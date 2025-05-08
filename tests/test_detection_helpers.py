@@ -30,7 +30,7 @@ def visualize_mask_regions(
     Create an image showing which regions are expected (dot, box, confidence)
     and highlight unexpected modifications (leaked pixels).
     """
-    print("in visualize_mas_regions")
+    print("in visualize_mask_regions")
     vis = np.zeros_like(original)
 
     # Set channels for different regions
@@ -46,8 +46,9 @@ def visualize_mask_regions(
     cv2.imwrite(str(out_path), vis)
     print(f"🧩 Mask visualization saved to {out_path}")
 
+
 class TestDrawFacesAndMouths(unittest.TestCase):
-    IMG_SIZE = 500  # Centralized constant for frame size
+    IMG_SIZE = 500
 
     def setUp(self):
         self.frame = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 3), dtype=np.uint8)
@@ -66,19 +67,16 @@ class TestDrawFacesAndMouths(unittest.TestCase):
         face_count = draw_faces_and_mouths(modified, self.boxes, self.landmarks, self.confidences)
 
         try:
-            print("in test_only_expected_pixels_changed()")
             self.assertEqual(face_count, 1)
 
-            # Constants
             red_dot_radius = 3
             green_dot_radius = 5
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.5
             thickness = 1
             pad = 2
-            extra_pad = 4  # extra vertical fudge for antialiasing
+            extra_pad = 4
 
-            # Extract landmarks
             pts = self.landmarks[0]
             mouth_left = pts[3]
             mouth_right = pts[4]
@@ -87,20 +85,17 @@ class TestDrawFacesAndMouths(unittest.TestCase):
                 int((mouth_left[1] + mouth_right[1]) / 2)
             ]
             mouth_pts = [(mouth_left, red_dot_radius),
-                        (mouth_right, red_dot_radius),
-                        (mouth_center, green_dot_radius)]
+                         (mouth_right, red_dot_radius),
+                         (mouth_center, green_dot_radius)]
 
-            # --- Dot mask ---
             dot_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE), dtype=np.uint8)
             for (x, y), r in mouth_pts:
                 cv2.circle(dot_mask, (int(x), int(y)), r, 1, thickness=-1)
 
-            # --- Bounding box mask ---
             box_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE), dtype=np.uint8)
             x1, y1, x2, y2 = self.boxes[0]
             cv2.rectangle(box_mask, (x1, y1), (x2, y2), 1, thickness=2)
 
-            # --- Confidence text mask ---
             conf_mask = np.zeros((self.IMG_SIZE, self.IMG_SIZE), dtype=np.uint8)
             text = f"{self.confidences[0]:.2f}"
             (text_width, text_height), baseline = cv2.getTextSize(text, font, font_scale, thickness)
@@ -111,18 +106,14 @@ class TestDrawFacesAndMouths(unittest.TestCase):
             text_y2 = min(self.IMG_SIZE, y1 + pad)
             cv2.rectangle(conf_mask, (text_x1, text_y1), (text_x2, text_y2), 1, thickness=-1)
 
-            # --- Combined safe mask ---
             safe_mask = ((dot_mask | box_mask | conf_mask) > 0)
 
-            # --- Check that dot region was modified ---
             changed = np.any(modified[dot_mask.astype(bool)] != 0)
             self.assertTrue(changed, "Expected dot regions to be nonzero")
 
-            # --- Identify actual modified pixels ---
             diff_mask = np.any(modified != self.frame, axis=-1)
             leaked_changes = diff_mask & (~safe_mask.astype(bool))
             num_unexpected = np.count_nonzero(leaked_changes)
-
 
             if num_unexpected > 0:
                 visualize_mask_regions(
@@ -134,11 +125,11 @@ class TestDrawFacesAndMouths(unittest.TestCase):
                     test_name="only_expected_pixels_changed"
                 )
                 debug_vis = modified.copy()
-                debug_vis[leaked_changes] = [0, 0, 255]  # Highlight unexpected pixels in red
+                debug_vis[leaked_changes] = [0, 0, 255]
                 save_debug_image(debug_vis, "unexpected_modified_pixels")
 
             self.assertEqual(num_unexpected, 0,
-                            f"{num_unexpected} pixels were unexpectedly modified outside safe regions")
+                             f"{num_unexpected} pixels were unexpectedly modified outside safe regions")
 
         except AssertionError:
             save_debug_image(modified, "test_draws_mouth_dots_and_confidence")
@@ -155,32 +146,27 @@ class TestDrawFacesAndMouths(unittest.TestCase):
             raise
 
     def test_raises_on_insufficient_landmarks(self):
-        """Ensure draw_faces_and_mouths fails loudly if landmarks are incomplete."""
         frame = np.zeros((self.IMG_SIZE, self.IMG_SIZE, 3), dtype=np.uint8)
         boxes = [[100, 100, 400, 400]]
-        bad_landmarks = [[[20, 50], [80, 50]]]  # Only two points
+        bad_landmarks = [[[20, 50], [80, 50]]]
         confidences = [0.95]
 
         with self.assertRaises(IndexError):
             draw_faces_and_mouths(frame, boxes, bad_landmarks, confidences)
 
+
 class TestDetectFacesInFrame(unittest.TestCase):
     def test_detect_faces_returns_expected_outputs(self):
-        # Dummy input image
         frame = np.zeros((640, 480, 3), dtype=np.uint8)
 
-        # Fake outputs
         fake_boxes = [[10, 10, 100, 100]]
         fake_landmarks = [[[15, 15], [90, 15], [50, 30], [30, 70], [70, 70]]]
         fake_confidences = [0.95]
 
-        # Mock model
         mock_model = MagicMock()
         mock_model.return_value = (fake_boxes, fake_landmarks, fake_confidences)
-        # Call the function
-        result = detect_faces_in_frame(mock_model, frame)
 
-        # Unpack and verify
+        result = detect_faces_in_frame(mock_model, frame)
         boxes, landmarks, confidences = result
 
         self.assertEqual(boxes, fake_boxes)
@@ -193,9 +179,4 @@ class TestDetectFacesInFrame(unittest.TestCase):
         mock_model.return_value = None
 
         result = detect_faces_in_frame(mock_model, frame)
-        mock_model.assert_called_once()  # confirm model(frame, ...) was invoked a single time
-                                         # important to check because assertIsNone() will pass if mock was miswired
-
-
-if __name__ == '__main__':
-    unittest.main()
+        mock_model.assert_called_once()

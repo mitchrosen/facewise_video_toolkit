@@ -4,17 +4,18 @@ from typing import Optional
 from mouthtracker.detection.yolo5face_model import load_yolo5face_model
 from mouthtracker.detection.detection_helpers import detect_faces_in_frame, draw_faces_and_mouths
 from mouthtracker.output.audio_tools import restore_audio_from_source
+from mouthtracker.tracking.mouth_tracker import MouthTracker
+
 try:
     from google.colab.patches import cv2_imshow
 except ImportError:
     def cv2_imshow(img):
-        import cv2
-        from matplotlib import pyplot as plt
+        import matplotlib.pyplot as plt
         plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         plt.axis('off')
         plt.show()
 
-def level3_multiface_yolo5face_mouthtrack_v2(
+def multiface_mouthtrack(
     input_path: str,
     output_path: str,
     model_path: str,
@@ -22,33 +23,24 @@ def level3_multiface_yolo5face_mouthtrack_v2(
     show_periodic: bool = False,
     display_interval_sec: float = 0.5,
     require_gpu: bool = True,
-    min_face: int = 10
+    min_face: int = 10,
+    track_interval: int = 30
 ) -> None:
     """
-    Performs frame-by-frame face detection and visual mouth tracking using a YOLOv5-based model.
-
-    For each frame of the input video, this function detects all faces and overlays:
-    - A green dot at the average center of the mouth
-    - A red dot at the left-most mouth corner
-    - A red dot at the right-most mouth corner
-    - Confidence scores above each face (if available)
-
-    Optionally displays frames periodically during processing and restores the original audio afterward.
+    Tracks mouths in a video by alternating between face detection and mouth tracking.
 
     Args:
-        input_path (str): Path to the source video file.
-        output_path (str): Path to save the output video with drawn indicators.
-        model_path (str): Path to the .pt file containing YOLOv5 face detection weights.
-        config_path (str): Path to the YOLOv5 model configuration YAML file.
-        show_periodic (bool): Whether to show frames periodically during processing. Default is False.
-        display_interval_sec (float): Interval (in seconds) between displayed frames if `show_periodic` is True.
-        require_gpu (bool): Whether to require a CUDA-enabled GPU. Raises an error if set and unavailable.
-        min_face (int): Minimum pixel size of a face to be considered valid.
-
-    Returns:
-        None
+        input_path (str): Path to the input video.
+        output_path (str): Path to save the output video.
+        model_path (str): Path to YOLOv5 face detector weights.
+        config_path (str): Path to detector config YAML.
+        show_periodic (bool): Whether to display frames during processing.
+        display_interval_sec (float): Interval (sec) for periodic display.
+        require_gpu (bool): If True, raise error if CUDA not available.
+        min_face (int): Minimum face size in pixels.
+        track_interval (int): Number of frames to skip between detections.
     """
-    
+
     if require_gpu and not torch.cuda.is_available():
         raise RuntimeError("❌ GPU required but CUDA is not available.")
 
@@ -74,24 +66,39 @@ def level3_multiface_yolo5face_mouthtrack_v2(
 
     frame_num = 0
     max_faces = 0
+    mouth_tracker = MouthTracker()
+    last_detection_frame = -track_interval
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        result = detect_faces_in_frame(model, frame, target_size=640)
+        if frame_num - last_detection_frame >= track_interval:
+            result = detect_faces_in_frame(model, frame, target_size=640)
 
-        if result is not None:
-            boxes, landmarks, confidences = result
-            face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
-            max_faces = max(max_faces, face_count)
+            if result is not None:
+                boxes, landmarks, confidences = result
+                face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
+                mouth_tracker.init_trackers(frame, landmarks)
+                last_detection_frame = frame_num
+                max_faces = max(max_faces, face_count)
+            else:
+                face_count = 0
+                cv2.putText(frame, "No Faces Found", (30, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
         else:
+            mouth_boxes = mouth_tracker.update_trackers(frame)
             face_count = 0
-            cv2.putText(frame, "No Faces Found", (30, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            for box in mouth_boxes:
+                if box is not None:
+                    x, y, w, h = map(int, box)
+                    center = (x + w // 2, y + h // 2)
+                    cv2.circle(frame, center, 4, (0, 255, 255), -1)
+                    face_count += 1
 
-        cv2.putText(frame, f"Faces detected: {face_count}", (20, height - 30),
+        cv2.putText(frame, f"Faces tracked: {face_count}", (20, height - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         if show_periodic and frame_num % display_interval == 0:
@@ -103,8 +110,7 @@ def level3_multiface_yolo5face_mouthtrack_v2(
 
     cap.release()
     out.release()
-
     restore_audio_from_source(input_path, output_path)
 
-    print(f"✅ Detection complete. Output saved to: {output_path}")
-    print(f"📊 Max faces in any frame: {max_faces}")
+    print(f"✅ Mouth tracking complete. Output saved to: {output_path}")
+    print(f"📊 Max faces detected at once: {max_faces}")

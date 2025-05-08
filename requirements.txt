@@ -1,15 +1,1 @@
-# Core dependencies
-opencv-python
-numpy
-pyyaml
-
-# Visualization (optional)
-matplotlib
-
-# Testing
-pytest
-
-# ⚠️ PyTorch must be installed manually to match your Python version
-# See: https://pytorch.org/get-started/locally/
-# Example:
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Placeholder
