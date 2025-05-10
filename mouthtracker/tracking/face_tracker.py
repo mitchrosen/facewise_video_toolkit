@@ -18,14 +18,12 @@ class FaceTracker:
     def init_trackers(self, frame, boxes):
         self.trackers = []
         self.track_fail_counts = []
-        print(f"Initializing tracker with boxes {boxes}", flush=True)
         for box in boxes:
             tracker = self._create_tracker()
             try:
                 tracker.init(frame, tuple(box))
                 self.trackers.append(tracker)
                 self.track_fail_counts.append(0)
-                print(f"✅ Tracker initialized for box {box}", flush=True)
             except Exception as e:
                 print(f"❌ Failed to initialize tracker for box {box}: {e}", flush=True)
 

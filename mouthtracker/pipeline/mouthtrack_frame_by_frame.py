@@ -54,7 +54,6 @@ def multiface_mouthtrack(
 
         if not should_detect:
             tracked_boxes = tracker.update_trackers(frame)
-            print(f"[Frame {frame_num}] drawing tracked box: {tracked_boxes}", flush=True)
             for box in tracked_boxes:
                 if box is not None:
                     draw_tracked_face_box(frame, box, color_name="tracked")
@@ -66,7 +65,6 @@ def multiface_mouthtrack(
             result = detect_faces_in_frame(model, frame, target_size=640)
             if result is not None:
                 boxes, landmarks, confidences = result
-                print(f"in should_detect, boxes = {boxes}")
                 if boxes:
                     face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
                     tracker.init_trackers(frame, [(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in boxes])
@@ -78,7 +76,6 @@ def multiface_mouthtrack(
                         )
                     max_faces = max(max_faces, face_count)
                 else:
-                    print(f"[Frame {frame_num}] ⚠️ Detection returned 0 boxes", flush=True)
                     cv2.putText(frame, "No Faces Found", (30, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             else:
