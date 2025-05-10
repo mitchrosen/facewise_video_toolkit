@@ -4,16 +4,7 @@ from typing import Optional
 from mouthtracker.detection.yolo5face_model import load_yolo5face_model
 from mouthtracker.detection.detection_helpers import detect_faces_in_frame, draw_faces_and_mouths
 from mouthtracker.output.audio_tools import restore_audio_from_source
-from mouthtracker.tracking.mouth_tracker import MouthTracker
-
-try:
-    from google.colab.patches import cv2_imshow
-except ImportError:
-    def cv2_imshow(img):
-        import matplotlib.pyplot as plt
-        plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        plt.axis('off')
-        plt.show()
+from mouthtracker.tracking.face_tracker import FaceTracker, draw_tracked_face_box
 
 def multiface_mouthtrack(
     input_path: str,
@@ -26,21 +17,6 @@ def multiface_mouthtrack(
     min_face: int = 10,
     track_interval: int = 30
 ) -> None:
-    """
-    Tracks mouths in a video by alternating between face detection and mouth tracking.
-
-    Args:
-        input_path (str): Path to the input video.
-        output_path (str): Path to save the output video.
-        model_path (str): Path to YOLOv5 face detector weights.
-        config_path (str): Path to detector config YAML.
-        show_periodic (bool): Whether to display frames during processing.
-        display_interval_sec (float): Interval (sec) for periodic display.
-        require_gpu (bool): If True, raise error if CUDA not available.
-        min_face (int): Minimum face size in pixels.
-        track_interval (int): Number of frames to skip between detections.
-    """
-
     if require_gpu and not torch.cuda.is_available():
         raise RuntimeError("❌ GPU required but CUDA is not available.")
 
@@ -63,46 +39,69 @@ def multiface_mouthtrack(
     display_interval = max(int(fps * display_interval_sec), 1)
 
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-
     frame_num = 0
     max_faces = 0
-    mouth_tracker = MouthTracker()
-    last_detection_frame = -track_interval
+    tracker = FaceTracker()
+    prev_face_count = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        if frame_num - last_detection_frame >= track_interval:
-            result = detect_faces_in_frame(model, frame, target_size=640)
+        should_detect = not prev_face_count or (frame_num % track_interval == 0)
+        face_count = 0
 
+        if not should_detect:
+            tracked_boxes = tracker.update_trackers(frame)
+            print(f"[Frame {frame_num}] drawing tracked box: {tracked_boxes}", flush=True)
+            for box in tracked_boxes:
+                if box is not None:
+                    draw_tracked_face_box(frame, box, color_name="tracked")
+                    face_count += 1
+                else:
+                    should_detect = True
+        
+        if should_detect:
+            result = detect_faces_in_frame(model, frame, target_size=640)
             if result is not None:
                 boxes, landmarks, confidences = result
-                face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
-                mouth_tracker.init_trackers(frame, landmarks)
-                last_detection_frame = frame_num
-                max_faces = max(max_faces, face_count)
+                print(f"in should_detect, boxes = {boxes}")
+                if boxes:
+                    face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
+                    tracker.init_trackers(frame, [(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in boxes])
+                    for box in boxes:
+                        draw_tracked_face_box(
+                            frame,
+                            (box[0], box[1], box[2] - box[0], box[3] - box[1]),
+                            color_name="detected"
+                        )
+                    max_faces = max(max_faces, face_count)
+                else:
+                    print(f"[Frame {frame_num}] ⚠️ Detection returned 0 boxes", flush=True)
+                    cv2.putText(frame, "No Faces Found", (30, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             else:
-                face_count = 0
                 cv2.putText(frame, "No Faces Found", (30, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-        else:
-            mouth_boxes = mouth_tracker.update_trackers(frame)
-            face_count = 0
-            for box in mouth_boxes:
-                if box is not None:
-                    x, y, w, h = map(int, box)
-                    center = (x + w // 2, y + h // 2)
-                    cv2.circle(frame, center, 4, (0, 255, 255), -1)
-                    face_count += 1
-
-        cv2.putText(frame, f"Faces tracked: {face_count}", (20, height - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        prev_face_count = face_count
+        if face_count > 0:
+            label = f"{'Faces detected' if should_detect else 'Faces tracked'}: {face_count}"
+            
+            cv2.putText(frame, label, (20, height - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         if show_periodic and frame_num % display_interval == 0:
             print(f"Processing frame {frame_num}")
+            try:
+                from google.colab.patches import cv2_imshow
+            except ImportError:
+                import matplotlib.pyplot as plt
+                def cv2_imshow(img):
+                    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    plt.axis('off')
+                    plt.show()
             cv2_imshow(frame)
 
         out.write(frame)

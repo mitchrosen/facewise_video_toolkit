@@ -93,7 +93,7 @@ def find_tracking_dot(frame, color=(0, 255, 255)):
 @patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
 @patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
 @patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.MouthTracker")
+@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.FaceTracker")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
 def test_detection_and_tracking_call_sequence(
