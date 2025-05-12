@@ -15,7 +15,8 @@ def multiface_mouthtrack(
     display_interval_sec: float = 0.5,
     require_gpu: bool = True,
     min_face: int = 10,
-    track_interval: int = 30
+    track_interval: int = 30,
+    tracker_type="CSRT"
 ) -> None:
     if require_gpu and not torch.cuda.is_available():
         raise RuntimeError("❌ GPU required but CUDA is not available.")
@@ -41,7 +42,7 @@ def multiface_mouthtrack(
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
     frame_num = 0
     max_faces = 0
-    tracker = FaceTracker()
+    tracker = FaceTracker(tracker_type=tracker_type)
     prev_face_count = 0
 
     while cap.isOpened():
@@ -50,6 +51,7 @@ def multiface_mouthtrack(
             break
 
         should_detect = not prev_face_count or (frame_num % track_interval == 0)
+        do_fallback = False
         face_count = 0
 
         if not should_detect:
@@ -59,9 +61,9 @@ def multiface_mouthtrack(
                     draw_tracked_face_box(frame, box, color_name="tracked")
                     face_count += 1
                 else:
-                    should_detect = True
+                    do_fallback = True
         
-        if should_detect:
+        if should_detect or do_fallback:
             result = detect_faces_in_frame(model, frame, target_size=640)
             if result is not None:
                 boxes, landmarks, confidences = result
@@ -72,7 +74,7 @@ def multiface_mouthtrack(
                         draw_tracked_face_box(
                             frame,
                             (box[0], box[1], box[2] - box[0], box[3] - box[1]),
-                            color_name="detected"
+                            color_name="detected" if should_detect else "fallback"
                         )
                     max_faces = max(max_faces, face_count)
                 else:

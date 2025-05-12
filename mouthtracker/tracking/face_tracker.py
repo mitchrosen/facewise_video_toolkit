@@ -47,7 +47,7 @@ def draw_tracked_face_box(frame, box, color_name="tracked"):
     """
     color_map = {
         "detected": (0, 255, 255),  # yellow
-        "fallback": (0, 165, 255),  # orange
+        "fallback": (0, 90, 255),  # orange
         "tracked": (255, 0, 0)      # blue
     }
     color = color_map.get(color_name, (255, 0, 255))  # fallback: magenta
