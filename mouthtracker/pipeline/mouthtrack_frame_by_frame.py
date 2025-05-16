@@ -70,6 +70,7 @@ def multiface_mouthtrack(
                 if boxes:
                     face_count = draw_faces_and_mouths(frame, boxes, landmarks, confidences)
                     tracker.init_trackers(frame, [(x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in boxes])
+                    _ = tracker.update_trackers(frame)
                     for box in boxes:
                         draw_tracked_face_box(
                             frame,

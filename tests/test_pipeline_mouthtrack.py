@@ -134,6 +134,7 @@ def test_detection_and_tracking_call_sequence(
 
     # Mock MouthTracker instance and method
     mock_tracker_instance = MagicMock()
+    mock_tracker_instance.init_trackers = MagicMock()
     mock_tracker_instance.update_trackers.return_value = [(50, 50, 30, 30)]
     mock_mouth_tracker_class.return_value = mock_tracker_instance
 
@@ -149,8 +150,10 @@ def test_detection_and_tracking_call_sequence(
 
     # 🔍 Assert detection was called on frames 0 and 2 (every 2nd frame)
     assert mock_detect.call_count == 2
-    # 🔍 Assert tracking was called on frames 1 and 3
-    assert mock_tracker_instance.update_trackers.call_count == 2
+    # 🔍 Assert init_trackers() was called on frames 0 and 2 following successful detect
+    assert mock_tracker_instance.init_trackers.call_count == 2
+    # 🔍 Assert tracking was called on frames 0 and 2 (following init_trackers()), and frames 1 and 3 (standard tracking)
+    assert mock_tracker_instance.update_trackers.call_count == 4
     # 🔍 draw_faces_and_mouths() is only called for detection frames (not for tracking)
     assert mock_draw.call_count == 2
 
