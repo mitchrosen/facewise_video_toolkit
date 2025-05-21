@@ -1,22 +1,33 @@
 import cv2
 import numpy as np
 from math import atan2, degrees, radians, cos, sin
+from typing import List, Dict, Tuple
 
 
-def crop_for_single_face(face, frame, aspect_ratio, output_size=(720, 1560)):
+def crop_for_single_face(
+    face: Dict[str, List[int]],
+    frame: np.ndarray,
+    aspect_ratio: float,
+    output_size: Tuple[int, int] = (720, 1560)
+) -> np.ndarray:
     """
     Perform standard portrait crop centered on a single face.
 
     Uses full height of the input frame and centers horizontally around the face.
 
-    Returns:
-        np.ndarray: Cropped and resized frame
-    """
-    frame_h, frame_w = frame.shape[:2]
+    Parameters:
+        face (dict): A dictionary with key "bbox" = [x1, y1, x2, y2].
+        frame (np.ndarray): The input video frame (H x W x 3).
+        aspect_ratio (float): Target portrait aspect ratio (width / height).
+        output_size (tuple): Final output size as (width, height).
 
-    # Full frame height, portrait width
+    Returns:
+        np.ndarray: Cropped and resized portrait frame.
+    """
+  
+    frame_h, frame_w = frame.shape[:2]
     crop_h = frame_h
-    crop_w = int(aspect_ratio * crop_h)
+    crop_w = int(crop_h / aspect_ratio)
 
     x1, _, x2, _ = face["bbox"]
     face_cx = (x1 + x2) // 2
@@ -35,137 +46,197 @@ def crop_for_single_face(face, frame, aspect_ratio, output_size=(720, 1560)):
     crop_x2 = min(frame_w, crop_x2)
 
     cropped = frame[:, crop_x1:crop_x2]
-    resized = cv2.resize(cropped, output_size)
-    return resized
+    return cv2.resize(cropped, output_size)
 
 
-def crop_for_two_faces(faces, frame, aspect_ratio, output_size=(720, 1560), max_angle=30, max_scale=1.5):
+def crop_for_two_faces(
+    faces: List[Dict[str, List[int]]],
+    frame: np.ndarray,
+    aspect_ratio: float,
+    output_size: Tuple[int, int] = (720, 1560),
+    max_angle: float = 30,
+    max_scale: float = 1.5
+) -> np.ndarray:
     """
-    Crop a portrait-oriented region from a frame that includes two faces,
-    optionally rotating and scaling the crop window to ensure both faces fit.
+    Crop a portrait-oriented region from a frame that includes two faces.
 
-    The method computes the angle between the centers of the two faces. If the angle
-    deviates from vertical by less than or equal to `max_angle` degrees, a portrait crop 
-    window is rotated by that angle and scaled minimally (up to `max_scale`) to include both 
-    face bounding boxes. The cropped region is then re-rotated to upright portrait orientation.
-
-    If the angle exceeds `max_angle`, the rotation is clamped to ±`max_angle`.
-
-    Parameters:
-        faces (list of dict): A list of two face dicts, each with key "bbox" = [x1, y1, x2, y2].
-        frame (np.ndarray): The input video frame (H x W x 3).
-        aspect_ratio (float): Desired portrait aspect ratio (e.g., 2.17 for 720x1560).
-        output_size (tuple): Final output dimensions (width, height), default (720, 1560).
-        max_angle (float): Maximum allowed rotation in degrees from vertical (default 30).
-        max_scale (float): Maximum allowed scale factor for the crop box (default 1.5).
-        debug (bool): If True, adds overlays to the input frame for debugging (default False).
+    Attempts an upright crop first. If the faces can't fit within a portrait
+    crop width (even after up to 10% width shrink), falls back to a rotated
+    and scaled crop that realigns the portrait box to fit both faces.
 
     Returns:
-        np.ndarray: A portrait-oriented cropped and resized frame containing both faces.
-    """    
+        np.ndarray: Cropped and resized portrait frame.
+    """
+    if upright_crop_possible(faces, frame.shape[0], aspect_ratio, shrink_tolerance=0.9):
+        return upright_crop_for_two_faces(faces, frame, aspect_ratio, output_size)
+    else:
+        return angular_crop_for_two_faces(faces, frame, aspect_ratio, output_size, max_angle, max_scale)
+
+
+def upright_crop_possible(
+    faces: List[Dict[str, List[int]]],
+    frame_h: int,
+    aspect_ratio: float,
+    shrink_tolerance: float = 0.9
+) -> bool:
+    """
+    Checks if an upright portrait crop can contain both faces
+    with up to `shrink_tolerance` shrink in width.
+
+    Returns:
+        bool: True if upright crop is sufficient, else False.
+    """
+    x1a, _, x2a, _ = faces[0]["bbox"]
+    x1b, _, x2b, _ = faces[1]["bbox"]
+    required_width = max(x2a, x2b) - min(x1a, x1b)
+    full_crop_width = aspect_ratio * frame_h
+    shrink_factor = required_width / full_crop_width
+    return shrink_factor <= 1.0 and shrink_factor >= shrink_tolerance
+
+
+def upright_crop_for_two_faces(
+    faces: List[Dict[str, List[int]]],
+    frame: np.ndarray,
+    aspect_ratio: float,
+    output_size: Tuple[int, int]
+) -> np.ndarray:
+    """
+    Crops upright portrait window centered between two faces,
+    assuming they fit within full-frame height.
+
+    Returns:
+        np.ndarray: Cropped and resized portrait frame.
+    """
+    x1a, _, x2a, _ = faces[0]["bbox"]
+    x1b, _, x2b, _ = faces[1]["bbox"]
+    cx1 = (x1a + x2a) / 2
+    cx2 = (x1b + x2b) / 2
+    center_x = (cx1 + cx2) / 2
+
     frame_h, frame_w = frame.shape[:2]
-    
-    # Step 1: Face centers
+    required_width = max(x2a, x2b) - min(x1a, x1b)
+    crop_x1 = center_x - required_width / 2
+    crop_x2 = center_x + required_width / 2
+
+    crop_x1 = max(0, int(crop_x1))
+    crop_x2 = min(frame_w, int(crop_x2))
+    cropped = frame[:, crop_x1:crop_x2]
+    return cv2.resize(cropped, output_size)
+
+
+def angular_crop_for_two_faces(
+    faces: List[Dict[str, List[int]]],
+    frame: np.ndarray,
+    aspect_ratio: float,
+    output_size: Tuple[int, int],
+    max_angle: float,
+    max_scale: float
+) -> np.ndarray:
+    """
+    Rotates and scales a portrait crop box to include two faces aligned diagonally.
+
+    The crop box is:
+    - Rotated around the midpoint between faces
+    - Scaled as needed to fully enclose both faces
+    - Re-rotated upright and resized to `output_size`
+
+    Returns:
+        np.ndarray: Cropped and resized upright portrait frame.
+    """
+    frame_h, frame_w = frame.shape[:2]
+
+    # Face centers
     (x1a, y1a, x2a, y2a) = faces[0]["bbox"]
     (x1b, y1b, x2b, y2b) = faces[1]["bbox"]
+    cx1, cy1 = (x1a + x2a) / 2, (y1a + y2a) / 2
+    cx2, cy2 = (x1b + x2b) / 2, (y1b + y2b) / 2
+    mid_x, mid_y = (cx1 + cx2) / 2, (cy1 + cy2) / 2
 
-    cx1 = (x1a + x2a) / 2
-    cy1 = (y1a + y2a) / 2
-    cx2 = (x1b + x2b) / 2
-    cy2 = (y1b + y2b) / 2
-
-    mid_x = (cx1 + cx2) / 2
-    mid_y = (cy1 + cy2) / 2
-
-    # Step 2: Rotation angle
+    # Angle between faces
     dx = cx2 - cx1
     dy = cy2 - cy1
     angle = degrees(atan2(dy, dx))
-    rotation_angle = angle - 90  # deviation from vertical
+    rotation_angle = max(-max_angle, min(max_angle, angle - 90))
 
-    # Step 3: Clamp to ±max_angle
-    rotation_angle = max(-max_angle, min(max_angle, rotation_angle))
-
-    # Step 4: Initial portrait crop box
+    # Base crop dimensions
     crop_h = frame_h
-    crop_w = int(aspect_ratio * crop_h)
-    scale = 1.0
+    crop_w = int(crop_h / aspect_ratio)
 
-    # Step 5: Iterate scale until both faces fit inside rotated box
-    while scale <= max_scale:
-        test_w = crop_w * scale
-        test_h = crop_h * scale
+    # Inverse-rotate face boxes into upright space
+    theta = radians(rotation_angle)
+    inv_rot = np.array([[cos(-theta), -sin(-theta)], [sin(-theta), cos(-theta)]])
+    corners = []
 
-        # Get 4 corners of crop box (centered at mid_x, mid_y)
-        box = np.array([
-            [-test_w/2, -test_h/2],
-            [ test_w/2, -test_h/2],
-            [ test_w/2,  test_h/2],
-            [-test_w/2,  test_h/2]
+    for face in faces:
+        fx1, fy1, fx2, fy2 = face["bbox"]
+        face_corners = np.array([
+            [fx1, fy1], [fx2, fy1], [fx2, fy2], [fx1, fy2]
         ])
+        rotated = np.dot(face_corners - np.array([mid_x, mid_y]), inv_rot.T)
+        corners.append(rotated)
 
-        # Rotation matrix
-        theta = radians(rotation_angle)
-        rot = np.array([[cos(theta), -sin(theta)], [sin(theta), cos(theta)]])
-        rotated_box = np.dot(box, rot.T) + np.array([mid_x, mid_y])
+    all_rotated_corners = np.vstack(corners)
+    min_x, min_y = np.min(all_rotated_corners, axis=0)
+    max_x, max_y = np.max(all_rotated_corners, axis=0)
 
-        # Convert rotated box to bounding rect
-        x_min = np.min(rotated_box[:,0])
-        x_max = np.max(rotated_box[:,0])
-        y_min = np.min(rotated_box[:,1])
-        y_max = np.max(rotated_box[:,1])
+    required_w = max_x - min_x
+    required_h = max_y - min_y
 
-        # Check if all face corners are inside this rotated region
-        def face_inside(face):
-            fx1, fy1, fx2, fy2 = face["bbox"]
-            corners = np.array([
-                [fx1, fy1],
-                [fx2, fy1],
-                [fx2, fy2],
-                [fx1, fy2]
-            ])
-            # Inverse rotate corners around mid
-            inv_rot = np.array([[cos(-theta), -sin(-theta)], [sin(-theta), cos(-theta)]])
-            aligned = np.dot(corners - np.array([mid_x, mid_y]), inv_rot.T)
-            half_w, half_h = test_w / 2, test_h / 2
-            return np.all(
-                (aligned[:,0] >= -half_w) & (aligned[:,0] <= half_w) &
-                (aligned[:,1] >= -half_h) & (aligned[:,1] <= half_h)
-            )
+    scale_x = required_w / crop_w
+    scale_y = required_h / crop_h
+    required_scale = max(scale_x, scale_y)
+    scale = min(required_scale, max_scale)
 
-        if face_inside(faces[0]) and face_inside(faces[1]):
-            break
-
-        scale += 0.05
-
-    # Step 6: Crop & rotate the region
-    # Compute affine warp to rotate the crop upright
-    src_center = (mid_x, mid_y)
-    rot_mat = cv2.getRotationMatrix2D(src_center, rotation_angle, scale)
-
+    # Rotate full frame
+    rot_mat = cv2.getRotationMatrix2D((mid_x, mid_y), rotation_angle, scale)
     warped = cv2.warpAffine(frame, rot_mat, (frame_w, frame_h), flags=cv2.INTER_LINEAR)
 
-    # Step 7: Extract axis-aligned upright portrait box from rotated frame
-    crop_x1 = int(mid_x - (crop_w / 2))
-    crop_y1 = int(mid_y - (crop_h / 2))
-    crop_x2 = crop_x1 + crop_w
-    crop_y2 = crop_y1 + crop_h
+    # Extract upright portrait crop
+    crop_x1 = int(mid_x - crop_w / 2)
+    crop_y1 = int(mid_y - crop_h / 2)
+    crop_x2 = crop_x1 + int(crop_w)
+    crop_y2 = crop_y1 + int(crop_h)
 
-    # Clamp to image bounds
     crop_x1 = max(0, crop_x1)
     crop_y1 = max(0, crop_y1)
     crop_x2 = min(frame_w, crop_x2)
     crop_y2 = min(frame_h, crop_y2)
 
     final_crop = warped[crop_y1:crop_y2, crop_x1:crop_x2]
-    final_resized = cv2.resize(final_crop, output_size)
+    return cv2.resize(final_crop, output_size)
 
-    return final_resized
+def crop_for_three_faces(faces,  aspect_ratio, output_size):
+    return (0, 0, output_size[0], output_size[1])
 
-def crop_for_three_faces(faces, width, height, aspect_ratio):
-    # Stub: return crop based on middle face
-    return (0, 0, width, height)
+def letterbox_frame(frame, aspect_ratio, output_size):
+    """
+    Resize the frame to fit within the target width and height
+    while preserving aspect ratio. Adds black padding as needed.
 
-def letterbox_frame(frame, width, height, aspect_ratio):
-    # Stub: return full frame
-    return (0, 0, width, height)
+    Parameters:
+        frame (np.ndarray): Input image.
+        width (int): Target output width.
+        height (int): Target output height.
+        aspect_ratio (float): Not used here but kept for API consistency.
+
+    Returns:
+        np.ndarray: Letterboxed (padded) image of shape (height, width, 3)
+    """
+    width = output_size[0]
+    height = output_size[1]
+    frame_h, frame_w = frame.shape[:2]
+    scale = min(width / frame_w, height / frame_h)
+    resized_w = int(frame_w * scale)
+    resized_h = int(frame_h * scale)
+
+    resized = cv2.resize(frame, (resized_w, resized_h))
+
+    # Create black background
+    result = np.zeros((height, width, 3), dtype=np.uint8)
+
+    # Center the resized image
+    x_offset = (width - resized_w) // 2
+    y_offset = (height - resized_h) // 2
+    result[y_offset:y_offset+resized_h, x_offset:x_offset+resized_w] = resized
+
+    return result
