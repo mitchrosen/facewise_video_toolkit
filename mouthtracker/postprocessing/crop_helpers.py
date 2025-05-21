@@ -150,7 +150,6 @@ def angular_crop_for_two_faces(
     # Face centers
     (x1a, y1a, x2a, y2a) = faces[0]["bbox"]
     (x1b, y1b, x2b, y2b) = faces[1]["bbox"]
-
     cx1, cy1 = (x1a + x2a) / 2, (y1a + y2a) / 2
     cx2, cy2 = (x1b + x2b) / 2, (y1b + y2b) / 2
     mid_x, mid_y = (cx1 + cx2) / 2, (cy1 + cy2) / 2
@@ -165,7 +164,7 @@ def angular_crop_for_two_faces(
     base_crop_h = frame_h
     base_crop_w = base_crop_h / aspect_ratio
 
-    # Inverse rotate face corners around midpoint to measure extents
+    # Inverse rotate face corners to measure bounding box
     theta = radians(rotation_angle)
     inv_rot = np.array([[cos(-theta), -sin(-theta)], [sin(-theta), cos(-theta)]])
     all_rotated_corners = []
@@ -192,14 +191,14 @@ def angular_crop_for_two_faces(
     rotated_center = np.dot(rot_mat[:, :2], np.array([mid_x, mid_y])) + rot_mat[:, 2]
     rot_mid_x, rot_mid_y = rotated_center
 
-    # Use *base* crop dimensions (not scaled), because scale already applied in warp
+    # Use base crop dimensions (scale already applied in warp)
     crop_w = int(base_crop_w)
     crop_h = int(base_crop_h)
 
     crop_x1 = int(rot_mid_x - crop_w / 2)
     crop_y1 = int(rot_mid_y - crop_h / 2)
 
-    # Clamp to image boundaries while maintaining fixed size
+    # Clamp to image bounds
     crop_x1 = max(0, min(frame_w - crop_w, crop_x1))
     crop_y1 = max(0, min(frame_h - crop_h, crop_y1))
     crop_x2 = crop_x1 + crop_w
@@ -208,99 +207,86 @@ def angular_crop_for_two_faces(
     final_crop = warped[crop_y1:crop_y2, crop_x1:crop_x2]
     return cv2.resize(final_crop, output_size)
 
-# def angular_crop_for_two_faces(
-#     faces: List[Dict[str, List[int]]],
-#     frame: np.ndarray,
-#     aspect_ratio: float,
-#     output_size: Tuple[int, int],
-#     max_angle: float,
-#     max_scale: float
-# ) -> np.ndarray:
-#     """
-#     Rotates and scales a portrait crop box to include two faces aligned diagonally.
+def crop_for_three_faces(
+    faces: List[Dict[str, List[int]]],
+    frame: np.ndarray,
+    aspect_ratio: float,
+    output_size: Tuple[int, int] = (720, 1560),
+    max_angle: float = 30
+) -> np.ndarray:
+    """
+    Crop a portrait-oriented region that includes three faces.
+    Rotates and scales as needed to align the faces vertically
+    and ensure all are included in the final crop.
 
-#     The crop box is:
-#     - Rotated around the midpoint between faces
-#     - Scaled as needed to fully enclose both faces
-#     - Re-rotated upright and resized to `output_size`
+    Returns:
+        np.ndarray: Cropped and resized portrait frame.
+    """
+    frame_h, frame_w = frame.shape[:2]
 
-#     Returns:
-#         np.ndarray: Cropped and resized upright portrait frame.
-#     """
-#     frame_h, frame_w = frame.shape[:2]
+    # Get center of each face
+    centers = []
+    for face in faces:
+        x1, y1, x2, y2 = face["bbox"]
+        centers.append(((x1 + x2) / 2, (y1 + y2) / 2))
 
-#     # Face centers
-#     (x1a, y1a, x2a, y2a) = faces[0]["bbox"]
-#     (x1b, y1b, x2b, y2b) = faces[1]["bbox"]
-#     cx1, cy1 = (x1a + x2a) / 2, (y1a + y2a) / 2
-#     cx2, cy2 = (x1b + x2b) / 2, (y1b + y2b) / 2
-#     mid_x, mid_y = (cx1 + cx2) / 2, (cy1 + cy2) / 2
+    # Compute average center and bounding box
+    cx_all = [c[0] for c in centers]
+    cy_all = [c[1] for c in centers]
+    mid_x = sum(cx_all) / 3
+    mid_y = sum(cy_all) / 3
 
-#     # Angle between faces
-#     dx = cx2 - cx1
-#     dy = cy2 - cy1
-#     angle = degrees(atan2(dy, dx))
-#     rotation_angle = max(-max_angle, min(max_angle, angle - 90))
+    # Compute principal direction via linear regression on centers
+    dx = max(cx_all) - min(cx_all)
+    dy = max(cy_all) - min(cy_all)
+    angle = degrees(atan2(dy, dx))
+    rotation_angle = max(-max_angle, min(max_angle, angle - 90))
 
-#     # Base crop dimensions
-#     crop_h = frame_h
-#     crop_w = int(crop_h / aspect_ratio)
+    # Base crop box
+    base_crop_h = frame_h
+    base_crop_w = base_crop_h / aspect_ratio
 
-#     # Inverse-rotate face boxes into upright space
-#     theta = radians(rotation_angle)
-#     inv_rot = np.array([[cos(-theta), -sin(-theta)], [sin(-theta), cos(-theta)]])
-#     corners = []
+    # Rotate face boxes to upright space
+    theta = radians(rotation_angle)
+    inv_rot = np.array([[cos(-theta), -sin(-theta)], [sin(-theta), cos(-theta)]])
+    all_rotated_corners = []
 
-#     for face in faces:
-#         fx1, fy1, fx2, fy2 = face["bbox"]
-#         face_corners = np.array([
-#             [fx1, fy1], [fx2, fy1], [fx2, fy2], [fx1, fy2]
-#         ])
-#         rotated = np.dot(face_corners - np.array([mid_x, mid_y]), inv_rot.T)
-#         corners.append(rotated)
+    for face in faces:
+        fx1, fy1, fx2, fy2 = face["bbox"]
+        corners = np.array([
+            [fx1, fy1], [fx2, fy1], [fx2, fy2], [fx1, fy2]
+        ])
+        rotated = np.dot(corners - np.array([mid_x, mid_y]), inv_rot.T)
+        all_rotated_corners.append(rotated)
 
-#     all_rotated_corners = np.vstack(corners)
-#     min_x, min_y = np.min(all_rotated_corners, axis=0)
-#     max_x, max_y = np.max(all_rotated_corners, axis=0)
+    all_rotated = np.vstack(all_rotated_corners)
+    required_w = np.ptp(all_rotated[:, 0])
+    required_h = np.ptp(all_rotated[:, 1])
+    scale = max(required_w / base_crop_w, required_h / base_crop_h)
 
-#     required_w = max_x - min_x
-#     required_h = max_y - min_y
+    # Warp frame
+    rot_mat = cv2.getRotationMatrix2D((mid_x, mid_y), -rotation_angle, 1.0 / scale)
+    warped = cv2.warpAffine(frame, rot_mat, (frame_w, frame_h), flags=cv2.INTER_LINEAR)
 
-#     scale_x = required_w / crop_w
-#     scale_y = required_h / crop_h
-#     required_scale = max(scale_x, scale_y)
-#     scale = min(required_scale, max_scale)
+    # New center after rotation
+    rotated_center = np.dot(rot_mat[:, :2], np.array([mid_x, mid_y])) + rot_mat[:, 2]
+    rot_mid_x, rot_mid_y = rotated_center
 
-#     # Rotate full frame
-#     rot_mat = cv2.getRotationMatrix2D((mid_x, mid_y), -rotation_angle, scale)
-#     warped = cv2.warpAffine(frame, rot_mat, (frame_w, frame_h), flags=cv2.INTER_LINEAR)
+    # Use original base dimensions (since scaling already applied)
+    crop_w = int(base_crop_w)
+    crop_h = int(base_crop_h)
 
-#     # Compute rotated center position
-#     rotated_center = np.dot(rot_mat[:, :2], np.array([mid_x, mid_y])) + rot_mat[:, 2]
-#     rot_mid_x, rot_mid_y = rotated_center
+    crop_x1 = int(rot_mid_x - crop_w / 2)
+    crop_y1 = int(rot_mid_y - crop_h / 2)
 
-#     # Scale crop dimensions accordingly
-#     scaled_crop_w = crop_w * scale
-#     scaled_crop_h = crop_h * scale
+    # Clamp
+    crop_x1 = max(0, min(frame_w - crop_w, crop_x1))
+    crop_y1 = max(0, min(frame_h - crop_h, crop_y1))
+    crop_x2 = crop_x1 + crop_w
+    crop_y2 = crop_y1 + crop_h
 
-#     # Compute crop box centered at the rotated/scaled midpoint
-#     crop_x1 = int(rot_mid_x - scaled_crop_w / 2)
-#     crop_y1 = int(rot_mid_y - scaled_crop_h / 2)
-#     crop_x2 = crop_x1 + int(scaled_crop_w)
-#     crop_y2 = crop_y1 + int(scaled_crop_h)
-
-#     # Clamp crop box to image bounds
-#     crop_x1 = max(0, crop_x1)
-#     crop_y1 = max(0, crop_y1)
-#     warped_h, warped_w = warped.shape[:2]
-#     crop_x2 = min(warped_w, crop_x2)
-#     crop_y2 = min(warped_h, crop_y2)
-
-#     final_crop = warped[crop_y1:crop_y2, crop_x1:crop_x2]
-#     return cv2.resize(final_crop, output_size)
-
-def crop_for_three_faces(faces,  aspect_ratio, output_size):
-    return (0, 0, output_size[0], output_size[1])
+    final_crop = warped[crop_y1:crop_y2, crop_x1:crop_x2]
+    return cv2.resize(final_crop, output_size)
 
 def letterbox_frame(frame, aspect_ratio, output_size):
     """
