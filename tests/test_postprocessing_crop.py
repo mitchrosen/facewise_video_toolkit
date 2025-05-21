@@ -2,11 +2,16 @@ import unittest
 from unittest.mock import patch, MagicMock, mock_open
 import numpy as np
 import json
-
+from unittest.mock import patch
 from mouthtracker.postprocessing import crop_portrait_video
 
 
 class TestCropPortraitVideo(unittest.TestCase):
+
+    def setUp(self):
+        patcher = patch("mouthtracker.postprocessing.crop_portrait_video.restore_audio_from_source")
+        self.mock_restore = patcher.start()
+        self.addCleanup(patcher.stop)
 
     @patch("cv2.VideoWriter")
     @patch("cv2.VideoCapture")

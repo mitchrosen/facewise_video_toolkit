@@ -7,6 +7,7 @@ from mouthtracker.postprocessing.crop_helpers import (
     crop_for_three_faces,
     letterbox_frame
 )
+from mouthtracker.output.audio_tools import restore_audio_from_source
 
 def add_bbox_to_faces(faces: List[Dict]) -> None:
     """
@@ -78,3 +79,4 @@ def crop_video_from_json(json_path, video_path, output_path, aspect_ratio=2.17, 
 
     cap.release()
     out.release()
+    restore_audio_from_source(video_path, output_path)
