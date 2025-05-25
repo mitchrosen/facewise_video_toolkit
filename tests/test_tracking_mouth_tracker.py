@@ -3,10 +3,10 @@ import pytest
 import cv2
 
 import sys
-sys.modules.pop("mouthtracker.pipeline.mouthtrack_frame_by_frame", None)
-sys.modules.pop("mouthtracker.pipeline", None)
+sys.modules.pop("facekit.pipeline.mouthtrack_frame_by_frame", None)
+sys.modules.pop("facekit.pipeline", None)
 
-from mouthtracker.tracking.mouth_tracker import MouthTracker, get_mouth_box_from_landmarks
+from facekit.tracking.mouth_tracker import MouthTracker, get_mouth_box_from_landmarks
 
 # --- Fixtures ---
 

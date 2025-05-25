@@ -5,14 +5,14 @@ import cv2
 import os
 
 import sys
-sys.modules.pop("mouthtracker.pipeline.mouthtrack_frame_by_frame", None)
-sys.modules.pop("mouthtracker.pipeline", None)
+sys.modules.pop("facekit.pipeline.mouthtrack_frame_by_frame", None)
+sys.modules.pop("facekit.pipeline", None)
 
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
 @patch("torch.cuda.is_available", return_value=True)
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
 def test_pipeline_calls_detection_and_drawing(
@@ -44,7 +44,7 @@ def test_pipeline_calls_detection_and_drawing(
     mock_writer.return_value = mock_writer_instance
     mock_load_model.return_value = MagicMock()
 
-    from mouthtracker.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
+    from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
     multiface_mouthtrack(
         input_path="dummy.mp4",
         output_path="out.mp4",
@@ -64,7 +64,7 @@ def test_pipeline_calls_detection_and_drawing(
 
 @patch("torch.cuda.is_available", return_value=False)
 def test_pipeline_requires_gpu_raises_error(mock_cuda):
-    from mouthtracker.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
+    from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
 
     with pytest.raises(RuntimeError, match="GPU required but CUDA is not available"):
         multiface_mouthtrack(
@@ -88,12 +88,12 @@ def find_tracking_dot(frame, color=(0, 255, 255)):
         return tuple(coords[0][0])  # (x, y)
     return None
 
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
 @patch("torch.cuda.is_available", return_value=True)
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
-@patch("mouthtracker.pipeline.mouthtrack_frame_by_frame.FaceTracker")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.FaceTracker")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
 def test_detection_and_tracking_call_sequence(
@@ -107,7 +107,7 @@ def test_detection_and_tracking_call_sequence(
     mock_load_model,
 ):
     import numpy as np
-    from mouthtracker.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
+    from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
 
     # Prepare 4 video frames (0–3)
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)

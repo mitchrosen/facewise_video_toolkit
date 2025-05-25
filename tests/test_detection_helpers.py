@@ -5,8 +5,8 @@ import numpy as np
 import cv2
 from unittest.mock import MagicMock
 
-from mouthtracker.detection.detection_helpers import draw_faces_and_mouths
-from mouthtracker.detection.detection_helpers import detect_faces_in_frame
+from facekit.detection.detection_helpers import draw_faces_and_mouths
+from facekit.detection.detection_helpers import detect_faces_in_frame
 
 
 def save_debug_image(image: np.ndarray, test_name: str):

@@ -1,9 +1,9 @@
 import cv2
 import torch
 import json
-from mouthtracker.detection.yolo5face_model import load_yolo5face_model
-from mouthtracker.detection.detection_helpers import detect_faces_in_frame
-from mouthtracker.tracking.face_tracker import FaceTracker
+from facekit.detection.yolo5face_model import load_yolo5face_model
+from facekit.detection.detection_helpers import detect_faces_in_frame
+from facekit.tracking.face_tracker import FaceTracker
 
 
 def multiface_tracking_to_json(

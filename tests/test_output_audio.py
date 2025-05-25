@@ -1,12 +1,12 @@
 import unittest
 from unittest.mock import patch
-from mouthtracker.output.audio_tools import restore_audio_from_source
+from facekit.output.audio_tools import restore_audio_from_source
 import subprocess
 
 class TestRestoreAudioFromSource(unittest.TestCase):
 
-    @patch("mouthtracker.output.audio_tools.os.replace")
-    @patch("mouthtracker.output.audio_tools.subprocess.run")
+    @patch("facekit.output.audio_tools.os.replace")
+    @patch("facekit.output.audio_tools.subprocess.run")
     def test_restore_audio_command_contains_expected_parts(self, mock_run, mock_replace):
         input_path = "input_with_audio.mp4"
         output_path = "output_no_audio.mp4"
@@ -33,14 +33,14 @@ class TestRestoreAudioFromSource(unittest.TestCase):
         # Ensure os.replace was called
         mock_replace.assert_called_once_with(expected_temp, output_path)
 
-    @patch("mouthtracker.output.audio_tools.subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg"))
+    @patch("facekit.output.audio_tools.subprocess.run", side_effect=subprocess.CalledProcessError(1, "ffmpeg"))
     def test_raises_if_ffmpeg_fails(self, mock_run):
         """Ensure ffmpeg failure is propagated via CalledProcessError."""
         with self.assertRaises(subprocess.CalledProcessError, msg="Expected ffmpeg failure to be propagated"):
             restore_audio_from_source("input.mp4", "output.mp4")
 
-    @patch("mouthtracker.output.audio_tools.os.replace", side_effect=FileNotFoundError("temp file missing"))
-    @patch("mouthtracker.output.audio_tools.subprocess.run")
+    @patch("facekit.output.audio_tools.os.replace", side_effect=FileNotFoundError("temp file missing"))
+    @patch("facekit.output.audio_tools.subprocess.run")
     def test_raises_if_os_replace_fails(self, mock_run, mock_replace):
         """Ensure os.replace failure is propagated (e.g., missing temp output)."""
         with self.assertRaises(FileNotFoundError, msg="Expected os.replace failure to be propagated"):

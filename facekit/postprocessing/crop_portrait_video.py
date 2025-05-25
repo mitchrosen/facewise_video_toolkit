@@ -1,13 +1,13 @@
 import cv2
 import json
 from typing import List, Dict
-from mouthtracker.postprocessing.crop_helpers import (
+from facekit.postprocessing.crop_helpers import (
     crop_for_single_face,
     crop_for_two_faces,
     crop_for_three_faces,
     letterbox_frame
 )
-from mouthtracker.output.audio_tools import restore_audio_from_source
+from facekit.output.audio_tools import restore_audio_from_source
 
 def add_bbox_to_faces(faces: List[Dict]) -> None:
     """

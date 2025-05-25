@@ -1,10 +1,10 @@
 import cv2
 import torch
 from typing import Optional
-from mouthtracker.detection.yolo5face_model import load_yolo5face_model
-from mouthtracker.detection.detection_helpers import detect_faces_in_frame, draw_faces_and_mouths
-from mouthtracker.output.audio_tools import restore_audio_from_source
-from mouthtracker.tracking.face_tracker import FaceTracker, draw_tracked_face_box
+from facekit.detection.yolo5face_model import load_yolo5face_model
+from facekit.detection.detection_helpers import detect_faces_in_frame, draw_faces_and_mouths
+from facekit.output.audio_tools import restore_audio_from_source
+from facekit.tracking.face_tracker import FaceTracker, draw_tracked_face_box
 
 def multiface_mouthtrack(
     input_path: str,

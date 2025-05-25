@@ -21,7 +21,7 @@ def load_yolo5face_model(
         YoloDetector: A configured instance of the YoloDetector class ready for inference.
     """
     # from torch.serialization import safe_globals
-    from mouthtracker.yolo5faceInference.yolo5face.yoloface.face_detector import YoloDetector
+    from facekit.yolo5faceInference.yolo5face.yoloface.face_detector import YoloDetector
 
     # safe_globals(["_reconstruct"])  # Not needed with the working torch
     return YoloDetector(
