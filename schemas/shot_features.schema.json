@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shot Features Schema",
+  "type": "object",
+  "properties": {
+    "shots": {
+      "type": "array",
+      "description": "Array of detected shots for a video. Each shot describes temporal span and visual face features.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "shot_number": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Shot number is 1-based and must be contiguous."
+          },
+          "first_frame": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "For shot_number 1, first_frame is 0. For subsequent shots, first_frame must equal previous shot's last_frame + 1."
+          },
+          "last_frame": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The last frame index of the shot. The final shot must end at the final frame of the video."
+          },
+          "detected_faces": {
+            "type": "object",
+            "description": "Summary of faces detected across representative frames in the shot.",
+            "properties": {
+              "face_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "face_details": {
+                "type": "array",
+                "description": "Each face object describes face geometry in normalized [0-100] coordinates.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "face_label": {
+                      "type": "string",
+                      "description": "Optional label for future identity tracking across shots."
+                    },
+                    "center_x": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "center_y": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "face_width": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "face_height": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  },
+                  "required": [
+                    "center_x",
+                    "center_y",
+                    "face_width",
+                    "face_height"
+                  ]
+                }
+              }
+            },
+            "required": ["face_count"]
+          },
+          "detected_graphics": {
+            "type": "object",
+            "description": "Future placeholder for detected graphics. Must be an empty object if present.",
+            "maxProperties": 0
+          }
+        },
+        "required": [
+          "shot_number",
+          "first_frame",
+          "last_frame",
+          "detected_faces"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    }
+  },
+  "required": ["shots"],
+  "additionalProperties": false
+}
