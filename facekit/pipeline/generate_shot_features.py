@@ -1,8 +1,11 @@
 import json
 import cv2
 from pathlib import Path
+from typing import Optional
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
+from scenedetect.frame_timecode import FrameTimecode
+from pathlib import Path
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.detection_helpers import detect_faces_in_frame
@@ -32,28 +35,41 @@ def extract_faces(frame, model, frame_w, frame_h):
     return [normalize_face_bbox((x1, y1, x2, y2), frame_w, frame_h) for x1, y1, x2, y2 in boxes]
 
 def generate_shot_features_json(video_path: str, output_json_path: str,
-                                 model_path: str = "facekit/yolo5faceInference/yolo5face/yolov5s-face.pt",
-                                 config_path: str = "facekit/yolo5faceInference/yolo5face/yolov5n.yaml"):
+                                 model_path: str = "models/yolov5n_state_dict.pt",
+                                 config_path: str = "models/yolov5n.yaml",
+                                 threshold: float = 30.0):
+    
     video_path = Path(video_path)
     output_path = Path(output_json_path)
-    scenes = detect_scenes(video_path)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+   
+    scenes = detect_scenes(video_path, threshold)
+
+    # ✅ Fallback if no scenes were detected
+    if not scenes:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames - 1, fps))]
 
     device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
     model = load_yolo5face_model(model_path=model_path, config_path=config_path, device=device)
 
-    cap = cv2.VideoCapture(str(video_path))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-
     shots = []
     for idx, (start_time, end_time) in enumerate(scenes, start=1):
-        start_frame = start_time.get_frames()
-        end_frame = end_time.get_frames()
-        mid_frame = (start_frame + end_frame) // 2
+        start_frame_num = start_time.get_frames()
+        end_frame_num = end_time.get_frames()
+        mid_frame_num = (start_frame_num + end_frame_num) // 2
+
+        frame = get_frame_at(cap, mid_frame_num)
 
         try:
-            frame = get_frame_at(cap, mid_frame)
+            frame = get_frame_at(cap, mid_frame_num)
             face_boxes = extract_faces(frame, model, frame_w, frame_h)
         except Exception as e:
             print(f"⚠️  Could not extract faces for shot {idx}: {e}")
@@ -61,8 +77,8 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
 
         shots.append({
             "shot_number": idx,
-            "first_frame": start_frame,
-            "last_frame": end_frame,
+            "first_frame": start_frame_num,
+            "last_frame": end_frame_num,
             "detected_faces": {
                 "face_count": len(face_boxes),
                 "face_details": face_boxes
