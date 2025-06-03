@@ -1,3 +1,3 @@
-[submodule "facekit/yolo5faceInference"]
-	path = facekit/yolo5faceInference
+[submodule "facekit/yolov5faceInference"]
+	path = facekit/yolov5faceInference
 	url = https://github.com/mitchrosen/yolov5faceInference.git
