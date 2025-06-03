@@ -13,13 +13,13 @@ def main():
     )
     parser.add_argument(
         "--model_path", type=str,
-        # default="facekit/yolo5faceInference/yolo5face/yolov5s-face.pt",
+        # default="facekit/yolov5faceInference/yolo5face/yolov5s-face.pt",
         default="models/yolov5n_state_dict.pt",
         help="Path to the YOLOv5 face detector weights"
     )
     parser.add_argument(
         "--config_path", type=str,
-        # default="facekit/yolo5faceInference/yolo5face/yolov5n.yaml",
+        # default="facekit/yolov5faceInference/yolo5face/yolov5n.yaml",
         default="models/yolov5n.yaml",
         help="Path to YOLOv5 face model config file"
     )

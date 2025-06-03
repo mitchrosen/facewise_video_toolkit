@@ -5,7 +5,7 @@ from facekit.detection.yolo5face_model import load_yolo5face_model
 
 class TestYolo5faceModel(unittest.TestCase):
 
-    @patch("facekit.yolo5faceInference.yolo5face.yoloface.face_detector.YoloDetector")
+    @patch("facekit.yolov5faceInference.yolo5face.yoloface.face_detector.YoloDetector")
     def test_load_yolo5face_model(self, mock_detector):
         dummy_model_path = "model_path"
         dummy_config_path = "config_path"
@@ -30,7 +30,7 @@ class TestYolo5faceModel(unittest.TestCase):
         )
         self.assertEqual(result, return_value)
 
-    @patch("facekit.yolo5faceInference.yolo5face.yoloface.face_detector.YoloDetector")
+    @patch("facekit.yolov5faceInference.yolo5face.yoloface.face_detector.YoloDetector")
     def test_load_yolo5face_model_with_min_face_default(self, mock_detector):
         dummy_model_path = "model_path"
         dummy_config_path = "config_path"
