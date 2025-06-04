@@ -67,15 +67,29 @@ def validate_shot_features_json(json_path: str | Path,
                 f"!= total_frame_count-1 ({expected_last})"
             )
 
-    # 2d. face_count vs. face_details length
+    # 2d. face_count vs. face_details consistency
     for shot in shots:
-        details = shot["detected_faces"].get("face_details", [])
-        if shot["detected_faces"]["face_count"] != len(details):
-            errors.append(
-                f"shot {shot['shot_number']}: face_count "
-                f"({shot['detected_faces']['face_count']}) does not match "
-                f"len(face_details) ({len(details)})"
-            )
+        shot_num = shot.get("shot_number")
+        detected_faces = shot.get("detected_faces", {})
+        face_count = detected_faces.get("face_count")
+
+        if face_count is None:
+            errors.append(f"shot {shot_num}: missing face_count in detected_faces")
+            continue
+
+        has_details = "face_details" in detected_faces
+        face_details = detected_faces.get("face_details", [])
+
+        if face_count > 0:
+            if not has_details:
+                errors.append(f"shot {shot_num}: face_count > 0 but face_details is missing")
+            elif len(face_details) != face_count:
+                errors.append(
+                    f"shot {shot_num}: face_count ({face_count}) does not match len(face_details) ({len(face_details)})"
+                )
+        elif face_count == 0 and has_details:
+            errors.append(f"shot {shot_num}: face_count == 0 but face_details is present")
+
 
     return errors
 # --------------------------------------------------------------------------- #

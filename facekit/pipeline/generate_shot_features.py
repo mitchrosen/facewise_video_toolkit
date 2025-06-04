@@ -38,7 +38,8 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
                                  model_path: str = "models/yolov5n_state_dict.pt",
                                  config_path: str = "models/yolov5n.yaml",
                                  threshold: float = 30.0):
-    
+    import time
+    start_time = time.time()
     video_path = Path(video_path)
     output_path = Path(output_json_path)
 
@@ -49,8 +50,13 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    elapsed = time.time() - start_time
+    print(f"⏱️ setup time: {elapsed:.2f} seconds")
    
+    start_time = time.time()
     scenes = detect_scenes(video_path, threshold)
+    elapsed = time.time() - start_time
+    print(f"⏱️ detect_scenes time: {elapsed:.2f} seconds")
 
     # ✅ Fallback if no scenes were detected
     if not scenes:
@@ -60,16 +66,16 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
     model = load_yolo5face_model(model_path=model_path, config_path=config_path, device=device)
 
+    start_time = time.time()
     shots = []
-    for idx, (start_time, end_time) in enumerate(scenes, start=1):
-        start_frame_num = start_time.get_frames()
-        end_frame_num = end_time.get_frames()
+    for idx, (scene_start, scene_end) in enumerate(scenes, start=1):
+        start_frame_num = scene_start.get_frames()
+        end_frame_num = scene_end.get_frames() - 1
         mid_frame_num = (start_frame_num + end_frame_num) // 2
 
         frame = get_frame_at(cap, mid_frame_num)
 
         try:
-            frame = get_frame_at(cap, mid_frame_num)
             face_boxes = extract_faces(frame, model, frame_w, frame_h)
         except Exception as e:
             print(f"⚠️  Could not extract faces for shot {idx}: {e}")
@@ -87,9 +93,15 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
         })
 
     cap.release()
+    elapsed = time.time() - start_time
+    print(f"⏱️ extract_faces and build json struct time: {elapsed:.2f} seconds")
 
+
+    start_time = time.time()
     result = {"shots": shots}
     output_path.write_text(json.dumps(result, indent=2))
+    elapsed = time.time() - start_time
+    print(f"⏱️ write json file time: {elapsed:.2f} seconds")
 
     errors = validate_shot_features_json(str(output_path), "schemas/shot_features.schema.json", total_frames)
     if errors:

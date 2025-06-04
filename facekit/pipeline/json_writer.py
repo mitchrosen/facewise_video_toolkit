@@ -36,6 +36,9 @@ def multiface_tracking_to_json(
     Returns:
         None. Writes tracking output to the specified JSON file.
     """
+    import time
+    start_time = time.time()
+ 
     if require_gpu and not torch.cuda.is_available():
         raise RuntimeError("❌ GPU required but CUDA is not available.")
 
@@ -46,6 +49,10 @@ def multiface_tracking_to_json(
         device=device,
         min_face=min_face
     )
+    elapsed = time.time() - start_time
+    print(f"⏱️ startup time: {elapsed:.2f} seconds")
+
+    start_time = time.time()
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -110,9 +117,13 @@ def multiface_tracking_to_json(
         frame_num += 1
 
     cap.release()
+    elapsed = time.time() - start_time
+    print(f"⏱️ detection/tracking time: {elapsed:.2f} seconds")
 
+    start_time = time.time()
     with open(output_json_path, 'w') as f:
         json.dump(results, f, indent=2)
+    print(f"⏱️ write json time: {elapsed:.2f} seconds")
 
     print(f"✅ JSON tracking output saved to: {output_json_path}")
     print(f"📊 Total frames processed: {frame_num}")

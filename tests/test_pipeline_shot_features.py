@@ -97,8 +97,8 @@ def test_generate_shot_features_schema_compliance(
     s1, e1 = MagicMock(), MagicMock()
     s0.get_frames.return_value = 0
     e0.get_frames.return_value = 2
-    s1.get_frames.return_value = 3
-    e1.get_frames.return_value = 5
+    s1.get_frames.return_value = 2  # adjusted for contiguity
+    e1.get_frames.return_value = 6
     mock_detect_scenes.return_value = [(s0, e0), (s1, e1)]
 
     # 🎭 Mock 1 detection per mid-frame
@@ -136,3 +136,4 @@ def test_generate_shot_features_schema_compliance(
     # ✅ Validate schema
     result = validate_shot_features_json(str(output_path), SCHEMA_PATH, total_frame_count=6)
     assert result == []
+
