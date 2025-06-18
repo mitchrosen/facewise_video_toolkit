@@ -10,3 +10,7 @@ __pycache__/
 *.log
 *.idea/
 *.ipynb_checkpoints/
+venv/
+.pytest_cache/
+.ruff_cache/
+scratch/
