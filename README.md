@@ -31,17 +31,59 @@ A comprehensive Python toolkit for face detection, tracking, and video processin
 
 ## Installation
 
-### Runtime Dependencies
+### Prerequisites
+- Python 3.10+ (tested with Python 3.13)
+- FFmpeg (for audio processing)
+
+### Setup Virtual Environment (Recommended)
+```bash
+# Create virtual environment
+python3 -m venv venv
+
+# Activate virtual environment
+source venv/bin/activate  # On macOS/Linux
+# or
+venv\Scripts\activate     # On Windows
+```
+
+### Install Dependencies
+
+#### Runtime Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### Development and Testing
+#### Development and Testing
 ```bash
 pip install -r requirements-dev.txt
 ```
 
+### Verify Installation
+```bash
+# Test imports
+python -c "import facekit; print('✅ FaceKit installed successfully')"
+
+# Run test suite
+pytest tests/ -v
+
+# Test CLI tools
+python -m facekit.cli.shot_features_cli --help
+```
+
 ## Quick Start
+
+### 0. Verify Installation
+First, ensure everything is working correctly:
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Test the installation
+python -c "import facekit; print('✅ FaceKit ready!')"
+
+# Run tests (optional but recommended)
+pytest tests/ -v
+```
 
 ### 1. Extract Shot Features
 Analyze a video to detect scenes and extract face information per shot:
@@ -127,8 +169,12 @@ facekit/
 ## Configuration
 
 ### Model Files
-- **YOLOv5 Weights**: `models/yolov5n_state_dict.pt`
-- **Model Config**: `models/yolov5n.yaml`
+The toolkit includes pre-trained YOLOv5Face models:
+- **YOLOv5 Weights**: `models/yolov5n_state_dict.pt` (included)
+- **Model Config**: `models/yolov5n.yaml` (included)
+- **Alternative Model**: `facekit/yolov5faceInference/yolo5face/yolov5s-face.pt` (larger model)
+
+> **Note**: The default models are included in the repository. For custom models, update the paths in your function calls.
 
 ### Key Parameters
 - `min_face`: Minimum face size in pixels (default: 10)
@@ -200,13 +246,104 @@ Test coverage includes:
 
 ## Requirements
 
-- Python 3.10+
-- OpenCV (cv2)
-- PyTorch
-- NumPy
-- JSONSchema
-- PySceneDetect
+### Core Dependencies
+- Python 3.10+ (tested with Python 3.13)
+- PyTorch 2.7.1+
+- torchvision 0.22.1+
+- OpenCV (opencv-python, opencv-contrib-python)
+- NumPy 2.3.0+
+- PyYAML 6.0.2+
+- Pillow 11.2.1+
+- JSONSchema 4.24.0+
+- PySceneDetect 0.6.6+
+
+### System Dependencies
 - FFmpeg (for audio processing)
+
+### Development Dependencies
+- pytest 8.4.1+
+- All runtime dependencies
+
+## Development & Testing
+
+### Running Tests
+The project includes comprehensive test coverage (32 tests):
+
+```bash
+# Run all tests
+pytest tests/ -v
+
+# Run specific test modules
+pytest tests/test_detection_helpers.py -v
+pytest tests/test_pipeline_shot_features.py -v
+pytest tests/test_postprocessing_crop.py -v
+```
+
+### Test Coverage
+- ✅ Face detection and tracking algorithms
+- ✅ Video processing pipelines
+- ✅ Portrait cropping functionality (1-3 faces)
+- ✅ JSON validation and output formats
+- ✅ Audio processing tools
+- ✅ YOLOv5Face model integration
+- ✅ Mouth tracking and landmark detection
+
+### Recent Fixes (v2024.1)
+- 🔧 Fixed module import structure with proper `__init__.py` files
+- 🔧 Added missing dependencies (PyYAML, torchvision, pillow)
+- 🔧 Resolved YOLOv5Face integration issues
+- 🔧 Updated requirements.txt with complete dependency list
+- ✅ All 32 tests now passing
+
+## Troubleshooting
+
+### Common Issues
+
+#### Import Errors
+If you encounter module import errors:
+```bash
+# Ensure you're in the virtual environment
+source venv/bin/activate
+
+# Reinstall dependencies
+pip install -r requirements.txt
+
+# Verify installation
+python -c "import facekit; print('Success')"
+```
+
+#### Missing Dependencies
+If you get `ModuleNotFoundError`:
+```bash
+# Install missing packages individually
+pip install PyYAML torchvision pillow
+
+# Or reinstall all requirements
+pip install -r requirements.txt --force-reinstall
+```
+
+#### CUDA/GPU Issues
+For GPU acceleration:
+```bash
+# Check CUDA availability
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+
+# Install CUDA-compatible PyTorch if needed
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+```
+
+#### FFmpeg Not Found
+For audio processing features:
+```bash
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt update && sudo apt install ffmpeg
+
+# Windows
+# Download from https://ffmpeg.org/download.html
+```
 
 ## License
 
