@@ -33,7 +33,17 @@ A comprehensive Python toolkit for face detection, tracking, and video processin
 
 ### Prerequisites
 - Python 3.10+ (tested with Python 3.13)
+- Git (for submodule management)
 - FFmpeg (for audio processing)
+
+### Clone Repository with Submodules
+```bash
+# Clone with submodules (recommended)
+git clone --recursive <repository-url>
+
+# Or if already cloned without submodules
+git submodule update --init --recursive
+```
 
 ### Setup Virtual Environment (Recommended)
 ```bash
@@ -264,6 +274,84 @@ Test coverage includes:
 - pytest 8.4.1+
 - All runtime dependencies
 
+## Git Submodule Management
+
+This project uses Git submodules for the YOLOv5Face integration. Here's how to work with them properly:
+
+### Initial Setup
+```bash
+# Clone with submodules
+git clone --recursive <repository-url>
+
+# Or if already cloned, initialize submodules
+git submodule update --init --recursive
+```
+
+### Working with Submodules
+
+#### Pulling Latest Changes
+```bash
+# Pull main repository changes
+git pull origin <branch-name>
+
+# Update submodules to match the references
+git submodule update --recursive
+```
+
+#### Making Changes to Submodules
+If you need to modify the `yolov5faceInference` submodule:
+
+```bash
+# Navigate to submodule
+cd facekit/yolov5faceInference
+
+# Create a new branch for your changes
+git checkout -b feature/your-changes
+
+# Make your changes and commit them
+git add .
+git commit -m "Your descriptive commit message"
+
+# Return to main repository
+cd ../..
+
+# Add the submodule reference update
+git add facekit/yolov5faceInference
+git commit -m "Update yolov5faceInference submodule: Brief description"
+```
+
+#### Checking Submodule Status
+```bash
+# Check if submodules are up to date
+git submodule status
+
+# See submodule changes
+git diff --submodule
+```
+
+### Recent Submodule Updates
+- **v2024.1**: Fixed module import structure in `yolov5faceInference`
+  - Added missing `__init__.py` files for proper Python module structure
+  - Submodule updated to commit `486c8b2` on branch `fix/module-imports`
+
+### Quick Reference: Common Submodule Commands
+```bash
+# Check submodule status
+git submodule status
+
+# Update all submodules to latest committed references
+git submodule update --recursive
+
+# See what changed in submodules
+git diff --submodule
+
+# Initialize missing submodules
+git submodule update --init --recursive
+
+# Force update submodules (discards local changes)
+git submodule update --force --recursive
+```
+
 ## Development & Testing
 
 ### Running Tests
@@ -343,6 +431,56 @@ sudo apt update && sudo apt install ffmpeg
 
 # Windows
 # Download from https://ffmpeg.org/download.html
+```
+
+#### Submodule Issues
+
+**Submodule not found or empty:**
+```bash
+# Initialize and update submodules
+git submodule update --init --recursive
+
+# Force update if needed
+git submodule update --force --recursive
+```
+
+**Import errors from yolov5faceInference:**
+```bash
+# Check submodule status
+git submodule status
+
+# Ensure you're on the correct submodule commit
+cd facekit/yolov5faceInference
+git log --oneline -5
+# Should show commit 486c8b2 or later with "Fix module imports"
+
+# Return to main repo and test
+cd ../..
+python -c "import facekit.yolov5faceInference.yolo5face.yoloface.face_detector; print('✅ Submodule imports working')"
+```
+
+**Submodule shows "modified content":**
+```bash
+# Check what changed in the submodule
+git diff --submodule
+
+# If you want to discard submodule changes
+git submodule update --force
+
+# If you want to commit submodule changes, see "Git Submodule Management" section above
+```
+
+**Team member can't access submodule changes:**
+```bash
+# Ensure they have the latest main repository
+git pull origin <branch-name>
+
+# Update their submodules
+git submodule update --recursive
+
+# If still having issues, re-initialize
+git submodule deinit facekit/yolov5faceInference
+git submodule update --init facekit/yolov5faceInference
 ```
 
 ## License
