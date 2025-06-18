@@ -1,4 +1,4 @@
-# FaceWise Video Toolkit
+# FaceWise Video Toolkit v1.0
 
 A comprehensive Python toolkit for face detection, tracking, and video processing with advanced portrait cropping capabilities. Built on YOLOv5Face for robust face detection and OpenCV for video processing.
 
