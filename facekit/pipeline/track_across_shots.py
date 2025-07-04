@@ -77,7 +77,7 @@ def track_across_shots(
 
         shot_tracks = aggregator.finalize_tracks()
 
-        # 💡 assign globally unique IDs to each track
+        # assign globally unique IDs to each track
         for track in shot_tracks:
             track.track_id = next_global_id
             next_global_id += 1

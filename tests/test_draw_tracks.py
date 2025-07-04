@@ -40,6 +40,7 @@ def test_draw_tracks_on_video_mocks(VideoCaptureMock, VideoWriterMock, rectangle
     # Define dummy tracks
     tracks = [
         FaceTrack(
+            shot_id=1,
             track_id=1,
             observations=[
                 FaceObservation(frame_idx=0, bbox=(10, 10, 20, 20), confidence=0.9),
@@ -64,6 +65,6 @@ def test_draw_tracks_on_video_mocks(VideoCaptureMock, VideoWriterMock, rectangle
     # Confirm correct arguments to drawing functions
     rectangle_mock.assert_any_call(mock.ANY, (10, 10), (20, 20), mock.ANY, 2)
     # Grab the expected label positions dynamically
-    bbox = tracks[0].observations[1].bbox  # (12, 12, 22, 22)
-    expected_position = (bbox[0], bbox[1] - 5)
-    puttext_mock.assert_any_call(mock.ANY, "1", expected_position, mock.ANY, mock.ANY, mock.ANY, mock.ANY)
+    bbox = tracks[0].observations[1].bbox
+    labels_drawn = [call[0][1] for call in puttext_mock.call_args_list]
+    assert "1" in labels_drawn

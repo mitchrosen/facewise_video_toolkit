@@ -36,6 +36,7 @@ class FaceTrack:
     Represents a series of face observations believed to belong to the same person.
 
     Attributes:
+        shot_id (int): Unique identifier for the shot that contains this track.
         track_id (int): Unique identifier for this track.
         observations (List[FaceObservation]): Chronologically ordered list of observations.
         is_active (bool): Whether this track is still active.
@@ -44,6 +45,7 @@ class FaceTrack:
         Observations are also indexed internally by frame index for quick access.
         Duplicate frame indices are disallowed unless `force=True` is used.
     """
+    shot_id: int
     track_id: int
     observations: List[FaceObservation] = field(default_factory=list)
     is_active: bool = True

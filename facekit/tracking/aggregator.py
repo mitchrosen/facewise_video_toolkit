@@ -56,7 +56,7 @@ class ShotFaceTrackAggregator:
                     matched = True
                     break
             if not matched:
-                new_track = FaceTrack(track_id=self.next_track_id)
+                new_track = FaceTrack(track_id=self.next_track_id, shot_id=self.shot_number)
                 new_track.add_observation(obs)
                 self.tracks.append(new_track)
                 self.next_track_id += 1
@@ -120,7 +120,7 @@ class ShotFaceTrackAggregator:
         """
         if not track.observations:
             return False
-        temp = FaceTrack(track_id=-1, observations=[obs])
+        temp = FaceTrack(track_id=-1, shot_id=-1, observations=[obs])
         return track.can_merge_with(
             temp,
             iou_thresh=iou_threshold if iou_threshold is not None else self.iou_threshold,

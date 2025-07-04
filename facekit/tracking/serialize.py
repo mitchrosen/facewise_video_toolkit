@@ -17,6 +17,7 @@ def tracks_to_json_dict(tracks, include_embeddings=False):
     return {
         "tracks": [
             {
+                "shot_id": track.shot_id,
                 "track_id": track.track_id,
                 "observations": [
                     {
@@ -44,6 +45,7 @@ def load_tracks_from_json_dict(json_dict):
     """
     tracks = []
     for t in json_dict.get("tracks", []):
+        shot_id = t["shot_id"]
         track_id = t["track_id"]
         observations = [
             FaceObservation(
@@ -54,7 +56,7 @@ def load_tracks_from_json_dict(json_dict):
             )
             for obs in t["observations"]
         ]
-        tracks.append(FaceTrack(track_id=track_id, observations=observations))
+        tracks.append(FaceTrack(shot_id= shot_id, track_id=track_id, observations=observations))
     return tracks
 
 def save_tracks_to_json_file(tracks, output_path, include_embeddings=False):

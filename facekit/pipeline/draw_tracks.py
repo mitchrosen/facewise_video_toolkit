@@ -40,6 +40,7 @@ def draw_tracks_on_video(
             overlay_map.setdefault(obs.frame_idx, []).append((obs.bbox, label))
 
     for frame_idx in range(total_frames):
+        
         ret, frame = cap.read()
         if not ret:
             break
@@ -48,8 +49,8 @@ def draw_tracks_on_video(
         for bbox, label in overlays:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, str(label), (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(frame, str(label), (x1, y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         out.write(frame)
 
