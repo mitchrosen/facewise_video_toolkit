@@ -49,6 +49,8 @@ class FaceTrack:
     track_id: int
     observations: List[FaceObservation] = field(default_factory=list)
     is_active: bool = True
+    embeddings: List[np.ndarray] = field(default_factory=list)
+    global_id: Optional[int] = None  # ✅ Add this line
     
     def __post_init__(self):
         self._frame_index_map = {}
@@ -74,6 +76,11 @@ class FaceTrack:
                 raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
         self._frame_index_map[obs.frame_idx] = obs
         self.observations.append(obs)
+        if obs.embedding is not None:
+            self.embeddings.append(obs.embedding)
+ 
+    def has_embedding(self):
+        return any(obs.embedding is not None for obs in self.observations)
 
     def get_bbox_by_observation_index(self, idx: int) -> Optional[Tuple[int, int, int, int]]:
         if 0 <= idx < len(self.observations):
@@ -156,7 +163,7 @@ class FaceTrack:
         embedding_thresh: float = 0.6
     ) -> bool:
         """
-        Determine if this track can be merged with another based on spatial and embedding similarity.
+        Determine if this track can be merged with another based on spatial and embedding distance (1 - similarity).
 
         Compares the last bbox and average embedding of this track with the first bbox and average embedding of the other.
 

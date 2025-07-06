@@ -7,6 +7,20 @@ from pathlib import Path
 from facekit.pipeline.track_across_shots import track_across_shots
 from facekit.tracking.face_tracks import FaceObservation
 
+class FakeEmbedder:
+    counter = 0
+
+    def get_embedding(self, frame, box):
+        emb = np.zeros(512, dtype=np.float32)
+        emb[FakeEmbedder.counter % 512] = 1.0  # Unique unit vector per call
+        nonzero_index = np.argmax(emb)
+        FakeEmbedder.counter += 1
+        return emb
+    
+@pytest.fixture(autouse=True)
+def reset_embedder_counter_each_test():
+    FakeEmbedder.counter = 0
+
 @pytest.fixture
 def dummy_video(tmp_path):
     path = tmp_path / "dummy.mp4"
@@ -62,14 +76,29 @@ def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json)
         shot_json_path=str(dummy_shot_json),
         model_path="fake.pt",
         config_path="fake.yaml",
+        embedder=FakeEmbedder(),
     )
 
     # Basic checks
-    assert len(tracks) == 10  # 1 detection per frame
-    print("past assert, 1")
+    assert len(tracks) == 10
+    assert sum(len(t.observations) for t in tracks) == 10
     track_ids = {t.track_id for t in tracks}
-    assert track_ids == set(range(10))
-    print("past assert, 2")
+
+    assert len(tracks) == 10
+
+    # Track IDs are reused per shot, so max unique IDs per shot = 5
+    # Expect only 0–4 repeated twice
+    track_ids = [t.track_id for t in tracks]
+    assert set(track_ids).issubset(set(range(5)))
+    assert track_ids.count(0) == 2  # Each ID appears twice (once per shot)
+    assert track_ids.count(1) == 2
+    assert track_ids.count(2) == 2
+    assert track_ids.count(3) == 2
+    assert track_ids.count(4) == 2
+
+    # Global IDs should be unique for each face (since embeddings differ)
+    global_ids = [t.global_id for t in tracks]
+    assert set(global_ids) == set(range(10))
 
     for idx, track in enumerate(tracks):
         assert len(track.observations) == 1
@@ -77,7 +106,11 @@ def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json)
         assert isinstance(obs, FaceObservation)
         val = idx * 10
         assert obs.bbox == (val, val, val+5, val+5)
-        assert obs.embedding is None  # No embedding model used
+
+        expected = np.zeros(512, dtype=np.float32)
+        expected[idx % 512] = 1.0
+        np.testing.assert_array_equal(obs.embedding, expected)
+        
         assert obs.confidence == 0.99
 
     # test frame indices

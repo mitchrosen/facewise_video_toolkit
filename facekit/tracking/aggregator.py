@@ -8,7 +8,7 @@ class ShotFaceTrackAggregator:
 
     This class processes per-frame face observations, associating them with
     ongoing face tracks or initializing new ones when no matches are found.
-    Matching is based on spatial (IoU) and optional embedding similarity.
+    Matching is based on spatial (IoU) and optional embedding distance (1 - similarity).
 
     Attributes:
         shot_number (int): Identifier for the video shot.
@@ -30,7 +30,7 @@ class ShotFaceTrackAggregator:
         Args:
             shot_number (int): Unique identifier for the shot.
             iou_threshold (float): IoU threshold to use for spatial matching.
-            embedding_threshold (float): Cosine distance threshold for embedding similarity.
+            embedding_threshold (float): Maximum cosine distance (1 - similarity) for embedding match.
         """
         self.shot_number = shot_number
         self.iou_threshold = iou_threshold
@@ -60,6 +60,82 @@ class ShotFaceTrackAggregator:
                 new_track.add_observation(obs)
                 self.tracks.append(new_track)
                 self.next_track_id += 1
+
+    def resolve_global_ids(
+        self,
+        prior_tracks: List[FaceTrack],
+        global_id_counter: int,
+        embedding_threshold: float = 0.6
+    ) -> int:
+        """
+        Assigns global IDs to current shot's tracks using a 3-pass strategy:
+        1. Match against active tracks in this shot (IoU + embedding)
+        2. Match against inactive tracks in this shot (embedding only)
+        3. Match against prior shots' tracks (embedding only)
+        4. Assign new global ID if no match
+
+        Modifies each track in-place to set .global_id
+        Returns the updated global_id_counter
+        """
+        for track in self.tracks:
+            if not track.has_embedding():
+                track.global_id = global_id_counter
+                global_id_counter += 1
+                continue
+
+            best_match = None
+            best_score = float("inf")
+
+            # Pass 1: match active tracks in this shot (IoU + embedding)
+            for candidate in self.tracks:
+                if candidate is track or not candidate.is_active:
+                    continue
+                if candidate.global_id is None:
+                    continue
+                if not candidate.has_embedding():
+                    continue
+                if track.can_merge_with(candidate, iou_thresh=self.iou_threshold, embedding_thresh=embedding_threshold):
+                    best_match = candidate
+                    break  # Prefer exact match and stop early
+
+            # Pass 2: match inactive tracks in this shot (embedding only)
+            if best_match is None:
+                for candidate in self.tracks:
+                    if candidate is track or candidate.is_active:
+                        continue
+                    if candidate.global_id is None:
+                        continue
+                    if not candidate.has_embedding():
+                        continue
+                    sim = 1 - np.dot(
+                        track.compute_average_embedding(),
+                        candidate.compute_average_embedding()
+                    )
+                    if sim < embedding_threshold and sim < best_score:
+                        best_score = sim
+                        best_match = candidate
+
+            # Pass 3: match against global prior tracks (embedding only)
+            if best_match is None:
+                for prior in prior_tracks:
+                    if not prior.has_embedding():
+                        continue
+                    sim = 1 - np.dot(
+                        track.compute_average_embedding(),
+                        prior.compute_average_embedding()
+                    )
+                    if sim < embedding_threshold and sim < best_score:
+                        best_score = sim
+                        best_match = prior
+
+            # Assign result
+            if best_match:
+                track.global_id = best_match.global_id
+            else:
+                track.global_id = global_id_counter
+                global_id_counter += 1
+
+        return global_id_counter
 
     def finalize_tracks(self) -> List[FaceTrack]:
         """

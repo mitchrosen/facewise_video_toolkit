@@ -2,6 +2,7 @@ import json
 import cv2
 from pathlib import Path
 from typing import List
+import numpy as np
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.detection_helpers import detect_faces_in_frame
@@ -11,10 +12,11 @@ from facekit.tracking.aggregator import ShotFaceTrackAggregator
 def track_across_shots(
     video_path: str,
     shot_json_path: str,
+    embedder=None ,
     model_path: str = "models/yolov5n_state_dict.pt",
     config_path: str = "models/yolov5n.yaml",
     iou_thresh: float = 0.5,
-    embedding_thresh: float = 0.6
+    embedding_thresh: float = 0.6,
 ) -> List[FaceTrack]:
     """
     Track faces across the entire video, shot by shot, returning intra-shot tracks.
@@ -22,10 +24,13 @@ def track_across_shots(
     Args:
         video_path (str): Path to the input video.
         shot_json_path (str): Path to the shot_features.json file.
+        embedder (Optional[object]): Optional face embedding extractor with a
+            `get_embedding(frame, bbox)` method. Used to generate embeddings
+            for identity resolution across shots.
         model_path (str): Path to the YOLOv5 face model weights.
         config_path (str): Path to the YOLOv5 model config.
         iou_thresh (float): IoU threshold for track matching.
-        embedding_thresh (float): Embedding similarity threshold for merging.
+        embedding_thresh (float): Embedding distance threshold for merging.
 
     Returns:
         List[FaceTrack]: A flat list of all face tracks from all shots.
@@ -69,20 +74,32 @@ def track_across_shots(
             if results is None:
                 continue
             boxes, _, confs = results
-            observations = [
-                FaceObservation(frame_idx=frame_idx, bbox=tuple(map(int, box)), confidence=conf)
-                for box, conf in zip(boxes, confs)
-            ]
+
+            observations = []
+            for box, conf in zip(boxes, confs):
+                x1, y1, x2, y2 = map(int, box)
+                embedding = embedder.get_embedding(frame, box) if embedder else None
+
+                obs = FaceObservation(
+                    frame_idx=frame_idx,
+                    bbox=(x1, y1, x2, y2),
+                    confidence=conf,
+                    embedding=embedding
+                )
+                observations.append(obs)
+                
             aggregator.add_frame_observations(frame_idx, observations)
 
-        shot_tracks = aggregator.finalize_tracks()
+        aggregator.finalize_tracks()
 
-        # assign globally unique IDs to each track
-        for track in shot_tracks:
-            track.track_id = next_global_id
-            next_global_id += 1
+        # ✅ Assign global IDs using match logic across shots
+        next_global_id = aggregator.resolve_global_ids(
+            prior_tracks=all_tracks,
+            global_id_counter=next_global_id,
+            embedding_threshold=embedding_thresh
+        )
 
-        all_tracks.extend(shot_tracks)
+        all_tracks.extend(aggregator.tracks)
 
     cap.release()
     return all_tracks

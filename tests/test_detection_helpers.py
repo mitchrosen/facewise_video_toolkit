@@ -30,7 +30,6 @@ def visualize_mask_regions(
     Create an image showing which regions are expected (dot, box, confidence)
     and highlight unexpected modifications (leaked pixels).
     """
-    print("in visualize_mask_regions")
     vis = np.zeros_like(original)
 
     # Set channels for different regions
