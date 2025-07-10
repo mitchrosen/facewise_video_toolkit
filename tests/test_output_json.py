@@ -2,7 +2,7 @@ import json
 import numpy as np
 import pytest
 from unittest.mock import patch, MagicMock, mock_open
-from facekit.pipeline.json_writer import multiface_tracking_to_json
+from facekit.output.json_writer import multiface_tracking_to_json
 
 # --- Calculate derived detection results and expected JSON ---
 def to_det_result(box, conf):
@@ -17,11 +17,11 @@ def to_json_face(box, conf=None, source="tracked"):
         return {"x": x, "y": y, "w": w, "h": h, "source": source}
 
 @patch("facekit.tracking.face_tracker.FaceTracker.update_trackers")
-@patch("facekit.pipeline.json_writer.load_yolo5face_model")
+@patch("facekit.output.json_writer.load_yolo5face_model")
 @patch("torch.cuda.is_available", return_value=True)
-@patch("facekit.pipeline.json_writer.detect_faces_in_frame")
+@patch("facekit.output.json_writer.detect_faces_in_frame")
 @patch("cv2.VideoCapture")
-@patch("facekit.pipeline.json_writer.open", new_callable=mock_open)
+@patch("facekit.output.json_writer.open", new_callable=mock_open)
 def test_multiface_tracking_to_json_precise_boxes(
     mock_file, mock_capture, mock_detect, mock_cuda, mock_load_model, mock_track
 ):
