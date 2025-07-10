@@ -86,7 +86,7 @@ def test_embedding_similarity_close_images():
         emb = []
         for face_version in range(1,5):
             face = load_face(f"tests/assets/faces/face{face_num}_{face_version}.jpg")
-            show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
+            # show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
             emb.append(embedder.get_embedding(face))
 
         for face_version1 in range(4):
@@ -103,7 +103,7 @@ def test_embedding_similarity_different_images():
         emb = []
         for face_num in range(1,4):
             face = load_face(f"tests/assets/faces/face{face_num}_{face_version}.jpg")
-            show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
+            # show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
             emb.append(embedder.get_embedding(face))
 
         for face_num1 in range(3):
