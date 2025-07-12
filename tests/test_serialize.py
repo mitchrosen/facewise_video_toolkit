@@ -10,7 +10,7 @@ from facekit.tracking.serialize import (
     load_tracks_from_json_file,
     load_tracks_from_json_dict,
 )
-from facekit.tracking.face_tracks import FaceTrack, FaceObservation
+from facekit.tracking.face_structures import FaceTrack, FaceObservation
 
 def create_dummy_tracks():
     return [

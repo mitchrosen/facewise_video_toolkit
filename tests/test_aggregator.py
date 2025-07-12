@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from facekit.tracking.face_tracks import FaceObservation, FaceTrack
+from facekit.tracking.face_structures import FaceObservation, FaceTrack
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 
 

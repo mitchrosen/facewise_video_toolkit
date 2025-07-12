@@ -6,7 +6,7 @@ import numpy as np
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.detection_helpers import detect_faces_in_frame
-from facekit.tracking.face_tracks import FaceObservation, FaceTrack
+from facekit.tracking.face_structures import FaceObservation, FaceTrack
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 
 def track_across_shots(

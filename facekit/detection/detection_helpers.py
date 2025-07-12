@@ -3,7 +3,7 @@ import numpy as np
 from typing import List, Tuple, Union
 from numpy import ndarray
 from typing import Optional, Tuple, List
-from facekit.tracking.face_tracks import FaceObservation
+from facekit.tracking.face_structures import FaceObservation
 from facekit.detection.yolo5face_model import load_yolo5face_model
 
 def detect_faces_in_frame(
@@ -151,7 +151,7 @@ def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
 
         embedding = None
         if embedding_model is not None:
-            embedding = get_embedding_from_crop(face_crop)
+            embedding = embedding_model.get_embedding(face_crop)
 
         obs = FaceObservation(
             frame_idx=frame_idx,
@@ -162,16 +162,3 @@ def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
         observations.append(obs)
 
     return observations
-
-
-# Ready for plug in of an actual face embedding model
-def get_embedding_from_crop(face_crop: np.ndarray) -> np.ndarray:
-    # This is placeholder logic. Replace with real embedding generation.
-    face_resized = cv2.resize(face_crop, (112, 112))  # if needed
-    face_input = face_resized.astype(np.float32) / 255.0
-    face_input = np.transpose(face_input, (2, 0, 1))[np.newaxis, ...]  # NCHW
-    face_input_tensor = torch.tensor(face_input).to("cuda" if torch.cuda.is_available() else "cpu")
-
-    with torch.no_grad():
-        embedding = embedding_model(face_input_tensor).cpu().numpy().flatten()
-    return embedding

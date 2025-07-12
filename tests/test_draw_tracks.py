@@ -2,7 +2,7 @@ import pytest
 from unittest import mock
 import numpy as np
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
-from facekit.tracking.face_tracks import FaceObservation, FaceTrack
+from facekit.tracking.face_structures import FaceObservation, FaceTrack
 
 @mock.patch("cv2.putText")
 @mock.patch("cv2.rectangle")

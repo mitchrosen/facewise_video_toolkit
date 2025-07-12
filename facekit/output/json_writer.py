@@ -1,10 +1,11 @@
 import cv2
 import torch
 import json
+from typing import Dict, List
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.detection_helpers import detect_faces_in_frame
 from facekit.tracking.face_tracker import FaceTracker
-
+from facekit.tracking.face_structures import FaceTrack
 
 def multiface_tracking_to_json(
     input_path: str,
@@ -127,3 +128,26 @@ def multiface_tracking_to_json(
 
     print(f"✅ JSON tracking output saved to: {output_json_path}")
     print(f"📊 Total frames processed: {frame_num}")
+
+
+def export_global_id_map(
+    shot_to_tracks: Dict[str, List[FaceTrack]],
+    output_path: str
+):
+    """
+    Saves a mapping of shot → track → global face ID to a JSON file.
+
+    Args:
+        shot_to_tracks: Dict mapping shot_id to list of FaceTrack objects
+        output_path: Path to output JSON
+    """
+    result = {}
+    for shot_id, track_list in shot_to_tracks.items():
+        result[shot_id] = {
+            track.track_id: f"face_{track.global_id}"
+            for track in track_list
+            if track.global_id is not None
+        }
+
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)

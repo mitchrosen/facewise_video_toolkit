@@ -1,6 +1,6 @@
 from typing import List, Dict, Optional
 import numpy as np
-from .face_tracks import FaceTrack, FaceObservation
+from .face_structures import FaceTrack, FaceObservation
 
 class ShotFaceTrackAggregator:
     """
@@ -60,6 +60,11 @@ class ShotFaceTrackAggregator:
                 new_track.add_observation(obs)
                 self.tracks.append(new_track)
                 self.next_track_id += 1
+    @staticmethod
+    def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+        a = a / np.linalg.norm(a)
+        b = b / np.linalg.norm(b)
+        return 1 - np.dot(a, b)
 
     def resolve_global_ids(
         self,
@@ -78,6 +83,9 @@ class ShotFaceTrackAggregator:
         Returns the updated global_id_counter
         """
         for track in self.tracks:
+            if track.global_id is not None:
+                continue  # Do not overwrite existing global_id!
+            
             if not track.has_embedding():
                 track.global_id = global_id_counter
                 global_id_counter += 1
@@ -107,10 +115,14 @@ class ShotFaceTrackAggregator:
                         continue
                     if not candidate.has_embedding():
                         continue
-                    sim = 1 - np.dot(
-                        track.compute_average_embedding(),
-                        candidate.compute_average_embedding()
-                    )
+
+                    # sim = self.cosine_distance(track.compute_average_embedding(), 
+                    #                       candidate.compute_average_embedding())
+
+                    emb1 = track.compute_average_embedding()
+                    emb2 = candidate.compute_average_embedding()
+                    sim = 1 - np.dot(emb1 / np.linalg.norm(emb1), emb2 / np.linalg.norm(emb2))
+
                     if sim < embedding_threshold and sim < best_score:
                         best_score = sim
                         best_match = candidate
@@ -120,10 +132,9 @@ class ShotFaceTrackAggregator:
                 for prior in prior_tracks:
                     if not prior.has_embedding():
                         continue
-                    sim = 1 - np.dot(
-                        track.compute_average_embedding(),
-                        prior.compute_average_embedding()
-                    )
+                    sim = self.cosine_distance(track.compute_average_embedding(), 
+                                          prior.compute_average_embedding())
+
                     if sim < embedding_threshold and sim < best_score:
                         best_score = sim
                         best_match = prior

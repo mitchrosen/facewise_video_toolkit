@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from facekit.tracking.face_tracks import FaceTrack, FaceObservation
+from facekit.tracking.face_structures import FaceTrack, FaceObservation
 
 
 def tracks_to_json_dict(tracks, include_embeddings=False):

@@ -6,7 +6,7 @@ from facekit.pipeline.track_across_shots import track_across_shots
 from facekit.tracking.serialize import tracks_to_json_dict
 from facekit.pipeline.generate_shot_features import generate_shot_features_json
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
-from facekit.tracking.face_tracks import FaceTrack
+from facekit.tracking.face_structures import FaceTrack
 
 def main():
     parser = argparse.ArgumentParser(description="Track faces across shots in a video")

@@ -1,7 +1,7 @@
 from typing import List, Callable, Optional
 import cv2
 from pathlib import Path
-from facekit.tracking.face_tracks import FaceTrack
+from facekit.tracking.face_structures import FaceTrack
 
 def draw_tracks_on_video(
     video_path: str,

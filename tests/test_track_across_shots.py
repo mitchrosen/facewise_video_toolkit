@@ -5,7 +5,7 @@ import tempfile
 import json
 from pathlib import Path
 from facekit.pipeline.track_across_shots import track_across_shots
-from facekit.tracking.face_tracks import FaceObservation
+from facekit.tracking.face_structures import FaceObservation
 
 class FakeEmbedder:
     counter = 0

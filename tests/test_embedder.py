@@ -1,12 +1,9 @@
+import sys
 import numpy as np
 import pytest
 import cv2
 import matplotlib.pyplot as plt
 from facekit.embedding.embedder import FaceEmbedder
-
-import sys
-print("Python executable:", sys.executable)
-print("sys.path:", sys.path)
 
 @pytest.fixture
 def dummy_frame():
@@ -18,43 +15,43 @@ def dummy_bbox():
     # Valid centered face box
     return [50, 50, 150, 150]
 
+@pytest.fixture(scope="session")
+def shared_embedder():
+    return FaceEmbedder()
+
 def load_face(path):
     img = cv2.imread(path)
     if img is None:
         raise FileNotFoundError(f"Could not load image at {path}")
     return img
 
-def test_embedding_basic_face():
+def test_embedding_basic_face(shared_embedder):
     face = load_face("tests/assets/faces/face1_1.jpg")
-    embedder = FaceEmbedder()
-    embedding = embedder.get_embedding(face)
+    embedding = shared_embedder.get_embedding(face)
 
     assert embedding is not None, "Embedding is None"
     assert embedding.shape == (512,), f"Unexpected shape: {embedding.shape}"
 
-def test_embedding_shape_and_type(dummy_frame):
+def test_embedding_shape_and_type(dummy_frame, shared_embedder):
     face = load_face("tests/assets/faces/face1_1.jpg")
-    embedder = FaceEmbedder()
-    embedding = embedder.get_embedding(face)
+    embedding = shared_embedder.get_embedding(face)
 
     assert isinstance(embedding, np.ndarray)
     assert embedding.dtype == np.float32
     assert embedding.shape == (512,)
 
-def test_embedding_is_normalized(dummy_frame):
+def test_embedding_is_normalized(dummy_frame, shared_embedder):
     face = load_face("tests/assets/faces/face1_1.jpg")
-    embedder = FaceEmbedder()
-    embedding = embedder.get_embedding(face)
+    embedding = shared_embedder.get_embedding(face)
 
     norm = np.linalg.norm(embedding)
     assert np.isclose(norm, 1.0, atol=1e-3), f"Embedding norm was {norm}"
 
-def test_embedding_is_deterministic(dummy_frame):
+def test_embedding_is_deterministic(dummy_frame, shared_embedder):
     face = load_face("tests/assets/faces/face1_1.jpg")
-    embedder = FaceEmbedder()
 
-    emb1 = embedder.get_embedding(face)
-    emb2 = embedder.get_embedding(face)
+    emb1 = shared_embedder.get_embedding(face)
+    emb2 = shared_embedder.get_embedding(face)
 
     assert np.allclose(emb1, emb2), "Embedding not deterministic"
 
@@ -79,15 +76,14 @@ def show_face_image(img: np.ndarray, title: str = "Face Image") -> None:
     plt.axis("off")
     plt.show()
 
-def test_embedding_similarity_close_images():
-    embedder = FaceEmbedder()
+def test_embedding_similarity_close_images(shared_embedder):
 
     for face_num in range(1,4):
         emb = []
         for face_version in range(1,5):
             face = load_face(f"tests/assets/faces/face{face_num}_{face_version}.jpg")
             # show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
-            emb.append(embedder.get_embedding(face))
+            emb.append(shared_embedder.get_embedding(face))
 
         for face_version1 in range(4):
             for face_version2 in range(4):
@@ -96,15 +92,14 @@ def test_embedding_similarity_close_images():
                 similarity = np.dot(emb[face_version1], emb[face_version2])
                 assert similarity > 0.30, f"for face{face_num} comparing version {face_version1} vs {face_version2}, expected high similarity, got {similarity:.4f}"
 
-def test_embedding_similarity_different_images():
-    embedder = FaceEmbedder()
+def test_embedding_similarity_different_images(shared_embedder):
 
     for face_version in range(1,5):
         emb = []
         for face_num in range(1,4):
             face = load_face(f"tests/assets/faces/face{face_num}_{face_version}.jpg")
             # show_face_image(face, f"test_embedding_similarity_close_images(), face{face_num}_{face_version}")
-            emb.append(embedder.get_embedding(face))
+            emb.append(shared_embedder.get_embedding(face))
 
         for face_num1 in range(3):
             for face_num2 in range(3):
