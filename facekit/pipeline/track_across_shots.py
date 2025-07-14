@@ -51,7 +51,7 @@ def track_across_shots(
         raise RuntimeError(f"Could not open video: {video_path}")
 
     all_tracks = []
-    next_global_id = 0
+    next_vchunk_id = 0
 
     for shot in shots:
         shot_number = shot["shot_number"]
@@ -92,10 +92,10 @@ def track_across_shots(
 
         aggregator.finalize_tracks()
 
-        # ✅ Assign global IDs using match logic across shots
-        next_global_id = aggregator.resolve_global_ids(
+        # ✅ Assign vchunk IDs using match logic within chunk
+        next_vchunk_id = aggregator.resolve_vchunk_ids(
             prior_tracks=all_tracks,
-            global_id_counter=next_global_id,
+            vchunk_id_counter=next_vchunk_id,
             embedding_threshold=embedding_thresh
         )
 

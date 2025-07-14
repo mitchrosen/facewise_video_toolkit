@@ -130,12 +130,12 @@ def multiface_tracking_to_json(
     print(f"📊 Total frames processed: {frame_num}")
 
 
-def export_global_id_map(
+def export_vchunk_id_map(
     shot_to_tracks: Dict[str, List[FaceTrack]],
     output_path: str
 ):
     """
-    Saves a mapping of shot → track → global face ID to a JSON file.
+    Saves a mapping of shot → track → vchunk ID to a JSON file.
 
     Args:
         shot_to_tracks: Dict mapping shot_id to list of FaceTrack objects
@@ -144,9 +144,9 @@ def export_global_id_map(
     result = {}
     for shot_id, track_list in shot_to_tracks.items():
         result[shot_id] = {
-            track.track_id: f"face_{track.global_id}"
+            track.track_id: f"face_{track.vchunk_id}"
             for track in track_list
-            if track.global_id is not None
+            if track.vchunk_id is not None
         }
 
     with open(output_path, "w") as f:

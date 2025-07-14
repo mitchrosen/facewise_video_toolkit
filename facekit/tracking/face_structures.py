@@ -50,7 +50,7 @@ class FaceTrack:
     observations: List[FaceObservation] = field(default_factory=list)
     is_active: bool = True
     embeddings: List[np.ndarray] = field(default_factory=list)
-    global_id: Optional[int] = None  # ✅ Add this line
+    vchunk_id: Optional[int] = None  
     
     def __post_init__(self):
         self._frame_index_map = {}

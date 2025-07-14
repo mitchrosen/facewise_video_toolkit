@@ -13,8 +13,6 @@ def dummy_track(track_id, shot_id, embedding=None):
 
 
 def test_assigns_unique_ids_when_no_embeddings():
-    print("\n[Running test_assigns_unique_ids_when_no_embeddings]")
-
     aggregator = ShotFaceTrackAggregator(shot_number=0)
     obs1 = dummy_observation(0, (10, 10, 50, 50))
     obs2 = dummy_observation(0, (100, 100, 150, 150))
@@ -22,19 +20,17 @@ def test_assigns_unique_ids_when_no_embeddings():
     aggregator.add_frame_observations(0, [obs1, obs2])
     aggregator.finalize_tracks()
     
-    global_id_counter = 0
-    updated_counter = aggregator.resolve_global_ids([], global_id_counter)
+    vchunk_id_counter = 0
+    updated_counter = aggregator.resolve_vchunk_ids([], vchunk_id_counter)
 
-    global_ids = [track.global_id for track in aggregator.tracks]
+    vchunk_ids = [track.vchunk_id for track in aggregator.tracks]
     
-    assert len(set(global_ids)) == 2
-    assert sorted(global_ids) == [0, 1]
+    assert len(set(vchunk_ids)) == 2
+    assert sorted(vchunk_ids) == [0, 1]
     assert updated_counter == 2
 
 
-def test_reuses_global_id_on_same_embedding_within_shot():
-    print("\n[Running test_reuses_global_id_on_same_embedding_within_shot]")
-
+def test_reuses_vchunk_id_on_same_embedding_within_chunk():
     shared_embedding = np.ones(512, dtype=np.float32)
 
     aggregator = ShotFaceTrackAggregator(shot_number=0)
@@ -46,14 +42,14 @@ def test_reuses_global_id_on_same_embedding_within_shot():
     aggregator.add_frame_observations(1, [obs2])
     aggregator.finalize_tracks()
 
-    # Manually assign global_id to first track to simulate one resolved earlier
-    aggregator.tracks[0].global_id = 42
+    # Manually assign vchunk_id to first track to simulate one resolved earlier
+    aggregator.tracks[0].vchunk_id = 42
     aggregator.tracks[0].is_active = False 
 
-    global_id_counter = 43
-    updated_counter = aggregator.resolve_global_ids([], global_id_counter)
+    vchunk_id_counter = 43
+    updated_counter = aggregator.resolve_vchunk_ids([], vchunk_id_counter)
 
-    assert aggregator.tracks[1].global_id == 42
+    assert aggregator.tracks[1].vchunk_id == 42
     assert updated_counter == 43  # No new ID consumed
 
 def test_does_not_merge_dissimilar_embeddings():
@@ -70,21 +66,21 @@ def test_does_not_merge_dissimilar_embeddings():
     aggregator.add_frame_observations(1, [obs2])
     aggregator.finalize_tracks()
 
-    aggregator.tracks[0].global_id = 42
+    aggregator.tracks[0].vchunk_id = 42
     aggregator.tracks[0].is_active = False
 
-    updated_counter = aggregator.resolve_global_ids([], global_id_counter=43)
+    updated_counter = aggregator.resolve_vchunk_ids([], vchunk_id_counter=43)
 
-    assert aggregator.tracks[1].global_id == 43
+    assert aggregator.tracks[1].vchunk_id == 43
     assert updated_counter == 44
 
 def test_reuses_id_from_prior_tracks():
     emb = np.ones(512, dtype=np.float32)
     emb /= np.linalg.norm(emb)
 
-    # Create a prior track from a previous shot
+    # Create a prior track from a previous chunk
     prior_track = dummy_track(track_id=0, shot_id=99, embedding=emb)
-    prior_track.global_id = 101  # Simulated global assignment
+    prior_track.vchunk_id = 101  # Simulated vchunk_id assignment
 
     # New shot
     aggregator = ShotFaceTrackAggregator(shot_number=0)
@@ -92,9 +88,9 @@ def test_reuses_id_from_prior_tracks():
     aggregator.add_frame_observations(0, [obs])
     aggregator.finalize_tracks()
 
-    updated_counter = aggregator.resolve_global_ids([prior_track], global_id_counter=102)
+    updated_counter = aggregator.resolve_vchunk_ids([prior_track], vchunk_id_counter=102)
 
-    assert aggregator.tracks[0].global_id == 101
+    assert aggregator.tracks[0].vchunk_id == 101
     assert updated_counter == 102  # No new ID consumed
 
 def test_skips_tracks_without_embedding():
@@ -103,13 +99,13 @@ def test_skips_tracks_without_embedding():
     aggregator.add_frame_observations(0, [obs])
     aggregator.finalize_tracks()
 
-    updated_counter = aggregator.resolve_global_ids([], global_id_counter=5)
+    updated_counter = aggregator.resolve_vchunk_ids([], vchunk_id_counter=5)
 
-    assert aggregator.tracks[0].global_id == 5
+    assert aggregator.tracks[0].vchunk_id == 5
     assert updated_counter == 6
 
 
-def test_preserves_preassigned_global_id():
+def test_preserves_preassigned_vchunk_id():
     emb = np.ones(512, dtype=np.float32)
     emb /= np.linalg.norm(emb)
 
@@ -118,9 +114,9 @@ def test_preserves_preassigned_global_id():
     aggregator.add_frame_observations(0, [obs])
     aggregator.finalize_tracks()
 
-    aggregator.tracks[0].global_id = 77  # Preassigned
-    updated_counter = aggregator.resolve_global_ids([], global_id_counter=78)
+    aggregator.tracks[0].vchunk_id = 77  # Preassigned
+    updated_counter = aggregator.resolve_vchunk_ids([], vchunk_id_counter=78)
 
-    assert aggregator.tracks[0].global_id == 77
+    assert aggregator.tracks[0].vchunk_id == 77
     assert updated_counter == 78
 

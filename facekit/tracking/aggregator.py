@@ -66,29 +66,29 @@ class ShotFaceTrackAggregator:
         b = b / np.linalg.norm(b)
         return 1 - np.dot(a, b)
 
-    def resolve_global_ids(
+    def resolve_vchunk_ids(
         self,
         prior_tracks: List[FaceTrack],
-        global_id_counter: int,
+        vchunk_id_counter: int,
         embedding_threshold: float = 0.6
     ) -> int:
         """
-        Assigns global IDs to current shot's tracks using a 3-pass strategy:
+        Assigns vchunk IDs to current shot's tracks using a 3-pass strategy:
         1. Match against active tracks in this shot (IoU + embedding)
         2. Match against inactive tracks in this shot (embedding only)
         3. Match against prior shots' tracks (embedding only)
-        4. Assign new global ID if no match
+        4. Assign new vchunk ID if no match
 
-        Modifies each track in-place to set .global_id
-        Returns the updated global_id_counter
+        Modifies each track in-place to set .vchunk_id
+        Returns the updated vchunk_id_counter
         """
         for track in self.tracks:
-            if track.global_id is not None:
-                continue  # Do not overwrite existing global_id!
+            if track.vchunk_id is not None:
+                continue  # Do not overwrite existing vchunk_id!
             
             if not track.has_embedding():
-                track.global_id = global_id_counter
-                global_id_counter += 1
+                track.vchunk_id = vchunk_id_counter
+                vchunk_id_counter += 1
                 continue
 
             best_match = None
@@ -98,7 +98,7 @@ class ShotFaceTrackAggregator:
             for candidate in self.tracks:
                 if candidate is track or not candidate.is_active:
                     continue
-                if candidate.global_id is None:
+                if candidate.vchunk_id is None:
                     continue
                 if not candidate.has_embedding():
                     continue
@@ -111,7 +111,7 @@ class ShotFaceTrackAggregator:
                 for candidate in self.tracks:
                     if candidate is track or candidate.is_active:
                         continue
-                    if candidate.global_id is None:
+                    if candidate.vchunk_id is None:
                         continue
                     if not candidate.has_embedding():
                         continue
@@ -127,7 +127,7 @@ class ShotFaceTrackAggregator:
                         best_score = sim
                         best_match = candidate
 
-            # Pass 3: match against global prior tracks (embedding only)
+            # Pass 3: match against prior tracks (embedding only)
             if best_match is None:
                 for prior in prior_tracks:
                     if not prior.has_embedding():
@@ -141,12 +141,12 @@ class ShotFaceTrackAggregator:
 
             # Assign result
             if best_match:
-                track.global_id = best_match.global_id
+                track.vchunk_id = best_match.vchunk_id
             else:
-                track.global_id = global_id_counter
-                global_id_counter += 1
+                track.vchunk_id = vchunk_id_counter
+                vchunk_id_counter += 1
 
-        return global_id_counter
+        return vchunk_id_counter
 
     def finalize_tracks(self) -> List[FaceTrack]:
         """

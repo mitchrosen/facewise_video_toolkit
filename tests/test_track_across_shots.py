@@ -96,9 +96,9 @@ def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json)
     assert track_ids.count(3) == 2
     assert track_ids.count(4) == 2
 
-    # Global IDs should be unique for each face (since embeddings differ)
-    global_ids = [t.global_id for t in tracks]
-    assert set(global_ids) == set(range(10))
+    # vchunk IDs should be unique for each face (since embeddings differ)
+    vchunk_ids = [t.vchunk_id for t in tracks]
+    assert set(vchunk_ids) == set(range(10))
 
     for idx, track in enumerate(tracks):
         assert len(track.observations) == 1
