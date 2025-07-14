@@ -116,3 +116,47 @@ def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json)
     # test frame indices
     frame_idxs = [track.observations[0].frame_idx for track in tracks]
     assert frame_idxs == list(range(10))
+
+def test_all_tracks_have_valid_vchunk_ids(dummy_video, dummy_shot_json, monkeypatch):
+    import facekit.pipeline.track_across_shots as track_mod
+    monkeypatch.setattr(track_mod, "load_yolo5face_model", fake_load_yolo5face_model)
+
+    tracks = track_across_shots(
+        video_path=str(dummy_video),
+        shot_json_path=str(dummy_shot_json),
+        model_path="fake.pt",
+        config_path="fake.yaml",
+        embedder=FakeEmbedder(),
+    )
+
+    for track in tracks:
+        assert hasattr(track, "vchunk_id"), "Track missing vchunk_id"
+        assert isinstance(track.vchunk_id, int), f"vchunk_id should be int, got {type(track.vchunk_id)}"
+        assert track.vchunk_id >= 0, "vchunk_id should be non-negative"
+
+def test_no_duplicate_vchunk_ids_across_chunks(dummy_video, dummy_shot_json, monkeypatch):
+    import facekit.pipeline.track_across_shots as track_mod
+    monkeypatch.setattr(track_mod, "load_yolo5face_model", fake_load_yolo5face_model)
+
+    tracks = track_across_shots(
+        video_path=str(dummy_video),
+        shot_json_path=str(dummy_shot_json),
+        model_path="fake.pt",
+        config_path="fake.yaml",
+        embedder=FakeEmbedder(),
+    )
+
+    # Group by shot_id
+    from collections import defaultdict
+    by_shot = defaultdict(list)
+    for t in tracks:
+        by_shot[t.shot_id].append(t)
+
+    # Confirm no vchunk_id appears in more than one shot
+    vchunk_to_shots = {}
+    for shot_id, shot_tracks in by_shot.items():
+        for t in shot_tracks:
+            if t.vchunk_id in vchunk_to_shots:
+                assert vchunk_to_shots[t.vchunk_id] == shot_id, f"vchunk_id {t.vchunk_id} reused across shots!"
+            else:
+                vchunk_to_shots[t.vchunk_id] = shot_id
