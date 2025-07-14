@@ -94,7 +94,6 @@ def track_across_shots(
 
         # ✅ Assign vchunk IDs using match logic within chunk
         next_vchunk_id = aggregator.resolve_vchunk_ids(
-            prior_tracks=all_tracks,
             vchunk_id_counter=next_vchunk_id,
             embedding_threshold=embedding_thresh
         )

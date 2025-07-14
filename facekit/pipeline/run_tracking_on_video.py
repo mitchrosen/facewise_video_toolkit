@@ -73,7 +73,6 @@ def run_tracking_on_video(
 
     # TEMP: assign vchunk IDs and export map
     aggregator.resolve_vchunk_ids(
-        prior_tracks=[],  # or keep a persistent list if testing across shots
         vchunk_idcounter=0,
         embedding_threshold=0.6
     )

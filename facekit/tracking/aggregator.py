@@ -68,7 +68,6 @@ class ShotFaceTrackAggregator:
 
     def resolve_vchunk_ids(
         self,
-        prior_tracks: List[FaceTrack],
         vchunk_id_counter: int,
         embedding_threshold: float = 0.6
     ) -> int:
@@ -76,8 +75,7 @@ class ShotFaceTrackAggregator:
         Assigns vchunk IDs to current shot's tracks using a 3-pass strategy:
         1. Match against active tracks in this shot (IoU + embedding)
         2. Match against inactive tracks in this shot (embedding only)
-        3. Match against prior shots' tracks (embedding only)
-        4. Assign new vchunk ID if no match
+        3. Assign new vchunk ID if no match
 
         Modifies each track in-place to set .vchunk_id
         Returns the updated vchunk_id_counter
@@ -126,18 +124,6 @@ class ShotFaceTrackAggregator:
                     if sim < embedding_threshold and sim < best_score:
                         best_score = sim
                         best_match = candidate
-
-            # Pass 3: match against prior tracks (embedding only)
-            if best_match is None:
-                for prior in prior_tracks:
-                    if not prior.has_embedding():
-                        continue
-                    sim = self.cosine_distance(track.compute_average_embedding(), 
-                                          prior.compute_average_embedding())
-
-                    if sim < embedding_threshold and sim < best_score:
-                        best_score = sim
-                        best_match = prior
 
             # Assign result
             if best_match:
