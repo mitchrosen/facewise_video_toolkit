@@ -33,14 +33,22 @@ def draw_tracks_on_video(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
+    # Build overlay map
     overlay_map = {}
     for track in tracks:
         label = label_fmt(track) if label_fmt else f"{track.track_id}"
         for obs in track.observations:
             overlay_map.setdefault(obs.frame_idx, []).append((obs.bbox, label))
 
-    for frame_idx in range(total_frames):
-        
+    if overlay_map:
+        max_overlay_frame = max(overlay_map.keys())
+    else:
+        max_overlay_frame = 0
+
+    # Ensure we loop through all frames up to max overlay frame
+    end_frame = max(total_frames, max_overlay_frame + 1)
+
+    for frame_idx in range(end_frame):
         ret, frame = cap.read()
         if not ret:
             break
@@ -49,10 +57,12 @@ def draw_tracks_on_video(
         for bbox, label in overlays:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, str(label), (x1, y1-10),
+            cv2.putText(frame, str(label), (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         out.write(frame)
 
     cap.release()
     out.release()
+    print(f"✅ Video with overlays written to {output_path}")
+

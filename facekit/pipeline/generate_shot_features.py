@@ -58,7 +58,7 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     elapsed = time.time() - start_time
     print(f"⏱️ detect_scenes time: {elapsed:.2f} seconds")
 
-    # ✅ Fallback if no scenes were detected
+    # Fallback if no scenes were detected
     if not scenes:
         fps = cap.get(cv2.CAP_PROP_FPS)
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames - 1, fps))]
@@ -91,6 +91,10 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
             },
             "detected_graphics": {}
         })
+
+    # Fix for missing last frame
+    if shots and int(shots[-1]["last_frame"]) < total_frames - 1:
+       shots[-1]["last_frame"] = total_frames - 1
 
     cap.release()
     elapsed = time.time() - start_time

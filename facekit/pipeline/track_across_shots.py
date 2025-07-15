@@ -72,9 +72,9 @@ def track_across_shots(
 
             results = detect_faces_in_frame(model, frame)
             if results is None:
-                continue
+                 continue
             boxes, _, confs = results
-
+ 
             observations = []
             for box, conf in zip(boxes, confs):
                 x1, y1, x2, y2 = map(int, box)
@@ -87,14 +87,13 @@ def track_across_shots(
                     embedding=embedding
                 )
                 observations.append(obs)
-                
+ 
             aggregator.add_frame_observations(frame_idx, observations)
-
         aggregator.finalize_tracks()
 
-        # ✅ Assign vchunk IDs using match logic within chunk
+        # Assign vchunk IDs using matchlogic within chunk
         next_vchunk_id = aggregator.resolve_vchunk_ids(
-            vchunk_id_counter=next_vchunk_id,
+            vchunk_id_counter=0,  # reset vchunk_id_counter with each iteration
             embedding_threshold=embedding_thresh
         )
 

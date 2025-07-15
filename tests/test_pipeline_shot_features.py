@@ -24,7 +24,7 @@ def test_generate_shot_features_runs(
     mock_detect_faces,
     tmp_path
 ):
-    # 🎥 Simulate 2 shots
+    # Simulate 2 shots
     s0, e0 = MagicMock(), MagicMock()
     s1, e1 = MagicMock(), MagicMock()
     s0.get_frames.return_value = 0
@@ -33,20 +33,20 @@ def test_generate_shot_features_runs(
     e1.get_frames.return_value = 5
     mock_detect_scenes.return_value = [(s0, e0), (s1, e1)]
 
-    # ✅ Mock face detection
+    # Mock face detection
     mock_detect_faces.side_effect = [
         ([[10, 10, 100, 100]], [[(50, 50)] * 5], [0.9]),
         ([[30, 30, 130, 130]], [[(70, 70)] * 5], [0.95])
     ]
 
-    # 🧠 Dummy model returned by loader
+    # Dummy model returned by loader
     mock_model = MagicMock()
     mock_load_model.return_value = mock_model
 
-    # 🎞️ Dummy frame
+    # Dummy frame
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-    # 🎬 Simulated cv2.VideoCapture
+    # Simulated cv2.VideoCapture
     mock_cap = MagicMock()
     mock_cap.get.side_effect = lambda x: {
         7: 6,    # CAP_PROP_FRAME_COUNT
@@ -65,7 +65,7 @@ def test_generate_shot_features_runs(
     output_json_path = tmp_path / "shot_features.json"
     generate_shot_features.generate_shot_features_json(str(input_video), str(output_json_path))
 
-    # ✅ Inspect result
+    # Inspect result
     parsed = json.loads(output_json_path.read_text())
     assert isinstance(parsed, dict)
     assert "shots" in parsed
@@ -101,20 +101,20 @@ def test_generate_shot_features_schema_compliance(
     e1.get_frames.return_value = 6
     mock_detect_scenes.return_value = [(s0, e0), (s1, e1)]
 
-    # 🎭 Mock 1 detection per mid-frame
+    # Mock 1 detection per mid-frame
     mock_detect_faces.side_effect = [
         ([[10, 10, 100, 100]], [[(50, 50)] * 5], [0.9]),   # frame 1
         ([[30, 30, 130, 130]], [[(70, 70)] * 5], [0.94])   # frame 4
     ]
 
-    # 🧠 Dummy model
+    # Dummy model
     mock_model = MagicMock()
     mock_load_model.return_value = mock_model
 
-    # 🎞️ Dummy frame
+    # Dummy frame
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-    # 🎬 Simulated VideoCapture
+    # Simulated VideoCapture
     mock_cap = MagicMock()
     mock_cap.get.side_effect = lambda x: {
         7: 6,
@@ -128,12 +128,12 @@ def test_generate_shot_features_schema_compliance(
     mock_cap.retrieve.side_effect = [(True, dummy_frame)] * 6 + [(False, None)]
     mock_capture.return_value = mock_cap
 
-    # 🚀 Run generator
+    # Run generator
     input_video = "tests/data/short_video.mp4"
     output_path = tmp_path / "output.json"
     generate_shot_features.generate_shot_features_json(str(input_video), str(output_path))
 
-    # ✅ Validate schema
+    # Validate schema
     result = validate_shot_features_json(str(output_path), SCHEMA_PATH, total_frame_count=6)
     assert result == []
 

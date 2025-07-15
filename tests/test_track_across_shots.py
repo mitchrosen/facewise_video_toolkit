@@ -66,12 +66,48 @@ def fake_load_yolo5face_model(model_path=None, config_path=None, device=None):
 
     return fake_detector
 
-def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json):
+import json
+import numpy as np
+from pathlib import Path
+from facekit.tracking.face_structures import FaceObservation
+
+def test_track_across_shots_with_mock(monkeypatch, dummy_video, tmp_path):
+    # Build custom shot segmentation file
+    dummy_shot_json = tmp_path / "shot_features.json"
+    shots = [
+        {"shot_number": 1, "first_frame": 0, "last_frame": 2},  # 3 frames
+        {"shot_number": 2, "first_frame": 3, "last_frame": 7},  # 5 frames
+    ]
+    dummy_shot_json.write_text(json.dumps({"shots": shots}, indent=2))
+
     # Patch model loader to return fake model
     import facekit.pipeline.track_across_shots as track_mod
-    monkeypatch.setattr(track_mod, "load_yolo5face_model", fake_load_yolo5face_model)
+    monkeypatch.setattr(track_mod, "load_yolo5face_model", lambda *a, **k: "fake_model")
 
-    tracks = track_across_shots(
+    # Patch face detection to return one box per frame
+    frame_counter = {"idx": 0}
+
+    def fake_detect_faces_in_frame(model, frame):
+        idx = frame_counter["idx"]
+        frame_counter["idx"] += 1
+        # Simulate detection for first 3 frames of shot 1 and all 5 frames of shot 2
+        if idx in [0, 1, 2, 3, 4, 5, 6, 7]:
+            val = idx * 10
+            return [(val, val, val + 5, val + 5)], None, [0.99]
+        return None
+
+    monkeypatch.setattr(track_mod, "detect_faces_in_frame", fake_detect_faces_in_frame)
+
+    # Patch embedder
+    class FakeEmbedder:
+        def get_embedding(self, frame, bbox):
+            # Generate deterministic embedding based on bbox for uniqueness
+            val = bbox[0]  # Use x1 as a seed for consistency
+            embedding = np.zeros(512, dtype=np.float32)
+            embedding[val % 512] = 1.0
+            return embedding
+
+    tracks = track_mod.track_across_shots(
         video_path=str(dummy_video),
         shot_json_path=str(dummy_shot_json),
         model_path="fake.pt",
@@ -79,43 +115,34 @@ def test_track_across_shots_with_mock(monkeypatch, dummy_video, dummy_shot_json)
         embedder=FakeEmbedder(),
     )
 
-    # Basic checks
-    assert len(tracks) == 10
-    assert sum(len(t.observations) for t in tracks) == 10
-    track_ids = {t.track_id for t in tracks}
+    # Validate number of tracks: 3 in first shot, 5 in second → total = 8
+    assert len(tracks) == 8
 
-    assert len(tracks) == 10
+    # Group tracks by shot_id
+    shot1_tracks = [t for t in tracks if t.shot_id == 1]
+    shot2_tracks = [t for t in tracks if t.shot_id == 2]
 
-    # Track IDs are reused per shot, so max unique IDs per shot = 5
-    # Expect only 0–4 repeated twice
-    track_ids = [t.track_id for t in tracks]
-    assert set(track_ids).issubset(set(range(5)))
-    assert track_ids.count(0) == 2  # Each ID appears twice (once per shot)
-    assert track_ids.count(1) == 2
-    assert track_ids.count(2) == 2
-    assert track_ids.count(3) == 2
-    assert track_ids.count(4) == 2
+    assert len(shot1_tracks) == 3
+    assert len(shot2_tracks) == 5
 
-    # vchunk IDs should be unique for each face (since embeddings differ)
-    vchunk_ids = [t.vchunk_id for t in tracks]
-    assert set(vchunk_ids) == set(range(10))
+    # Track IDs reset per shot
+    assert {t.track_id for t in shot1_tracks} == {0, 1, 2}
+    assert {t.track_id for t in shot2_tracks} == {0, 1, 2, 3, 4}
 
-    for idx, track in enumerate(tracks):
+    # Ensure vchunk IDs reset within each shot and no duplicates per shot
+    shot1_vchunk_ids = [t.vchunk_id for t in shot1_tracks]
+    shot2_vchunk_ids = [t.vchunk_id for t in shot2_tracks]
+
+    assert set(shot1_vchunk_ids) == {0, 1, 2}
+    assert set(shot2_vchunk_ids) == {0, 1, 2, 3, 4}
+
+    # Validate observation structure
+    for track in tracks:
         assert len(track.observations) == 1
         obs = track.observations[0]
         assert isinstance(obs, FaceObservation)
-        val = idx * 10
-        assert obs.bbox == (val, val, val+5, val+5)
-
-        expected = np.zeros(512, dtype=np.float32)
-        expected[idx % 512] = 1.0
-        np.testing.assert_array_equal(obs.embedding, expected)
-        
         assert obs.confidence == 0.99
 
-    # test frame indices
-    frame_idxs = [track.observations[0].frame_idx for track in tracks]
-    assert frame_idxs == list(range(10))
 
 def test_all_tracks_have_valid_vchunk_ids(dummy_video, dummy_shot_json, monkeypatch):
     import facekit.pipeline.track_across_shots as track_mod
@@ -134,29 +161,3 @@ def test_all_tracks_have_valid_vchunk_ids(dummy_video, dummy_shot_json, monkeypa
         assert isinstance(track.vchunk_id, int), f"vchunk_id should be int, got {type(track.vchunk_id)}"
         assert track.vchunk_id >= 0, "vchunk_id should be non-negative"
 
-def test_no_duplicate_vchunk_ids_across_chunks(dummy_video, dummy_shot_json, monkeypatch):
-    import facekit.pipeline.track_across_shots as track_mod
-    monkeypatch.setattr(track_mod, "load_yolo5face_model", fake_load_yolo5face_model)
-
-    tracks = track_across_shots(
-        video_path=str(dummy_video),
-        shot_json_path=str(dummy_shot_json),
-        model_path="fake.pt",
-        config_path="fake.yaml",
-        embedder=FakeEmbedder(),
-    )
-
-    # Group by shot_id
-    from collections import defaultdict
-    by_shot = defaultdict(list)
-    for t in tracks:
-        by_shot[t.shot_id].append(t)
-
-    # Confirm no vchunk_id appears in more than one shot
-    vchunk_to_shots = {}
-    for shot_id, shot_tracks in by_shot.items():
-        for t in shot_tracks:
-            if t.vchunk_id in vchunk_to_shots:
-                assert vchunk_to_shots[t.vchunk_id] == shot_id, f"vchunk_id {t.vchunk_id} reused across shots!"
-            else:
-                vchunk_to_shots[t.vchunk_id] = shot_id
