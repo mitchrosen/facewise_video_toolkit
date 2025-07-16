@@ -160,36 +160,41 @@ class FaceTrack:
         self,
         other: 'FaceTrack',
         iou_thresh: float = 0.5,
-        embedding_thresh: float = 0.6
+        embedding_thresh: float = 0.06
     ) -> bool:
         """
-        Determine if this track can be merged with another based on spatial and embedding distance (1 - similarity).
-
-        Compares the last bbox and average embedding of this track with the first bbox and average embedding of the other.
+        Determine if this track can be merged with another based on spatial continuity (IoU)
+        and embedding similarity (cosine similarity).
 
         Args:
             other (FaceTrack): The other track to compare against.
-            iou_thresh (float): Minimum IoU required to consider a merge.
-            embedding_thresh (float): Maximum allowed cosine distance (1 - similarity) between embeddings.
+            iou_thresh (float): Minimum IoU required for spatial continuity.
+            embedding_thresh (float): Minimum cosine similarity required for embeddings.
 
         Returns:
-            bool: True if mergeable, False otherwise.
+            bool: True if the tracks can be merged, False otherwise.
         """
-        # Check IoU continuity
+        # ✅ Step 1: Check IoU continuity
         bbox_self = self.get_last_bbox()
         bbox_other = other.observations[0].bbox if other.observations else None
         if bbox_self is None or bbox_other is None:
             return False
+
         if compute_iou(bbox_self, bbox_other) < iou_thresh:
             return False
 
-        # Check embedding cosine similarity
+        # ✅ Step 2: Check embedding similarity (if both have embeddings)
         e1 = self.compute_average_embedding()
         e2 = other.compute_average_embedding()
-        if e1 is not None and e2 is not None:
-            if np.linalg.norm(e1) == 0 or np.linalg.norm(e2) == 0:
-                return False
-            cos_sim = np.dot(e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2))
-            return cos_sim > (1 - embedding_thresh)
 
-        return True  # fallback if no embeddings are present
+        if e1 is not None and e2 is not None:
+            # Normalize embeddings to unit vectors
+            norm_e1 = e1 / np.linalg.norm(e1)
+            norm_e2 = e2 / np.linalg.norm(e2)
+            cos_sim = np.dot(norm_e1, norm_e2)
+
+            # ✅ New interpretation: similarity must be > threshold
+            return cos_sim > embedding_thresh
+
+        # ✅ Fallback if no embeddings: rely on IoU only
+        return True

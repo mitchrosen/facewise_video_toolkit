@@ -107,3 +107,18 @@ def test_embedding_similarity_different_images(shared_embedder):
                     continue
                 similarity = np.dot(emb[face_num1], emb[face_num2])
                 assert similarity < 0.06, f"for face version{face_version} comparing face nums {face_num1} vs {face_num2}, expected low similarity, got {similarity:.4f}"
+
+def test_embedding_similarity_same_faces_large_crop(shared_embedder):
+
+    emb = []
+
+    face1 = load_face(f"tests/assets/faces/face3_5.jpg")
+    # show_face_image(face1, f"test_embedding_similarity_same_faces_large_crop(), face3_5")
+    emb.append(shared_embedder.get_embedding(face1))
+
+    face2 = load_face(f"tests/assets/faces/face3_6.jpg")
+    # show_face_image(face2, f"test_embedding_similarity_same_faces_large_crop(), face3_6")
+    emb.append(shared_embedder.get_embedding(face2))
+
+    similarity = np.dot(emb[0], emb[1])
+    assert similarity > 0.06, f"for face version 3 comparing face nums 5 vs 6, expected high similarity, got {similarity:.4f}"

@@ -74,7 +74,7 @@ def run_tracking_on_video(
     # TEMP: assign vchunk IDs and export map
     aggregator.resolve_vchunk_ids(
         vchunk_idcounter=0,
-        embedding_threshold=0.6
+        embedding_threshold=0.7
     )
     export_vchunk_id_map(tracks, output_path.replace(".mp4", "_vchunk_ids.json"))
     print(f"vchunk ID map written to: {output_path.replace('.mp4', '_vchunk_ids.json')}")

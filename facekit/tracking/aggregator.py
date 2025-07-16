@@ -22,7 +22,7 @@ class ShotFaceTrackAggregator:
         self,
         shot_number: int,
         iou_threshold: float = 0.5,
-        embedding_threshold: float = 0.6
+        embedding_threshold: float = 0.7
     ):
         """
         Initialize the aggregator for a specific shot.
@@ -69,7 +69,7 @@ class ShotFaceTrackAggregator:
     def resolve_vchunk_ids(
         self,
         vchunk_id_counter: int,
-        embedding_threshold: float = 0.6
+        embedding_threshold: float = 0.7
     ) -> int:
         """
         Assigns vchunk IDs to current shot's tracks using a 3-pass strategy:

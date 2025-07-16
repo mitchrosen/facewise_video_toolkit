@@ -85,7 +85,7 @@ def test_global_id_resolution_does_not_merge_dissimilar_embeddings():
         track2
     ]
 
-    resolver = GlobalIdentityResolver(embedding_threshold=0.2)
+    resolver = GlobalIdentityResolver(embedding_threshold=0.7)
     resolver.resolve(tracks)
 
     assert track1.global_id != track2.global_id

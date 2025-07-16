@@ -119,20 +119,66 @@ def draw_faces_and_mouths(
 
     return face_count
 
-# ready for plug in of an actual face embedding model
-embedding_model = None  # e.g., InsightFace for example
 device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
 model_path = "models/yolov5n_state_dict.pt"
 config_path = "models/yolov5n.yaml"
 model = load_yolo5face_model(model_path=model_path, config_path=config_path, device=device)
 
-def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
+def compute_expanded_bbox(bbox, all_boxes, img_w, img_h, margin=20):
+    """
+    Expand bbox as much as possible without overlapping other boxes or image boundaries.
+    Optionally add a fixed margin if space allows.
+    """
+    x1, y1, x2, y2 = bbox
+
+    # Distance to image boundaries
+    left_limit = x1
+    top_limit = y1
+    right_limit = img_w - x2
+    bottom_limit = img_h - y2
+
+    # Distance to nearest neighbor in each direction
+    for other in all_boxes:
+        if other == bbox:
+            continue
+        ox1, oy1, ox2, oy2 = other
+
+        # To the left: other box must be fully left
+        if ox2 <= x1:
+            left_limit = min(left_limit, x1 - ox2)
+        # To the right: other box must be fully right
+        if ox1 >= x2:
+            right_limit = min(right_limit, ox1 - x2)
+        # Above
+        if oy2 <= y1:
+            top_limit = min(top_limit, y1 - oy2)
+        # Below
+        if oy1 >= y2:
+            bottom_limit = min(bottom_limit, oy1 - y2)
+
+    # Now decide actual expansion amount (bounded by image and neighbors)
+    expand_left = max(left_limit, margin)
+    expand_top = max(top_limit, margin)
+    expand_right = max(right_limit, margin)
+    expand_bottom = max(bottom_limit, margin)
+
+    return (
+        max(0, x1 - expand_left),
+        max(0, y1 - expand_top),
+        min(img_w, x2 + expand_right),
+        min(img_h, y2 + expand_bottom),
+    )
+
+def detect_faces_and_embeddings(frame, frame_idx: int, embedder=None) -> List[FaceObservation]:
     """
     Detect faces and return a list of FaceObservation objects.
+    Expands bounding boxes for embedding context without overlapping other faces.
 
     Args:
         frame (np.ndarray): The current video frame (BGR).
         frame_idx (int): Index of the current frame.
+        embedder (object): Face embedding extractor with a `get_embedding(frame, bbox)` method. 
+            Used to generate embeddings for identity resolution across shots.
 
     Returns:
         List[FaceObservation]: Observations with bbox and (optional) embeddings.
@@ -144,18 +190,28 @@ def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
         return observations
 
     boxes, landmarks, confidences = result
+    height, width = frame.shape[:2]
 
-    for bbox, conf in zip(boxes, confidences):
+    # Expand boxes for embedding context
+    expanded_boxes = []
+    for i, bbox in enumerate(boxes):
+        expanded_box = compute_expanded_bbox(bbox, boxes, width, height, margin=20)
+        expanded_boxes.append(expanded_box)
+
+    for bbox, expanded_bbox, conf in zip(boxes, expanded_boxes, confidences):
         bbox = tuple(int(x) for x in bbox)
-        face_crop = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+        expanded_bbox = tuple(int(x) for x in expanded_bbox)
+
+        # Crop using expanded bbox
+        face_crop = frame[expanded_bbox[1]:expanded_bbox[3], expanded_bbox[0]:expanded_bbox[2]]
 
         embedding = None
-        if embedding_model is not None:
-            embedding = embedding_model.get_embedding(face_crop)
+        if embedder is not None:
+            embedding = embedder.get_embedding(face_crop)
 
         obs = FaceObservation(
             frame_idx=frame_idx,
-            bbox=bbox,
+            bbox=bbox,  # Keep original for consistency
             embedding=embedding,
             confidence=conf
         )

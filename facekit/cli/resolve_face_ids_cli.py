@@ -9,7 +9,7 @@ from facekit.tracking.serialize import tracks_to_json_dict
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
 from facekit.tracking.face_structures import FaceTrack
 from facekit.pipeline.generate_shot_features import generate_shot_features_json
-
+from facekit.embedding.embedder import FaceEmbedder
 
 def main():
     parser = argparse.ArgumentParser(description="Track faces and resolve global identities across shots")
@@ -55,12 +55,16 @@ def main():
         shot_json.write_text(json.dumps(shot_data, indent=2))
         print("Shot segmentation JSON updated to include final frame.")
 
-    # Track faces with vchunk IDs
+    # ✅ Initialize embedder
+    print("✅ Initializing embedder for identity resolution...")
+    device = "cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
+    embedder = FaceEmbedder(model_name="buffalo_l", device=device)
+
+    # ✅ Track faces with vchunk IDs and embeddings
     tracks = track_across_shots(
         video_path=str(input_path),
         shot_json_path=str(shot_json),
-        model_path=args.model,
-        config_path=args.config,
+        embedder=embedder  # Pass embedder here
     )
 
     # Save vchunk-only JSON if requested
@@ -70,8 +74,8 @@ def main():
         vchunk_path.write_text(json.dumps(tracks_to_json_dict(tracks), indent=2))
         print(f"Wrote vchunk tracks to {vchunk_path}")
 
-    # Resolve global IDs
-    resolver = GlobalIdentityResolver()
+    # ✅ Resolve global IDs based on embeddings
+    resolver = GlobalIdentityResolver(embedding_threshold=0.70)
     resolver.resolve(tracks)
 
     # Save globally resolved JSON if requested

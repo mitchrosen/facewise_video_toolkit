@@ -97,14 +97,14 @@ def test_iou_matching_threshold():
 def test_patch_can_merge_with(monkeypatch):
     calls = []
 
-    def fake_can_merge_with(self, other, iou_thresh=0.5, embedding_thresh=0.6):
+    def fake_can_merge_with(self, other, iou_thresh=0.5, embedding_thresh=0.7):
         frame_idx = other.observations[0].frame_idx if other.observations else None
         calls.append((self.track_id, frame_idx, iou_thresh, embedding_thresh))
         return True
 
     monkeypatch.setattr(FaceTrack, "can_merge_with", fake_can_merge_with)
 
-    aggregator = ShotFaceTrackAggregator(shot_number=1)
+    aggregator = ShotFaceTrackAggregator(shot_number=1, embedding_threshold=0.6)
     obs1 = make_obs(0, (0, 0, 10, 10))
     obs2 = make_obs(1, (1, 1, 11, 11))  # Should match due to patched method
     aggregator.add_frame_observations(0, [obs1])
