@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+from unittest.mock import patch
+import torch
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 from facekit.tracking.face_structures import FaceTrack
 
@@ -153,3 +155,24 @@ def test_cluster_assignment_in_mixed_scenario():
 
     ids = [t.global_id for t in tracks]
     assert len(set(ids)) == 3, f"Expected 3 clusters, got {len(set(ids))}: {ids}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_global_id_consistency_cpu_vs_gpu_with_mock():
+    resolver = GlobalIdentityResolver(embedding_threshold=0.8)
+
+    # Create two identical track sets
+    tracks_gpu = [make_track(i, make_vector(angle_rad=0)) for i in range(4)]
+    tracks_cpu = [make_track(i, make_vector(angle_rad=0)) for i in range(4)]
+
+    # First run: actual GPU mode
+    resolver.resolve_global_ids(tracks_gpu, start_id=0)
+
+    # Second run: mock CUDA unavailable -> force CPU mode
+    with patch("torch.cuda.is_available", return_value=False):
+        resolver.resolve_global_ids(tracks_cpu, start_id=0)
+
+    cpu_ids = [t.global_id for t in tracks_cpu]
+    gpu_ids = [t.global_id for t in tracks_gpu]
+
+    assert cpu_ids == gpu_ids, f"Mismatch between CPU and GPU modes: CPU={cpu_ids}, GPU={gpu_ids}"
