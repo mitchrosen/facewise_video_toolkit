@@ -36,10 +36,13 @@ class FaceTrack:
     Represents a series of face observations believed to belong to the same person.
 
     Attributes:
-        shot_id (int): Unique identifier for the shot that contains this track.
-        track_id (int): Unique identifier for this track.
-        observations (List[FaceObservation]): Chronologically ordered list of observations.
-        is_active (bool): Whether this track is still active.
+        shot_id (int): Shot this track belongs to.
+        track_id (int): Unique within shot, does not change after creation.
+        vchunk_id (Optional[int]): Persistent identity across tracks in a shot.
+        observations (List[FaceObservation]): Chronologically ordered observations.
+        is_active (bool): True if matched in current frame; resets per frame.
+        is_open (bool): True if track can accept new observations.
+        embeddings (List[np.ndarray]): For computing similarity.
     
     Notes:
         Observations are also indexed internally by frame index for quick access.
@@ -47,10 +50,11 @@ class FaceTrack:
     """
     shot_id: int
     track_id: int
-    observations: List[FaceObservation] = field(default_factory=list)
-    is_active: bool = True
-    embeddings: List[np.ndarray] = field(default_factory=list)
     vchunk_id: Optional[int] = None  
+    observations: List[FaceObservation] = field(default_factory=list)
+    is_active: bool = False       # Frame-level: assigned in current frame
+    is_open: bool = True          # Track lifecycle
+    embeddings: List[np.ndarray] = field(default_factory=list)
     
     def __post_init__(self):
         self._frame_index_map = {}
@@ -70,17 +74,29 @@ class FaceTrack:
         Raises:
             ValueError: If an observation already exists for the frame index and force is False.
         """
+        if not self.is_open:
+            raise RuntimeError("Cannot add observation to a closed track")
         existing = self._frame_index_map.get(obs.frame_idx)
-        if existing:
-            if not force:
-                raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
+        if existing and not force:
+            raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
         self._frame_index_map[obs.frame_idx] = obs
         self.observations.append(obs)
         if obs.embedding is not None:
             self.embeddings.append(obs.embedding)
  
+    def reset_for_frame(self):
+        self.is_active = False
+
+    def mark_closed(self):
+        """Mark this track as permanently closed (no more updates)."""
+        self.is_open = False
+        
+    def is_closed(self) -> bool:
+        """Return True if this track has been permanently closed."""
+        return not self.is_open
+
     def has_embedding(self):
-        return any(obs.embedding is not None for obs in self.observations)
+        return bool(self.embeddings)
 
     def get_bbox_by_observation_index(self, idx: int) -> Optional[Tuple[int, int, int, int]]:
         if 0 <= idx < len(self.observations):
@@ -100,20 +116,17 @@ class FaceTrack:
         obs = self._frame_index_map.get(frame_idx)
         return obs.bbox if obs else None
 
-    def get_first_bbox(self) -> Optional[Tuple[int, int, int, int]]:
-        """
-        Return the bounding box from the first observation, or None if empty.
-        """
-        return self.observations[0].bbox if self.observations else None
-
-    def get_last_bbox(self) -> Optional[Tuple[int, int, int, int]]:
-        """
-        Return the bounding box from the last observation, or None if no observations exist.
-        """
+    def get_last_bbox(self):
         return self.observations[-1].bbox if self.observations else None
 
-    def get_last_frame_idx(self) -> int:
+    def get_first_bbox(self):
+        return self.observations[0].bbox if self.observations else None
+
+    def last_frame(self) -> int:
         return self.observations[-1].frame_idx if self.observations else -1
+    
+    def first_frame(self):
+        return self.observations[0].frame_idx if self.observations else float("inf")
 
     def compute_average_embedding(self) -> Optional[np.ndarray]:
         """
@@ -122,10 +135,9 @@ class FaceTrack:
         Returns:
             Optional[np.ndarray]: The mean embedding vector, or None if no embeddings are available.
         """
-        embeddings = [obs.embedding for obs in self.observations if obs.embedding is not None]
-        if not embeddings:
+        if not self.embeddings:
             return None
-        return np.mean(embeddings, axis=0)
+        return np.mean(self.embeddings, axis=0)
 
     def duration(self) -> int:
         if not self.observations:
@@ -155,46 +167,3 @@ class FaceTrack:
             float(np.mean(x2s)),
             float(np.mean(y2s))
         )
-    
-    def can_merge_with(
-        self,
-        other: 'FaceTrack',
-        iou_thresh: float = 0.5,
-        embedding_thresh: float = 0.06
-    ) -> bool:
-        """
-        Determine if this track can be merged with another based on spatial continuity (IoU)
-        and embedding similarity (cosine similarity).
-
-        Args:
-            other (FaceTrack): The other track to compare against.
-            iou_thresh (float): Minimum IoU required for spatial continuity.
-            embedding_thresh (float): Minimum cosine similarity required for embeddings.
-
-        Returns:
-            bool: True if the tracks can be merged, False otherwise.
-        """
-        # ✅ Step 1: Check IoU continuity
-        bbox_self = self.get_last_bbox()
-        bbox_other = other.observations[0].bbox if other.observations else None
-        if bbox_self is None or bbox_other is None:
-            return False
-
-        if compute_iou(bbox_self, bbox_other) < iou_thresh:
-            return False
-
-        # ✅ Step 2: Check embedding similarity (if both have embeddings)
-        e1 = self.compute_average_embedding()
-        e2 = other.compute_average_embedding()
-
-        if e1 is not None and e2 is not None:
-            # Normalize embeddings to unit vectors
-            norm_e1 = e1 / np.linalg.norm(e1)
-            norm_e2 = e2 / np.linalg.norm(e2)
-            cos_sim = np.dot(norm_e1, norm_e2)
-
-            # ✅ New interpretation: similarity must be > threshold
-            return cos_sim > embedding_thresh
-
-        # ✅ Fallback if no embeddings: rely on IoU only
-        return True

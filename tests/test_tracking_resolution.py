@@ -25,28 +25,28 @@ def test_global_id_resolution_unique():
     ]
 
     resolver = GlobalIdentityResolver()
-    resolver.resolve(tracks)
+    resolver.resolve_global_ids(tracks)
 
     global_ids = {track.global_id for track in tracks}
     assert global_ids == {0, 1, 2}
 
 
 def test_global_id_resolution_merges_similar_embeddings():
-    """
-    Similar embeddings from different vchunks should be merged to same global_id.
-    """
-    shared_emb_val = 5
-    tracks= [
-        dummy_track(0, 0, shared_emb_val),
-        dummy_track(1, 0, shared_emb_val),
-        dummy_track(2, 0, shared_emb_val),
-    ]
+    shared_embedding = np.ones(512, dtype=np.float32)
+
+    tracks = []
+    for i in range(3):
+        t = FaceTrack(shot_id=0, track_id=i)
+        obs = FaceObservation(frame_idx=i, bbox=(0, 0, 10, 10), embedding=shared_embedding)
+        t.add_observation(obs)
+        tracks.append(t)
 
     resolver = GlobalIdentityResolver()
-    resolver.resolve(tracks)
+    resolver.resolve_global_ids(tracks)
 
     global_ids = {track.global_id for track in tracks}
     assert global_ids == {0}, "All tracks should share global_id since they share embedding"
+
 
 
 def test_global_id_resolution_skips_tracks_without_embedding():
@@ -65,7 +65,7 @@ def test_global_id_resolution_skips_tracks_without_embedding():
     ]
 
     resolver = GlobalIdentityResolver()
-    resolver.resolve(tracks)
+    resolver.resolve_global_ids(tracks)
 
     global_ids = {track.global_id for track in tracks}
     assert global_ids == {0, 1}
@@ -86,6 +86,6 @@ def test_global_id_resolution_does_not_merge_dissimilar_embeddings():
     ]
 
     resolver = GlobalIdentityResolver(embedding_threshold=0.7)
-    resolver.resolve(tracks)
+    resolver.resolve_global_ids(tracks)
 
     assert track1.global_id != track2.global_id

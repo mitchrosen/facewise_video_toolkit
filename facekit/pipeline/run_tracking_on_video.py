@@ -49,7 +49,7 @@ def run_tracking_on_video(
             break
 
         observations = detect_faces_and_embeddings(frame, frame_idx)
-        aggregator.add_frame_observations(frame_idx, observations)
+        aggregator.update_tracks_with_frame(frame_idx, observations)
 
         if draw:
             for track in aggregator.get_tracks_in_frame(frame_idx):

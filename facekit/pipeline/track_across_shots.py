@@ -63,7 +63,7 @@ def track_across_shots(
 
             # ✅ Use detect_faces_and_embeddings (with expanded crops + embeddings)
             observations = detect_faces_and_embeddings(frame, frame_idx, embedder=embedder)
-            aggregator.add_frame_observations(frame_idx, observations)
+            aggregator.update_tracks_with_frame(frame_idx, observations)
 
         # After processing all frames in the shot
         aggregator.finalize_tracks()

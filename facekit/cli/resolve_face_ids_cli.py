@@ -76,7 +76,7 @@ def main():
 
     # ✅ Resolve global IDs based on embeddings
     resolver = GlobalIdentityResolver(embedding_threshold=0.70)
-    resolver.resolve(tracks)
+    resolver.resolve_global_ids(tracks)
 
     # Save globally resolved JSON if requested
     if args.output_global_json:
