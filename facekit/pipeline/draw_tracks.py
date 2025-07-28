@@ -1,5 +1,6 @@
 from typing import List, Callable, Optional
 import cv2
+import time
 from pathlib import Path
 from facekit.tracking.face_structures import FaceTrack
 
@@ -11,6 +12,7 @@ def draw_tracks_on_video(
 ) -> None:
     """
     Render a video with bounding boxes and labels for each tracked face.
+    Uses MJPEG for faster debug video writing and provides timing stats.
 
     Args:
         video_path (str): Path to the original video file.
@@ -30,7 +32,12 @@ def draw_tracks_on_video(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    # ✅ Use MJPEG for speed and .avi extension
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    if output_path.suffix.lower() != ".avi":
+        output_path = output_path.with_suffix(".avi")
+
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
     # Build overlay map
@@ -45,24 +52,42 @@ def draw_tracks_on_video(
     else:
         max_overlay_frame = 0
 
-    # Ensure we loop through all frames up to max overlay frame
     end_frame = max(total_frames, max_overlay_frame + 1)
 
+    # ✅ Timing variables
+    total_read, total_draw, total_write = 0.0, 0.0, 0.0
+
     for frame_idx in range(end_frame):
+        # Read frame
+        t0 = time.time()
         ret, frame = cap.read()
         if not ret:
             break
+        t1 = time.time()
+        total_read += (t1 - t0)
 
+        # Draw overlays
+        t0 = time.time()
         overlays = overlay_map.get(frame_idx, [])
         for bbox, label in overlays:
             x1, y1, x2, y2 = bbox
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, str(label), (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        t1 = time.time()
+        total_draw += (t1 - t0)
 
+        # Write frame
+        t0 = time.time()
         out.write(frame)
+        t1 = time.time()
+        total_write += (t1 - t0)
 
     cap.release()
     out.release()
-    print(f"✅ Video with overlays written to {output_path}")
 
+    print(f"\n✅ Video with overlays written to {output_path}")
+    print(f"[TIMING SUMMARY]")
+    print(f"Frame Reading    : {total_read:.2f}s")
+    print(f"Overlay Drawing  : {total_draw:.2f}s")
+    print(f"Frame Writing    : {total_write:.2f}s")

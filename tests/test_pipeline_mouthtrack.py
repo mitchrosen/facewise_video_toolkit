@@ -11,13 +11,23 @@ sys.modules.pop("facekit.pipeline", None)
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
 @patch("torch.cuda.is_available", return_value=True)
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
-@patch("facekit.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.FaceDetector.detect_faces_in_frame")
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
 def test_pipeline_calls_detection_and_drawing(
-    mock_capture, mock_writer, mock_draw, mock_detect, mock_restore, mock_cuda, mock_load_model
+    mock_capture,
+    mock_writer,
+    mock_draw,
+    mock_detect_method,
+    mock_restore,
+    mock_cuda,
+    mock_load_detector_model
 ):
+    import numpy as np
+    from unittest.mock import MagicMock
+    from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
+
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
     mock_cap_instance = MagicMock()
     mock_cap_instance.isOpened.side_effect = [True, True, True, True, False]
@@ -34,7 +44,7 @@ def test_pipeline_calls_detection_and_drawing(
     }[x]
     mock_capture.return_value = mock_cap_instance
 
-    mock_detect.return_value = (
+    mock_detect_method.return_value = (
         [[10, 10, 100, 100]],
         [[(15, 15), (90, 15), (50, 30), (30, 70), (70, 70)]],
         [0.95]
@@ -42,25 +52,23 @@ def test_pipeline_calls_detection_and_drawing(
     mock_draw.return_value = 1
     mock_writer_instance = MagicMock()
     mock_writer.return_value = mock_writer_instance
-    mock_load_model.return_value = MagicMock()
+    mock_load_detector_model.return_value = MagicMock()
 
-    from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
     multiface_mouthtrack(
         input_path="dummy.mp4",
         output_path="out.mp4",
-        model_path="dummy_model.pt",
+        detector_model_path="dummy_detector_model.pt",
         config_path="dummy.yaml",
         require_gpu=False,
         track_interval=1
     )
 
-    assert mock_detect.call_count == 3
+    assert mock_detect_method.call_count == 3
     assert mock_draw.call_count == 3
     assert mock_writer_instance.write.call_count == 3
     mock_capture.assert_called_once_with("dummy.mp4")
     mock_writer.assert_called_once()
     mock_restore.assert_called_once_with("dummy.mp4", "out.mp4")
-
 
 @patch("torch.cuda.is_available", return_value=False)
 def test_pipeline_requires_gpu_raises_error(mock_cuda):
@@ -70,7 +78,7 @@ def test_pipeline_requires_gpu_raises_error(mock_cuda):
         multiface_mouthtrack(
             input_path="dummy.mp4",
             output_path="out.mp4",
-            model_path="dummy_model.pt",
+            detector_model_path="dummy_detector_model.pt",
             config_path="dummy.yaml",
             require_gpu=True
         )
@@ -88,11 +96,15 @@ def find_tracking_dot(frame, color=(0, 255, 255)):
         return tuple(coords[0][0])  # (x, y)
     return None
 
+from unittest.mock import patch, MagicMock
+import numpy as np
+import cv2
+
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.load_yolo5face_model")
 @patch("torch.cuda.is_available", return_value=True)
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.restore_audio_from_source")
-@patch("facekit.pipeline.mouthtrack_frame_by_frame.detect_faces_in_frame")
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
+@patch("facekit.pipeline.mouthtrack_frame_by_frame.FaceDetector")
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.FaceTracker")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
@@ -100,16 +112,15 @@ def test_detection_and_tracking_call_sequence(
     mock_capture,
     mock_writer,
     mock_mouth_tracker_class,
+    mock_face_detector_class,
     mock_draw,
-    mock_detect,
     mock_restore,
     mock_cuda,
-    mock_load_model,
+    mock_load_detector_model,
 ):
-    import numpy as np
     from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
 
-    # Prepare 4 video frames (0–3)
+    # === Prepare video ===
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
     mock_cap_instance = MagicMock()
     mock_cap_instance.isOpened.side_effect = [True] * 5 + [False]
@@ -121,43 +132,44 @@ def test_detection_and_tracking_call_sequence(
     }[x]
     mock_capture.return_value = mock_cap_instance
 
-    # Mock detection to return a fixed bounding box and landmarks
-    mock_detect.return_value = (
-        [[10, 10, 100, 100]],                    # boxes
-        [[(50, 50)] * 5],                        # 5-point landmarks
-        [0.95],                                  # confidences
+    # === Prepare mocked FaceDetector instance ===
+    mock_detector_instance = MagicMock()
+    mock_detector_instance.detect_faces_in_frame.return_value = (
+        [[10, 10, 100, 100]],        # boxes
+        [[(50, 50)] * 5],            # landmarks
+        [0.95],                      # confidences
     )
-    mock_draw.return_value = 1
-    mock_writer_instance = MagicMock()
-    mock_writer.return_value = mock_writer_instance
-    mock_load_model.return_value = MagicMock()
+    mock_face_detector_class.return_value = mock_detector_instance
 
-    # Mock MouthTracker instance and method
+    # === Mock draw and writer ===
+    mock_draw.return_value = 1
+    mock_writer.return_value = MagicMock()
+    mock_load_detector_model.return_value = MagicMock()
+
+    # === Mock tracker ===
     mock_tracker_instance = MagicMock()
     mock_tracker_instance.init_trackers = MagicMock()
     mock_tracker_instance.update_trackers.return_value = [(50, 50, 30, 30)]
     mock_mouth_tracker_class.return_value = mock_tracker_instance
 
-    # Run pipeline with track_interval = 2
+    # === Run pipeline ===
     multiface_mouthtrack(
         input_path="dummy.mp4",
         output_path="out.mp4",
-        model_path="dummy_model.pt",
+        detector_model_path="dummy_detector_model.pt",
         config_path="dummy.yaml",
         require_gpu=False,
         track_interval=2
     )
 
-    # 🔍 Assert detection was called on frames 0 and 2 (every 2nd frame)
-    assert mock_detect.call_count == 2
-    # 🔍 Assert init_trackers() was called on frames 0 and 2 following successful detect
+    # === Assertions ===
+    assert mock_detector_instance.detect_faces_in_frame.call_count == 2
     assert mock_tracker_instance.init_trackers.call_count == 2
-    # 🔍 Assert tracking was called on frames 0 and 2 (following init_trackers()), and frames 1 and 3 (standard tracking)
     assert mock_tracker_instance.update_trackers.call_count == 4
-    # 🔍 draw_faces_and_mouths() is only called for detection frames (not for tracking)
     assert mock_draw.call_count == 2
 
-    # You could even inspect the order if you wanted:
-    expected_detect_calls = [0, 2]
-    actual_detect_calls = [call[0][1] for call in mock_detect.call_args_list]
-    assert len(actual_detect_calls) == len(expected_detect_calls)
+    # Optionally inspect call order
+    expected_calls = [0, 2]
+    actual_calls = [call[0][0] for call in mock_detector_instance.detect_faces_in_frame.call_args_list]
+    assert len(actual_calls) == len(expected_calls)
+

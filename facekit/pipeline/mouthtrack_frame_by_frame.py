@@ -2,14 +2,15 @@ import cv2
 import torch
 from typing import Optional
 from facekit.detection.yolo5face_model import load_yolo5face_model
-from facekit.detection.detection_helpers import detect_faces_in_frame, draw_faces_and_mouths
+from facekit.detection.detection_helpers import draw_faces_and_mouths
 from facekit.output.audio_tools import restore_audio_from_source
 from facekit.tracking.face_tracker import FaceTracker, draw_tracked_face_box
+from facekit.detection.face_detector import FaceDetector
 
 def multiface_mouthtrack(
     input_path: str,
     output_path: str,
-    model_path: str,
+    detector_model_path: str,
     config_path: str,
     show_periodic: bool = False,
     display_interval_sec: float = 0.5,
@@ -19,19 +20,20 @@ def multiface_mouthtrack(
     tracker_type="CSRT"
 ) -> None:
     if require_gpu and not torch.cuda.is_available():
-        raise RuntimeError("❌ GPU required but CUDA is not available.")
+        raise RuntimeError("GPU required but CUDA is not available.")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = load_yolo5face_model(
-        model_path=model_path,
+    detector_model = load_yolo5face_model(
+        detector_model_path=detector_model_path,
         config_path=config_path,
         device=device,
         min_face=min_face
     )
+    face_detector = FaceDetector(detector_model)
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"❌ Could not open video: {input_path}")
+        print(f"Could not open video: {input_path}")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -62,9 +64,9 @@ def multiface_mouthtrack(
                     face_count += 1
                 else:
                     do_fallback = True
-        
+
         if should_detect or do_fallback:
-            result = detect_faces_in_frame(model, frame, target_size=640)
+            result = face_detector.detect_faces_in_frame(frame, target_size=640)
             if result is not None:
                 boxes, landmarks, confidences = result
                 if boxes:
@@ -88,7 +90,6 @@ def multiface_mouthtrack(
         prev_face_count = face_count
         if face_count > 0:
             label = f"{'Faces detected' if should_detect else 'Faces tracked'}: {face_count}"
-            
             cv2.putText(frame, label, (20, height - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
@@ -111,5 +112,5 @@ def multiface_mouthtrack(
     out.release()
     restore_audio_from_source(input_path, output_path)
 
-    print(f"✅ Mouth tracking complete. Output saved to: {output_path}")
-    print(f"📊 Max faces detected at once: {max_faces}")
+    print(f"Mouth tracking complete. Output saved to: {output_path}")
+    print(f"Max faces detected at once: {max_faces}")

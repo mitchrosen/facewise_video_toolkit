@@ -1,44 +1,10 @@
 import cv2
 import numpy as np
-from typing import List, Tuple, Union
-from numpy import ndarray
-from typing import Optional, Tuple, List
+from typing import List, Union
+from typing import Optional, List
 from facekit.tracking.face_structures import FaceObservation
+from facekit.detection.face_detector import FaceDetector
 from facekit.detection.yolo5face_model import load_yolo5face_model
-
-def detect_faces_in_frame(
-    model: object,
-    frame: ndarray,
-    target_size: int = 640
-) -> Optional[Tuple[List[List[int]], List[List[List[int]]], List[float]]]:
-    """
-    Run face detection on a single video frame using the specified YOLO-based model.
-
-    Args:
-        frame (np.ndarray): The image frame to process.
-        model (Any): The face detection model object with a callable interface.
-        target_size (int): Optional resizing dimension before detection (default is 640).
-
-    Returns:
-        Optional[Tuple]: A tuple containing:
-            - List of bounding boxes (each box is [x1, y1, x2, y2])
-            - List of facial landmarks (each face has a list of 5 [x, y] points)
-            - List of confidence scores for each detected face
-        Returns None if no faces are detected or an error occurs.
-    """
-
-    try:
-        results = model(frame, target_size=target_size)
-        if (
-            isinstance(results, tuple) and
-            len(results) == 3 and
-            all(isinstance(r, list) for r in results)
-        ):
-            return results  # (boxes, landmarks, confidences)
-        else:
-            return None
-    except Exception:
-        return None
 
 import cv2
 import numpy as np
@@ -120,9 +86,13 @@ def draw_faces_and_mouths(
     return face_count
 
 device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
-model_path = "models/yolov5n_state_dict.pt"
-config_path = "models/yolov5n.yaml"
-model = load_yolo5face_model(model_path=model_path, config_path=config_path, device=device)
+detector_model_path = "models/detector/yolov5n_state_dict.pt"
+config_path = "models/detector/yolov5n.yaml"
+detector = FaceDetector(load_yolo5face_model(
+    detector_model_path="models/detector/yolov5n_state_dict.pt",
+    config_path="models/detector/yolov5n.yaml",
+    device='cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
+))
 
 def compute_expanded_bbox(bbox, all_boxes, img_w, img_h, margin=20):
     """
@@ -169,50 +139,24 @@ def compute_expanded_bbox(bbox, all_boxes, img_w, img_h, margin=20):
         min(img_h, y2 + expand_bottom),
     )
 
-def detect_faces_and_embeddings(frame, frame_idx: int, embedder=None) -> List[FaceObservation]:
+def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
     """
-    Detect faces and return a list of FaceObservation objects.
-    Expands bounding boxes for embedding context without overlapping other faces.
-
-    Args:
-        frame (np.ndarray): The current video frame (BGR).
-        frame_idx (int): Index of the current frame.
-        embedder (object): Face embedding extractor with a `get_embedding(frame, bbox)` method. 
-            Used to generate embeddings for identity resolution across shots.
-
-    Returns:
-        List[FaceObservation]: Observations with bbox and (optional) embeddings.
+    Detect faces and return a list of FaceObservation objects (no embedding).
     """
     observations = []
 
-    result = detect_faces_in_frame(model, frame)
+    result = detector.detect_faces_in_frame(frame)
     if result is None:
         return observations
 
     boxes, landmarks, confidences = result
-    height, width = frame.shape[:2]
 
-    # Expand boxes for embedding context
-    expanded_boxes = []
-    for i, bbox in enumerate(boxes):
-        expanded_box = compute_expanded_bbox(bbox, boxes, width, height, margin=20)
-        expanded_boxes.append(expanded_box)
-
-    for bbox, expanded_bbox, conf in zip(boxes, expanded_boxes, confidences):
+    for bbox, conf in zip(boxes, confidences):
         bbox = tuple(int(x) for x in bbox)
-        expanded_bbox = tuple(int(x) for x in expanded_bbox)
-
-        # Crop using expanded bbox
-        face_crop = frame[expanded_bbox[1]:expanded_bbox[3], expanded_bbox[0]:expanded_bbox[2]]
-
-        embedding = None
-        if embedder is not None:
-            embedding = embedder.get_embedding(face_crop)
-
         obs = FaceObservation(
             frame_idx=frame_idx,
-            bbox=bbox,  # Keep original for consistency
-            embedding=embedding,
+            bbox=bbox,
+            embedding=None,  # Embedding will be added later in batch
             confidence=conf
         )
         observations.append(obs)

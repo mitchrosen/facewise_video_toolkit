@@ -1,52 +1,58 @@
 import numpy as np
 from typing import List, Optional
-from insightface.app import FaceAnalysis
-
+from insightface.model_zoo import ArcFaceONNX
 
 class FaceEmbedder:
-    def __init__(self, model_name: str = "buffalo_l", device: str = "cpu"):
+    def __init__(self, embedding_model_path: str, device: str = "cpu"):
         """
-        Initialize the face embedding model.
+        Initialize ONNX ArcFace model for embeddings.
         Args:
-            model_name: Name of the InsightFace model to use.
-            device: Device to load model onto ('cpu' or 'cuda').
+            embedding_model_path: Path to ArcFace ONNX model file.
+            device: 'cpu' or 'cuda'.
         """
-        self.device = device
-        provider = "CPUExecutionProvider" if device == "cpu" else "CUDAExecutionProvider"
+        # Debug: Check if the model file exists
+        import os
+        if not os.path.exists(embedding_model_path):
+            print(f"DEBUG Model file not found: {embedding_model_path}")
+        else:
+            print(f"DEBUG Model file found: {embedding_model_path} (size: {os.path.getsize(embedding_model_path) / (1024*1024):.2f} MB)")
 
-        self.app = FaceAnalysis(name=model_name, providers=[provider])
-        self.app.prepare(ctx_id=0 if device == "cuda" else -1, det_size=(640, 640))
+        self.embedding_model = ArcFaceONNX(model_file=embedding_model_path)
+        ctx_id = 0 if device == "cpu" else -1
+        self.embedding_model.prepare(ctx_id=ctx_id)
+        if hasattr(self.embedding_model, "input_size") and hasattr(self.embedding_model, "session"):
+            print(f"DEBUG prepare(): {self.embedding_model.input_size}, {self.embedding_model.session}")
+        
+        self.input_size = (112, 112)
 
-    def get_embedding(self, frame: np.ndarray) -> Optional[np.ndarray]:
+    def get_embedding_batch(self, aligned_faces: List[np.ndarray], batch_size: int = 32) -> List[np.ndarray]:
         """
-        Extract a normalized 512-dimensional embedding from the most prominent face in the frame.
-
+        Compute embeddings for a batch of aligned faces.
         Args:
-            frame: Original BGR image as a NumPy array.
-
+            aligned_faces: List of aligned face images (112x112 RGB).
+            batch_size: Max number of faces to process per batch.
         Returns:
-            A 512-dimensional float32 NumPy array (L2-normalized), or None if no face is found.
+            List of normalized embeddings (float32 arrays).
         """
-        import warnings
-        with warnings.catch_warnings():     # Suppress FutureWarning from insightface (as of 7/9/2025) due to internal use of np.linalg.lstsq.
-                                            # Safe to remove this filter once insightface updates and no longer triggers the warning.
-            warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
-            faces = self.app.get(frame)
+        if not isinstance(aligned_faces, (list, tuple)) or not all(isinstance(f, np.ndarray) for f in aligned_faces):
+            raise TypeError("aligned_faces must be a list of numpy arrays.")
+        if not aligned_faces:
+            return []
+        if not all(f.shape == (112, 112, 3) for f in aligned_faces):
+            raise ValueError("Each face must be aligned to (112,112,3) RGB.")
+    
+        embeddings = []
+        for i in range(0, len(aligned_faces), batch_size):
+            batch = aligned_faces[i:i + batch_size]
 
-        if not faces or faces[0].embedding is None:
-            return None
+            # # Apply ArcFace normalization: (img - 127.5) / 128.0
+            # batch = np.stack([(face.astype(np.float32) - 127.5) / 128.0 for face in batch])  # N,H,W,C
+            # batch = batch.transpose(0, 3, 1, 2)  # N,C,H,W      
+            
+            batch_embeddings = self.embedding_model.get_feat(batch)
 
-        embedding = np.asarray(faces[0].embedding, dtype=np.float32)
-
-        if embedding.ndim == 2 and embedding.shape[0] == 1:
-            embedding = embedding[0]  # flatten
-
-        if embedding.shape != (512,):
-            raise ValueError(f"Unexpected embedding shape: {embedding.shape} (expected (512,))")
-
-        # L2 normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding /= norm
-
-        return embedding
+            # L2 normalize
+            norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+            batch_embeddings = batch_embeddings / norms
+            embeddings.extend(batch_embeddings)
+        return embeddings

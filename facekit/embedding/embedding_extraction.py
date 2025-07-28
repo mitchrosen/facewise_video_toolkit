@@ -22,26 +22,3 @@ def crop_face(frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
     return frame[y1:y2, x1:x2]
 
 
-def extract_embedding_for_track(
-    embeddings_dict: EmbeddingDict,
-    frame: np.ndarray,
-    shot_id: int,
-    frame_idx: int,
-    track_id: str,
-    bbox: Tuple[int, int, int, int],
-    face_embedder: FaceEmbedder
-):
-    """
-    Extracts an embedding for the cropped face and stores it in the nested dict under shot_id → frame_id → track_id.
-    """
-    face_crop = crop_face(frame, bbox)
-    embedding = face_embedder.get_embedding(face_crop)
-    if embedding is not None:
-        embedding = embedding.tolist()
-        frame_id = f"frame_{frame_idx}"
-        if shot_id not in embeddings_dict:
-            embeddings_dict[shot_id] = {}
-        if frame_id not in embeddings_dict[shot_id]:
-            embeddings_dict[shot_id][frame_id] = {}
-        embeddings_dict[shot_id][frame_id][track_id] = embedding
-

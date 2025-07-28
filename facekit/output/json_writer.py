@@ -3,14 +3,14 @@ import torch
 import json
 from typing import Dict, List
 from facekit.detection.yolo5face_model import load_yolo5face_model
-from facekit.detection.detection_helpers import detect_faces_in_frame
+from facekit.detection.face_detector import FaceDetector
 from facekit.tracking.face_tracker import FaceTracker
 from facekit.tracking.face_structures import FaceTrack
 
 def multiface_tracking_to_json(
     input_path: str,
     output_json_path: str,
-    model_path: str,
+    detector_model_path: str,
     config_path: str,
     require_gpu: bool = False,
     min_face: int = 10,
@@ -27,7 +27,7 @@ def multiface_tracking_to_json(
     Args:
         input_path (str): Path to the input video file.
         output_json_path (str): Path where the JSON output will be saved.
-        model_path (str): Path to the YOLOv5 face detector weights (.pt file).
+        detector_model_path (str): Path to the YOLOv5 face detector weights (.pt file).
         config_path (str): Path to the YOLOv5 model configuration YAML file.
         require_gpu (bool): If True, raises an error if CUDA is not available.
         min_face (int): Minimum face size in pixels.
@@ -41,15 +41,17 @@ def multiface_tracking_to_json(
     start_time = time.time()
  
     if require_gpu and not torch.cuda.is_available():
-        raise RuntimeError("❌ GPU required but CUDA is not available.")
+        raise RuntimeError("GPU required but CUDA is not available.")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = load_yolo5face_model(
-        model_path=model_path,
+    detector_model = load_yolo5face_model(
+        detector_model_path=detector_model_path,
         config_path=config_path,
         device=device,
         min_face=min_face
     )
+    detector = FaceDetector(detector_model)
+
     elapsed = time.time() - start_time
     print(f"⏱️ startup time: {elapsed:.2f} seconds")
 
@@ -57,7 +59,7 @@ def multiface_tracking_to_json(
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"❌ Could not open video: {input_path}")
+        print(f"Could not open video: {input_path}")
         return
 
     tracker = FaceTracker(tracker_type=tracker_type)
@@ -90,7 +92,7 @@ def multiface_tracking_to_json(
                     do_fallback = True
 
         if should_detect or do_fallback:
-            result = detect_faces_in_frame(model, frame, target_size=640)
+            result = detector.detect_faces_in_frame(frame, target_size=640)
             if result is not None:
                 boxes, landmarks, confidences = result
                 if boxes:
@@ -124,10 +126,10 @@ def multiface_tracking_to_json(
     start_time = time.time()
     with open(output_json_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"⏱️ write json time: {elapsed:.2f} seconds")
+    print(f"Write json time: {elapsed:.2f} seconds")
 
-    print(f"✅ JSON tracking output saved to: {output_json_path}")
-    print(f"📊 Total frames processed: {frame_num}")
+    print(f"JSON tracking output saved to: {output_json_path}")
+    print(f"Total frames processed: {frame_num}")
 
 
 def export_vchunk_id_map(

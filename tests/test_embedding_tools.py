@@ -2,12 +2,13 @@ import numpy as np
 import pytest
 import json
 from facekit.embedding.embedding_summary import compute_representative_embeddings
-from facekit.embedding.embedding_extraction import crop_face, extract_embedding_for_track, save_embeddings_to_json
 from facekit.embedding.embedding_types import EmbeddingDict
+from facekit.embedding.embedding_extraction import crop_face, save_embeddings_to_json
 
 class DummyEmbedder:
-    def get_embedding(self, face_crop):
-        return np.ones(512, dtype=np.float32)
+    def get_embedding_batch(self, faces, batch_size=32):
+        # Return a batch of embeddings where each embedding is a 512-dim vector of ones
+        return np.array([np.ones(512, dtype=np.float32) for _ in faces], dtype=np.float32)
 
 @pytest.fixture
 def dummy_frame():
@@ -18,33 +19,6 @@ def test_crop_face_shape(dummy_frame):
     bbox = (10, 20, 50, 60)
     cropped = crop_face(dummy_frame, bbox)
     assert cropped.shape == (40, 40, 3)
-
-def test_extract_embedding_structure(dummy_frame):
-    embeddings: EmbeddingDict = {}
-    shot_id = "shot_001"
-    frame_idx = 12
-    frame_id = f"frame_{frame_idx}"
-    track_id = "track_0"
-    bbox = (10, 20, 50, 60)
-    extract_embedding_for_track(embeddings, dummy_frame, shot_id, frame_idx, track_id, bbox, DummyEmbedder())
-
-    assert shot_id in embeddings
-    assert len(embeddings) == 1
-    assert frame_id in embeddings[shot_id]
-    assert len(embeddings[shot_id]) == 1
-    assert track_id in embeddings[shot_id][frame_id]
-    assert len(embeddings[shot_id][frame_id]) == 1
-    assert isinstance(embeddings[shot_id][frame_id][track_id], list)
-    assert len(embeddings[shot_id][frame_id][track_id]) == 512
-
-def test_extract_embedding_none_skipped(dummy_frame):
-    class NoneEmbedder:
-        def get_embedding(self, face_crop):
-            return None
-
-    embeddings: EmbeddingDict = {}
-    extract_embedding_for_track(embeddings, dummy_frame, "shot_001", 0, "track_0", (10, 10, 20, 20), NoneEmbedder())
-    assert embeddings == {}
 
 def test_compute_representative_embeddings_basic():
     # Mock input embeddings for shot_001 with two frames, one track

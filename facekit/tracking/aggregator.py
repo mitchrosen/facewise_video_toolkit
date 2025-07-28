@@ -127,6 +127,33 @@ class ShotFaceTrackAggregator:
             if not track.is_active and not track.is_closed():
                 track.mark_closed()
 
+    def add_frame_observations(self, frame_idx: int, observations: List[Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray]]):
+        """
+        Converts (bbox, landmarks, aligned_face) observations into FaceObservations
+        and passes them to update_tracks_with_frame.
+        """
+        face_observations = [
+            FaceObservation(frame_idx, bbox, landmarks, aligned_face)
+            for bbox, landmarks, aligned_face in observations
+        ]
+        self.update_tracks_with_frame(frame_idx, face_observations)
+
+    def attach_embeddings(self, track_id: int, embeddings: List[np.ndarray]):
+        """
+        Attach a list of embeddings to the track with the given ID.
+
+        Args:
+            track_id (int): Track identifier.
+            embeddings (List[np.ndarray]): List of face embedding vectors.
+        """
+        for track in self.tracks:
+            if track.track_id == track_id:
+                if not hasattr(track, "embeddings"):
+                    track.embeddings = []
+                track.embeddings.extend(embeddings)
+                break
+
+
     # -------------------
     # Persistent Identity Assignment
     # -------------------
