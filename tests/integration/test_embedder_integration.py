@@ -20,7 +20,7 @@ def test_real_arcface_similarity():
     5. Assert that same-person similarity > different-person similarity.
     """
 
-    embedding_model_path = "models/embedding/w600k_r50.onnx"
+    embedding_model_path = "models/embedding/glintr100_dynamic.onnx"
     img1_path = "tests/assets/faces/face1_1.jpg"
     img2_path = "tests/assets/faces/face1_2.jpg"
     img3_path = "tests/assets/faces/face2_1.jpg"

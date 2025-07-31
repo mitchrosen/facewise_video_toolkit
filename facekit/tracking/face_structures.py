@@ -13,13 +13,17 @@ class FaceObservation:
         bbox (tuple): Bounding box in pixel coordinates (x1, y1, x2, y2).
         embedding (np.ndarray, optional): Facial feature vector.
         confidence (float, optional): Confidence score from the detector.
+        aligned_face (np.ndarray, optional): Aligned face crop (e.g. ArcFace 112x112 RGB)
     """
     frame_idx: int
     bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
     embedding: Optional[np.ndarray] = None
     confidence: Optional[float] = None
+    aligned_face: Optional[np.ndarray] = None
 
     def __post_init__(self):
+        # Defensive: coerce bbox to tuple and validate
+        self.bbox = tuple(self.bbox)
         self.validate_bbox()
 
     def validate_bbox(self):
@@ -28,7 +32,9 @@ class FaceObservation:
             len(self.bbox) == 4 and
             all(isinstance(v, int) for v in self.bbox)
         ):
-            raise ValueError(f"Invalid bbox: expected a 4-tuple of ints, got {self.bbox}")
+            raise ValueError(
+                f"Invalid bbox: could not convert to 4-tuple of ints — received {self.bbox}"
+            )
 
 @dataclass
 class FaceTrack:
@@ -82,8 +88,14 @@ class FaceTrack:
         self._frame_index_map[obs.frame_idx] = obs
         self.observations.append(obs)
         if obs.embedding is not None:
+            if not isinstance(obs.embedding, np.ndarray):
+                print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
+                raise TypeError(f"Embedding is not a numpy array (got {type(obs.embedding)}): frame {obs.frame_idx}")
+            if obs.embedding.ndim != 1:
+                print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
+                raise ValueError(f"Embedding is not 1D (got shape {obs.embedding.shape}): frame {obs.frame_idx}")
             self.embeddings.append(obs.embedding)
- 
+
     def reset_for_frame(self):
         self.is_active = False
 

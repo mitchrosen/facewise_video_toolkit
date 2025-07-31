@@ -127,32 +127,53 @@ class ShotFaceTrackAggregator:
             if not track.is_active and not track.is_closed():
                 track.mark_closed()
 
-    def add_frame_observations(self, frame_idx: int, observations: List[Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray]]):
+    def add_frame_observations(self, 
+                               frame_idx: int, 
+                               observations: List[Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray]]):
         """
-        Converts (bbox, landmarks, aligned_face) observations into FaceObservations
-        and passes them to update_tracks_with_frame.
+        Convert detector outputs for one frame into FaceObservations and update tracks.
+
+        observations: list of tuples with the following semantic shape per item:
+            (bbox, landmarks, aligned_face)
+              - bbox:       (x1, y1, x2, y2), may arrive as list → coerced to tuple of ints
+              - landmarks:  5-point landmarks (unused here other than having produced aligned_face)
+              - aligned_face: ArcFace-aligned RGB crop (112x112x3) or None if alignment failed
         """
-        face_observations = [
-            FaceObservation(frame_idx, bbox, landmarks, aligned_face)
-            for bbox, landmarks, aligned_face in observations
-        ]
+        face_observations = []
+        for bbox, _landmarks, aligned_face in observations:
+            obs = FaceObservation(frame_idx=frame_idx, bbox=bbox, aligned_face=aligned_face)
+            face_observations.append(obs)
         self.update_tracks_with_frame(frame_idx, face_observations)
 
-    def attach_embeddings(self, track_id: int, embeddings: List[np.ndarray]):
-        """
-        Attach a list of embeddings to the track with the given ID.
+    def attach_embeddings(self, track_id: int, embeddings: np.ndarray, expected_dim: int = 512):
+        track = next((t for t in self.tracks if t.track_id == track_id), None)
+        if track is None:
+            raise KeyError(f"No track with id {track_id}")
+        # Require a 2-D ndarray
+        if not isinstance(embeddings, np.ndarray):
+            raise TypeError(
+                f"attach_embeddings expected a numpy.ndarray of shape (K,{expected_dim}); "
+                f"got {type(embeddings).__name__}"
+            )
+        if embeddings.ndim != 2 or embeddings.shape[1] != expected_dim:
+            raise ValueError(
+                f"Embeddings must be shape (K,{expected_dim}); got {embeddings.shape}"
+            )
+        if not np.isfinite(embeddings).all(): 
+            raise ValueError(
+                f"Embeddings must all be finite; got\n {embeddings}"
+            )
+        if embeddings.dtype != np.float32:
+            embeddings = embeddings.astype(np.float32, copy=False)
+        
 
-        Args:
-            track_id (int): Track identifier.
-            embeddings (List[np.ndarray]): List of face embedding vectors.
-        """
-        for track in self.tracks:
-            if track.track_id == track_id:
-                if not hasattr(track, "embeddings"):
-                    track.embeddings = []
-                track.embeddings.extend(embeddings)
-                break
+        # Cheap (re-)normalization to keep invariants
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        embeddings = embeddings / norms
 
+        for i in range(embeddings.shape[0]):
+            track.embeddings.append(embeddings[i].copy())
 
     # -------------------
     # Persistent Identity Assignment
@@ -222,14 +243,10 @@ class ShotFaceTrackAggregator:
         def tracks_temporally_overlap(t1, t2):
             return not (t1.last_frame() < t2.first_frame() or t2.last_frame() < t1.first_frame())
 
-        print("[DEBUG] Starting resolve_vchunk_ids()")
-
         # Split into assigned and unassigned
         unassigned = [t for t in self.tracks if t.vchunk_id is None]
         existing = [t for t in self.tracks if t.vchunk_id is not None]
 
-        print(f"[DEBUG] Initial unassigned: {[t.track_id for t in unassigned]}")
-        print(f"[DEBUG] Initial existing: {[t.track_id for t in existing]}")
 
         # ✅ Pass 1: Reuse existing IDs
         for u in unassigned[:]:
@@ -277,10 +294,8 @@ class ShotFaceTrackAggregator:
                 # Remove grouped tracks
                 unassigned = [t for t in unassigned if t.vchunk_id is None]
 
-            print(f"[DEBUG] Assigned group {[t.track_id for t in group]} → vchunk_id {vchunk_id_counter}")
             vchunk_id_counter += 1
 
-        print(f"[DEBUG] Final assignments: {[(t.track_id, t.vchunk_id) for t in self.tracks]}")
         return vchunk_id_counter
 
 

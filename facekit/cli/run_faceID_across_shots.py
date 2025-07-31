@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--output_tracks", default=None, help="Path to save face tracks JSON")
     parser.add_argument("--detector_model", default="models/detector/yolov5n_state_dict.pt", help="Path to YOLOv5 model weights")
     parser.add_argument("--config", default="models/detector/yolov5n.yaml", help="Path to YOLOv5 config")
-    parser.add_argument("--embedding_model", default="models/embedding/w600k_r50.onnx", help="Path to ArcFace ONNX model")
+    parser.add_argument("--embedding_model", default="models/embedding/glintr100_dynamic.onnx", help="Path to ArcFace ONNX model")
     parser.add_argument("--output_video", nargs="?", const=True, default=None,
                         help="Optionally render labeled video (provide path or leave empty for default)")
     args = parser.parse_args()

@@ -50,9 +50,14 @@ class FaceEmbedder:
             # batch = batch.transpose(0, 3, 1, 2)  # N,C,H,W      
             
             batch_embeddings = self.embedding_model.get_feat(batch)
+            batch_embeddings = np.asarray(batch_embeddings, dtype=np.float32, order="C")  #ensure float32, contiguous       # ensure float32, contiguous
 
             # L2 normalize
             norms = np.linalg.norm(batch_embeddings, axis=1, keepdims=True)
+            norms = np.where(norms == 0.0, 1.0, norms)                 # guard divide-by-zero
+
             batch_embeddings = batch_embeddings / norms
             embeddings.extend(batch_embeddings)
-        return embeddings
+        
+        embeddings_array = np.vstack(embeddings)               # Concatenate per‑batch results into array, cache- and vectorized-ops-friendly                              # (K, 512)
+        return embeddings_array

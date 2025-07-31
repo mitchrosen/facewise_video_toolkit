@@ -176,3 +176,8 @@ def test_global_id_consistency_cpu_vs_gpu_with_mock():
     gpu_ids = [t.global_id for t in tracks_gpu]
 
     assert cpu_ids == gpu_ids, f"Mismatch between CPU and GPU modes: CPU={cpu_ids}, GPU={gpu_ids}"
+
+def test_resolver_raises_when_cuda_requested_but_unavailable(monkeypatch):
+    monkeypatch.setattr(torch, "cuda", type("X", (), {"is_available": lambda: False}))
+    with pytest.raises(RuntimeError):
+        GlobalIdentityResolver(device="cuda")

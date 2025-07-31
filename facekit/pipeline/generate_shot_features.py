@@ -105,6 +105,13 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
 
     start_time = time.time()
     result = {"shots": shots}
+
+    print(f"[DEBUG] total_frames={total_frames}")
+    for s in shots:
+        print(f"[DEBUG] shot {s['shot_number']}: {s['first_frame']}..{s['last_frame']}")
+    max_last = max(s['last_frame'] for s in shots) if shots else -1
+    print(f"[DEBUG] max last_frame in shots={max_last}")
+
     output_path.write_text(json.dumps(result, indent=2))
     elapsed = time.time() - start_time
     print(f"⏱️ write json file time: {elapsed:.2f} seconds")

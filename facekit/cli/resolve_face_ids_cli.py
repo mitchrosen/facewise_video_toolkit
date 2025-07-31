@@ -11,12 +11,13 @@ from facekit.tracking.face_structures import FaceTrack
 from facekit.pipeline.generate_shot_features import generate_shot_features_json
 from facekit.embedding.embedder import FaceEmbedder
 from facekit.detection.face_detector import FaceDetector
+from facekit.detection.yolo5face_model import load_yolo5face_model
 
 def main():
     parser = argparse.ArgumentParser(description="Track faces and resolve global identities across shots")
     parser.add_argument("--input", required=True, help="Path to input video file")
     parser.add_argument("--detector_model", default="models/detector/yolov5n_state_dict.pt", help="Path to YOLOv5 model weights")
-    parser.add_argument("--embedding_model", default="models/embedding/w600k_r50.onnx", help="Path to ArcFace ONNX model") 
+    parser.add_argument("--embedding_model", default="models/embedding/glintr100_dynamic.onnx", help="Path to ArcFace ONNX model") 
     parser.add_argument("--config", default="models/detector/yolov5n.yaml", help="Path to YOLOv5 model config")
     parser.add_argument("--shot_segmentation", default=None, help="Path to shot segmentation JSON (optional)")
     parser.add_argument("--output_vchunk_json", default=None, help="Optional path to save vchunk-only tracks JSON")
@@ -62,7 +63,16 @@ def main():
 
     # Initialize detector and embedder
     print("Initializing detector and embedder...")
-    detector = FaceDetector(model_path=args.detector_model, config_path=args.config, device=device)
+
+    # Remove --config from parser.add_argument section
+
+    # Initialize detector and embedder
+    print("Initializing detector and embedder...")
+    detector_model = load_yolo5face_model(
+        detector_model_path=args.detector_model,
+        config_path=args.config,
+        device=device)
+    detector = FaceDetector(detector_model=detector_model)
     embedder = FaceEmbedder(embedding_model_path=args.embedding_model, device=device)
 
     # Track across shots
@@ -72,7 +82,6 @@ def main():
         detector=detector,
         embedder=embedder
     )
-
 
     # Save vchunk-only JSON if requested
     if args.output_vchunk_json:
