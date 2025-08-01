@@ -1,7 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Literal
 import numpy as np
 from facekit.utils.geometry import compute_iou
+
+SourceT = Literal["detection", "tracking", "flow"]
 
 @dataclass
 class FaceObservation:
@@ -20,6 +22,9 @@ class FaceObservation:
     embedding: Optional[np.ndarray] = None
     confidence: Optional[float] = None
     aligned_face: Optional[np.ndarray] = None
+
+    landmarks: Optional[List[Tuple[float,float]]] = None
+    source: Optional[SourceT] = None  # "detection" | "tracking" | "flow"
 
     def __post_init__(self):
         # Defensive: coerce bbox to tuple and validate
@@ -52,15 +57,21 @@ class FaceTrack:
     
     Notes:
         Observations are also indexed internally by frame index for quick access.
-        Duplicate frame indices are disallowed unless `force=True` is used.
+        Duplicate frame indices are disallowed unless force=True is used.
     """
     shot_id: int
     track_id: int
-    vchunk_id: Optional[int] = None  
+    vchunk_id: Optional[int] = None 
+
     observations: List[FaceObservation] = field(default_factory=list)
     is_active: bool = False       # Frame-level: assigned in current frame
     is_open: bool = True          # Track lifecycle
     embeddings: List[np.ndarray] = field(default_factory=list)
+
+    last_landmarks: Optional[np.ndarray] = None     # shape (5,2), float32
+    last_bbox: Optional[Tuple[int,int,int,int]] = None
+    last_gray_roi: Optional[np.ndarray] = None      # previous ROI gray for LK
+    last_det_frame_idx: Optional[int] = None        # when we last had “real” landmarks
     
     def __post_init__(self):
         self._frame_index_map = {}
@@ -82,11 +93,15 @@ class FaceTrack:
         """
         if not self.is_open:
             raise RuntimeError("Cannot add observation to a closed track")
+
         existing = self._frame_index_map.get(obs.frame_idx)
         if existing and not force:
             raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
+
         self._frame_index_map[obs.frame_idx] = obs
         self.observations.append(obs)
+
+        # Store embedding if present
         if obs.embedding is not None:
             if not isinstance(obs.embedding, np.ndarray):
                 print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
@@ -95,6 +110,11 @@ class FaceTrack:
                 print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
                 raise ValueError(f"Embedding is not 1D (got shape {obs.embedding.shape}): frame {obs.frame_idx}")
             self.embeddings.append(obs.embedding)
+
+        # For tracking continuity: store landmarks if this was a detection
+        if obs.source == "detection" and obs.landmarks is not None:
+            self.last_known_landmarks = obs.landmarks  # ← prepare for optical flow
+
 
     def reset_for_frame(self):
         self.is_active = False

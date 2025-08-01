@@ -34,6 +34,18 @@ def test_track_across_shots_two_abutting_shots_no_overlap(tmp_path, monkeypatch)
         def get_embedding_batch(self, aligned_faces, batch_size=32):
             return np.ones((len(aligned_faces), 512), dtype=np.float32)
 
+    class FakeFaceTracker:
+        def __init__(self, tracker_type="CSRT"):
+            self.active_boxes = []
+
+        def init_trackers(self, frame, boxes_xywh):
+            self.active_boxes = boxes_xywh
+
+        def update_trackers(self, frame):
+            return self.active_boxes  # Always "succeeds" at tracking
+
+    monkeypatch.setattr("facekit.pipeline.track_across_shots.FaceTracker", FakeFaceTracker)
+
     # Build frames 0..7 with numeric pts/time
     n, fps, tb = 8, 30.0, Fraction(1, 30)
     frames = [FakeFrame(i, pts=int(round((i/fps)/tb)), time=i/fps) for i in range(n)]
