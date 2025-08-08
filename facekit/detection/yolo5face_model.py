@@ -1,5 +1,5 @@
 def load_yolo5face_model(
-    model_path: str,
+    detector_model_path: str,
     config_path: str,
     device: str = "cuda",
     min_face: int = 10
@@ -12,7 +12,7 @@ def load_yolo5face_model(
     to simplify downstream detection pipelines.
 
     Args:
-        model_path (str): Path to the .pt weights file (e.g., yolov5n_state_dict.pt).
+        detector_model_path (str): Path to the .pt weights file (e.g., yolov5n_state_dict.pt).
         config_path (str): Path to the YAML config file describing the model architecture.
         device (str): Device to run the model on ('cuda' or 'cpu').
         min_face (int, optional): Minimum pixel size of faces to detect. Defaults to 10.
@@ -25,7 +25,7 @@ def load_yolo5face_model(
 
     # safe_globals(["_reconstruct"])  # Not needed with the working torch
     return YoloDetector(
-        model_path,
+        detector_model_path,
         config_name=config_path,
         device=device,
         min_face=min_face
