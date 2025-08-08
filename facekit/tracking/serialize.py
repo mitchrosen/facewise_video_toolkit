@@ -19,6 +19,7 @@ def tracks_to_json_dict(tracks, include_embeddings=False):
             {
                 "shot_id": track.shot_id,
                 "track_id": track.track_id,
+                "face_label": track.global_id,  # <-- Added field
                 "observations": [
                     {
                         "frame_idx": obs.frame_idx,

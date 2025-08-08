@@ -8,7 +8,7 @@ def draw_tracks_on_video(
     video_path: str,
     output_path: str,
     tracks: List[FaceTrack],
-    label_fmt: Optional[Callable[[FaceTrack], str]] = None
+    label_fmt: Optional[Callable[[FaceTrack, int], str]] = None
 ) -> None:
     """
     Render a video with bounding boxes and labels for each tracked face.
@@ -43,8 +43,15 @@ def draw_tracks_on_video(
     # Build overlay map
     overlay_map = {}
     for track in tracks:
-        label = label_fmt(track) if label_fmt else f"{track.track_id}"
         for obs in track.observations:
+            if label_fmt:
+                # Prefer 2-arg labelers (track, frame_idx); fall back to legacy 1-arg
+                try:
+                    label = label_fmt(track, obs.frame_idx)
+                except TypeError:
+                    label = label_fmt(track)
+            else:
+                label = f"{track.track_id}"
             overlay_map.setdefault(obs.frame_idx, []).append((obs.bbox, label))
 
     print(f"[DEBUG] total_frames (video) = {total_frames}")

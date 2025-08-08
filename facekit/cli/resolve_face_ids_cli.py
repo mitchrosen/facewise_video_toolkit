@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--output_global_json", default=None, help="Optional path to save resolved global ID tracks JSON")
     parser.add_argument("--output_video", nargs="?", const=True, default=None,
                         help="Optionally render labeled video with global + vchunk IDs")
+    parser.add_argument("--detect_interval", type=int, default=30)
+    parser.add_argument("--embedding_batch_size_max", type=int, default=32)
 
     args = parser.parse_args()
 
@@ -80,7 +82,9 @@ def main():
         video_path=str(input_path),
         shot_json_path=str(shot_json),
         detector=detector,
-        embedder=embedder
+        embedder=embedder,
+        detect_interval = args.detect_interval,
+        embedding_batch_size_max = args.embedding_batch_size_max,
     )
 
     # Save vchunk-only JSON if requested
@@ -113,12 +117,23 @@ def main():
             vid = track.vchunk_id if hasattr(track, "vchunk_id") and track.vchunk_id is not None else "?"
             return f"G{gid}_V{vid}"
 
+        def label_with_shot_track_face_segment_frame_ids(track: FaceTrack, frame_num: int) -> str:
+            def q(x):  # convert None/missing to "?"
+                return "?" if x is None else x
+
+            sid = q(getattr(track, "shot_id", None))
+            tid = q(getattr(track, "track_id", None))
+            gid = q(getattr(track, "global_id", None))
+            seg = q(getattr(track, "vchunk_id", None))
+
+            return f"Sh{sid}_Tr{tid}_Fa{gid}_Seg{seg}_Fr{frame_num}"
+
         print(f"Rendering labeled video to {output_video_path}")
         draw_tracks_on_video(
             video_path=str(input_path),
             output_path=str(output_video_path),
             tracks=tracks,
-            label_fmt=label_with_global_and_vchunk
+            label_fmt=label_with_shot_track_face_segment_frame_ids
         )
 
 

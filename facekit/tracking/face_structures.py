@@ -46,22 +46,24 @@ class FaceTrack:
     """
     Represents a series of face observations believed to belong to the same person.
 
+    Identification Fields:
+        - shot_id (int): The shot number or video chunk this track belongs to.
+        - track_id (int): Unique track identifier within a shot or chunk.
+        - vchunk_id (Optional[int]): Identity assigned *within* a shot or chunk for matching faces.
+        - global_id (Optional[int]): Identity resolved *across* the full video (multi-shot/global).
+
     Attributes:
-        shot_id (int): Shot this track belongs to.
-        track_id (int): Unique within shot, does not change after creation.
-        vchunk_id (Optional[int]): Persistent identity across tracks in a shot.
         observations (List[FaceObservation]): Chronologically ordered observations.
         is_active (bool): True if matched in current frame; resets per frame.
         is_open (bool): True if track can accept new observations.
         embeddings (List[np.ndarray]): For computing similarity.
-    
-    Notes:
-        Observations are also indexed internally by frame index for quick access.
-        Duplicate frame indices are disallowed unless force=True is used.
+        last_landmarks (Optional[np.ndarray]): Landmark state for optical flow propagation.
+        last_gray_roi (Optional[np.ndarray]): Cached grayscale ROI from last detection.
     """
-    shot_id: int
-    track_id: int
-    vchunk_id: Optional[int] = None 
+    shot_id: int                      # The shot this track belongs to
+    track_id: int                     # Unique within a shot
+    vchunk_id: Optional[int] = None   # Local identity label (per-shot or chunk)
+    global_id: Optional[int] = None   # Global identity label across shots
 
     observations: List[FaceObservation] = field(default_factory=list)
     is_active: bool = False       # Frame-level: assigned in current frame
