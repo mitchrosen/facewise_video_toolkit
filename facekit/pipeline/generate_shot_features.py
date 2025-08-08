@@ -1,3 +1,5 @@
+# facekit/pipeline/generate_shot_features.py
+
 import json
 import cv2
 from pathlib import Path
@@ -5,10 +7,9 @@ from typing import Optional
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from scenedetect.frame_timecode import FrameTimecode
-from pathlib import Path
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
-from facekit.detection.detection_helpers import detect_faces_in_frame
+from facekit.detection.face_detector import FaceDetector
 from facekit.utils.geometry import normalize_face_bbox
 from facekit.postprocessing.validate_shot_features_json import validate_shot_features_json
 
@@ -30,13 +31,16 @@ def get_frame_at(video_capture, frame_num):
         raise RuntimeError(f"Failed to read frame {frame_num}")
     return frame
 
-def extract_faces(frame, model, frame_w, frame_h):
-    boxes, _, _ = detect_faces_in_frame(model, frame, target_size=640)
+def extract_faces(frame, detector: FaceDetector, frame_w, frame_h):
+    result = detector.detect_faces_in_frame(frame, target_size=640)
+    if result is None:
+        return []
+    boxes, _, _ = result
     return [normalize_face_bbox((x1, y1, x2, y2), frame_w, frame_h) for x1, y1, x2, y2 in boxes]
 
 def generate_shot_features_json(video_path: str, output_json_path: str,
-                                 model_path: str = "models/yolov5n_state_dict.pt",
-                                 config_path: str = "models/yolov5n.yaml",
+                                 detector_model_path: str = "models/detector/yolov5n_state_dict.pt",
+                                 config_path: str = "models/detector/yolov5n.yaml",
                                  threshold: float = 30.0):
     import time
     start_time = time.time()
@@ -58,13 +62,13 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     elapsed = time.time() - start_time
     print(f"⏱️ detect_scenes time: {elapsed:.2f} seconds")
 
-    # ✅ Fallback if no scenes were detected
     if not scenes:
         fps = cap.get(cv2.CAP_PROP_FPS)
         scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames - 1, fps))]
 
     device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
-    model = load_yolo5face_model(model_path=model_path, config_path=config_path, device=device)
+    detector_model = load_yolo5face_model(detector_model_path=detector_model_path, config_path=config_path, device=device)
+    detector = FaceDetector(detector_model)
 
     start_time = time.time()
     shots = []
@@ -76,7 +80,7 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
         frame = get_frame_at(cap, mid_frame_num)
 
         try:
-            face_boxes = extract_faces(frame, model, frame_w, frame_h)
+            face_boxes = extract_faces(frame, detector, frame_w, frame_h)
         except Exception as e:
             print(f"⚠️  Could not extract faces for shot {idx}: {e}")
             face_boxes = []
@@ -92,13 +96,22 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
             "detected_graphics": {}
         })
 
+    if shots and int(shots[-1]["last_frame"]) < total_frames - 1:
+       shots[-1]["last_frame"] = total_frames - 1
+
     cap.release()
     elapsed = time.time() - start_time
     print(f"⏱️ extract_faces and build json struct time: {elapsed:.2f} seconds")
 
-
     start_time = time.time()
     result = {"shots": shots}
+
+    print(f"[DEBUG] total_frames={total_frames}")
+    for s in shots:
+        print(f"[DEBUG] shot {s['shot_number']}: {s['first_frame']}..{s['last_frame']}")
+    max_last = max(s['last_frame'] for s in shots) if shots else -1
+    print(f"[DEBUG] max last_frame in shots={max_last}")
+
     output_path.write_text(json.dumps(result, indent=2))
     elapsed = time.time() - start_time
     print(f"⏱️ write json file time: {elapsed:.2f} seconds")
@@ -110,4 +123,3 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
             print(" -", e)
     else:
         print(f"✅ JSON valid. Saved to {output_path}")
-

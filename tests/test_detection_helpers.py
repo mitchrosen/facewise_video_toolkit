@@ -6,8 +6,7 @@ import cv2
 from unittest.mock import MagicMock
 
 from facekit.detection.detection_helpers import draw_faces_and_mouths
-from facekit.detection.detection_helpers import detect_faces_in_frame
-
+from facekit.detection.face_detector import FaceDetector
 
 def save_debug_image(image: np.ndarray, test_name: str):
     """Save frame to disk for debugging."""
@@ -30,7 +29,6 @@ def visualize_mask_regions(
     Create an image showing which regions are expected (dot, box, confidence)
     and highlight unexpected modifications (leaked pixels).
     """
-    print("in visualize_mask_regions")
     vis = np.zeros_like(original)
 
     # Set channels for different regions
@@ -165,9 +163,9 @@ class TestDetectFacesInFrame(unittest.TestCase):
 
         mock_model = MagicMock()
         mock_model.return_value = (fake_boxes, fake_landmarks, fake_confidences)
+        detector = FaceDetector(mock_model)
 
-        result = detect_faces_in_frame(mock_model, frame)
-        boxes, landmarks, confidences = result
+        boxes, landmarks, confidences = detector.detect_faces_in_frame(frame)
 
         self.assertEqual(boxes, fake_boxes)
         self.assertEqual(landmarks, fake_landmarks)
@@ -175,8 +173,13 @@ class TestDetectFacesInFrame(unittest.TestCase):
 
     def test_detect_faces_handles_none(self):
         frame = np.zeros((640, 480, 3), dtype=np.uint8)
+
         mock_model = MagicMock()
         mock_model.return_value = None
+        detector = FaceDetector(mock_model)
 
-        result = detect_faces_in_frame(mock_model, frame)
-        mock_model.assert_called_once()
+        boxes, landmarks, confidences = detector.detect_faces_in_frame(frame)
+
+        self.assertEqual(boxes, [])
+        self.assertEqual(landmarks, [])
+        self.assertEqual(confidences, [])

@@ -8,12 +8,18 @@ class FaceTracker:
         self.track_fail_counts = []
 
     def _create_tracker(self):
+        # Try modern API first
         if self.tracker_type == "CSRT":
-            return cv2.TrackerCSRT_create()
+            if hasattr(cv2, "TrackerCSRT_create"):
+                return cv2.TrackerCSRT_create()
+            elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
+                return cv2.legacy.TrackerCSRT_create()
         elif self.tracker_type == "KCF":
-            return cv2.TrackerKCF_create()
-        else:
-            raise ValueError(f"Unsupported tracker type: {self.tracker_type}")
+            if hasattr(cv2, "TrackerKCF_create"):
+                return cv2.TrackerKCF_create()
+            elif hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerKCF_create"):
+                return cv2.legacy.TrackerKCF_create()
+        raise RuntimeError(f"Unsupported tracker type: {self.tracker_type}")
 
     def init_trackers(self, frame, boxes):
         self.trackers = []
