@@ -1,42 +1,10 @@
 import cv2
 import numpy as np
-from typing import List, Tuple, Union
-from numpy import ndarray
-from typing import Optional, Tuple, List
-
-def detect_faces_in_frame(
-    model: object,
-    frame: ndarray,
-    target_size: int = 640
-) -> Optional[Tuple[List[List[int]], List[List[List[int]]], List[float]]]:
-    """
-    Run face detection on a single video frame using the specified YOLO-based model.
-
-    Args:
-        frame (np.ndarray): The image frame to process.
-        model (Any): The face detection model object with a callable interface.
-        target_size (int): Optional resizing dimension before detection (default is 640).
-
-    Returns:
-        Optional[Tuple]: A tuple containing:
-            - List of bounding boxes (each box is [x1, y1, x2, y2])
-            - List of facial landmarks (each face has a list of 5 [x, y] points)
-            - List of confidence scores for each detected face
-        Returns None if no faces are detected or an error occurs.
-    """
-
-    try:
-        results = model(frame, target_size=target_size)
-        if (
-            isinstance(results, tuple) and
-            len(results) == 3 and
-            all(isinstance(r, list) for r in results)
-        ):
-            return results  # (boxes, landmarks, confidences)
-        else:
-            return None
-    except Exception:
-        return None
+from typing import List, Union
+from typing import Optional, List
+from facekit.tracking.face_structures import FaceObservation
+from facekit.detection.face_detector import FaceDetector
+from facekit.detection.yolo5face_model import load_yolo5face_model
 
 import cv2
 import numpy as np
@@ -117,3 +85,80 @@ def draw_faces_and_mouths(
 
     return face_count
 
+device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
+detector_model_path = "models/detector/yolov5n_state_dict.pt"
+config_path = "models/detector/yolov5n.yaml"
+detector = FaceDetector(load_yolo5face_model(
+    detector_model_path="models/detector/yolov5n_state_dict.pt",
+    config_path="models/detector/yolov5n.yaml",
+    device='cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
+))
+
+def compute_expanded_bbox(bbox, all_boxes, img_w, img_h, margin=20):
+    """
+    Expand bbox as much as possible without overlapping other boxes or image boundaries.
+    Optionally add a fixed margin if space allows.
+    """
+    x1, y1, x2, y2 = bbox
+
+    # Distance to image boundaries
+    left_limit = x1
+    top_limit = y1
+    right_limit = img_w - x2
+    bottom_limit = img_h - y2
+
+    # Distance to nearest neighbor in each direction
+    for other in all_boxes:
+        if other == bbox:
+            continue
+        ox1, oy1, ox2, oy2 = other
+
+        # To the left: other box must be fully left
+        if ox2 <= x1:
+            left_limit = min(left_limit, x1 - ox2)
+        # To the right: other box must be fully right
+        if ox1 >= x2:
+            right_limit = min(right_limit, ox1 - x2)
+        # Above
+        if oy2 <= y1:
+            top_limit = min(top_limit, y1 - oy2)
+        # Below
+        if oy1 >= y2:
+            bottom_limit = min(bottom_limit, oy1 - y2)
+
+    # Now decide actual expansion amount (bounded by image and neighbors)
+    expand_left = max(left_limit, margin)
+    expand_top = max(top_limit, margin)
+    expand_right = max(right_limit, margin)
+    expand_bottom = max(bottom_limit, margin)
+
+    return (
+        max(0, x1 - expand_left),
+        max(0, y1 - expand_top),
+        min(img_w, x2 + expand_right),
+        min(img_h, y2 + expand_bottom),
+    )
+
+def detect_faces_and_embeddings(frame, frame_idx: int) -> List[FaceObservation]:
+    """
+    Detect faces and return a list of FaceObservation objects (no embedding).
+    """
+    observations = []
+
+    result = detector.detect_faces_in_frame(frame)
+    if result is None:
+        return observations
+
+    boxes, landmarks, confidences = result
+
+    for bbox, conf in zip(boxes, confidences):
+        bbox = tuple(int(x) for x in bbox)
+        obs = FaceObservation(
+            frame_idx=frame_idx,
+            bbox=bbox,
+            embedding=None,  # Embedding will be added later in batch
+            confidence=conf
+        )
+        observations.append(obs)
+
+    return observations

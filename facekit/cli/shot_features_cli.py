@@ -12,15 +12,15 @@ def main():
         help="Output JSON path (defaults to <video_basename>_shots.json)"
     )
     parser.add_argument(
-        "--model_path", type=str,
+        "--detector_model_path", type=str,
         # default="facekit/yolov5faceInference/yolo5face/yolov5s-face.pt",
-        default="models/yolov5n_state_dict.pt",
+        default="models/detector/yolov5n_state_dict.pt",
         help="Path to the YOLOv5 face detector weights"
     )
     parser.add_argument(
         "--config_path", type=str,
         # default="facekit/yolov5faceInference/yolo5face/yolov5n.yaml",
-        default="models/yolov5n.yaml",
+        default="models/detector/yolov5n.yaml",
         help="Path to YOLOv5 face model config file"
     )
     args = parser.parse_args()
@@ -35,7 +35,7 @@ def main():
     generate_shot_features_json(
         video_path=str(input_path),
         output_json_path=str(output_path),
-        model_path=args.model_path,
+        detector_model_path=args.detector_model_path,
         config_path=args.config_path
     )
 

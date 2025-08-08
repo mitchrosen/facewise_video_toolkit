@@ -27,7 +27,7 @@ def restore_audio_from_source(video_with_audio: str, video_no_audio: str) -> Non
         "-y",
         "-hide_banner",
         "-loglevel", "quiet",
-        temp_path  # ✅ output filename must go last
+        temp_path  # output filename must go last
     ]
     subprocess.run(cmd, check=True)
     os.replace(temp_path, video_no_audio)

@@ -1,0 +1,2 @@
+*.onnx filter=lfs diff=lfs merge=lfs -text
+models/embedding/*.onnx filter=lfs diff=lfs merge=lfs -text

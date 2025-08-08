@@ -21,3 +21,32 @@ def normalize_face_bbox(bbox, frame_w, frame_h):
         "face_width": round(face_width, 2),
         "face_height": round(face_height, 2)
     }
+
+def compute_iou(boxA, boxB):
+    """
+    Compute the Intersection over Union (IoU) of two bounding boxes.
+
+    Args:
+        boxA (tuple): (x1, y1, x2, y2) for the first box.
+        boxB (tuple): (x1, y1, x2, y2) for the second box.
+
+    Returns:
+        float: IoU value between 0.0 and 1.0
+    """
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    inter_width = max(0, xB - xA)
+    inter_height = max(0, yB - yA)
+    inter_area = inter_width * inter_height
+
+    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    union_area = areaA + areaB - inter_area
+
+    if union_area == 0:
+        return 0.0
+
+    return inter_area / union_area
