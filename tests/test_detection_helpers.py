@@ -15,7 +15,7 @@ def save_debug_image(image: np.ndarray, test_name: str):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = debug_dir / f"{test_name}_{timestamp}.png"
     cv2.imwrite(str(out_path), image)
-    print(f"⚠️ Debug frame saved to {out_path}")
+    print(f"Debug frame saved to {out_path}")
 
 def visualize_mask_regions(
         original: np.ndarray,
@@ -42,7 +42,7 @@ def visualize_mask_regions(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = out_dir / f"mask_debug_{test_name}_{timestamp}.png"
     cv2.imwrite(str(out_path), vis)
-    print(f"🧩 Mask visualization saved to {out_path}")
+    print(f"Mask visualization saved to {out_path}")
 
 
 class TestDrawFacesAndMouths(unittest.TestCase):

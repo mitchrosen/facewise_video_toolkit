@@ -33,7 +33,7 @@ def draw_tracks_on_video(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ✅ Use MJPEG for speed and .avi extension
+    # Use MJPEG for speed and .avi extension
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     if output_path.suffix.lower() != ".avi":
         output_path = output_path.with_suffix(".avi")
@@ -74,7 +74,7 @@ def draw_tracks_on_video(
 
     end_frame = max(total_frames, max_overlay_frame + 1)
 
-    # ✅ Timing variables
+    # Timing variables
     total_read, total_draw, total_write = 0.0, 0.0, 0.0
 
     for frame_idx in range(end_frame):
@@ -122,7 +122,7 @@ def draw_tracks_on_video(
     # --- DEBUG: loop end summary ---
     print(f"[DEBUG] Finished draw loop at frame_idx={frame_idx if 'frame_idx' in locals() else 'N/A'}")
 
-    print(f"\n✅ Video with overlays written to {output_path}")
+    print(f"\nVideo with overlays written to {output_path}")
     print(f"[TIMING SUMMARY]")
     print(f"Frame Reading    : {total_read:.2f}s")
     print(f"Overlay Drawing  : {total_draw:.2f}s")

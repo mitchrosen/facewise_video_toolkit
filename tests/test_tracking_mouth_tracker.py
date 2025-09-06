@@ -48,8 +48,8 @@ def test_get_mouth_box_from_landmarks_wide_mouth():
     ]
 
     box = get_mouth_box_from_landmarks(landmarks)
-    # x_min = 60 → 55, x_max = 100 → 105, w = 50
-    # y_min = 40 → 35, y_max = 42 → 47, h = 12
+    # x_min = 60 -> 55, x_max = 100 -> 105, w = 50
+    # y_min = 40 -> 35, y_max = 42 -> 47, h = 12
     assert box == (55, 35, 50, 12)
 
 def test_tracker_initialization_creates_expected_number(dummy_frame, dummy_landmarks):

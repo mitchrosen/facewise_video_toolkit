@@ -6,13 +6,13 @@ from unittest.mock import patch
 from tests.utils.pyav_fakes import FakeFrame, FakeContainer
 
 @pytest.mark.integration
-def test_track_across_shots_two_abutting_shots_no_overlap(tmp_path, monkeypatch):
-    from facekit.pipeline.track_across_shots import track_across_shots
+def test_track_across_segments_two_abutting_shots_no_overlap(tmp_path, monkeypatch):
+    from facekit.pipeline.track_across_segments import track_across_segments
 
     # Keep this test focused on shot boundaries; avoid OpenCV geometry.
     monkeypatch.setattr(
-        "facekit.pipeline.track_across_shots.align_face_for_arcface",
-        lambda frame, lm: np.zeros((112, 112, 3), dtype=np.uint8),
+        "facekit.pipeline.track_across_segments.align_face_for_arcface",
+        lambda frame, lm, frame_idx=None, source=None: np.zeros((112, 112, 3), dtype=np.uint8),
     )
 
     # Shots [0..2] and [3..7]
@@ -35,16 +35,20 @@ def test_track_across_shots_two_abutting_shots_no_overlap(tmp_path, monkeypatch)
             return np.ones((len(aligned_faces), 512), dtype=np.float32)
 
     class FakeFaceTracker:
-        def __init__(self, tracker_type="CSRT"):
+        def __init__(self, tracker_type="CSRT", *args, **kwargs):
             self.active_boxes = []
+            self.ids = []
 
-        def init_trackers(self, frame, boxes_xywh):
-            self.active_boxes = boxes_xywh
+        def init_trackers(self, frame, boxes_xywh, track_ids=None, *a, **k):
+            self.active_boxes = list(boxes_xywh)
+            self.ids = list(track_ids) if track_ids is not None else list(range(len(self.active_boxes)))
+
 
         def update_trackers(self, frame):
-            return self.active_boxes  # Always "succeeds" at tracking
+            # Return a dict keyed by track_id as expected by track_across_segments
+            return {tid: box for tid, box in zip(self.ids, self.active_boxes)}
 
-    monkeypatch.setattr("facekit.pipeline.track_across_shots.FaceTracker", FakeFaceTracker)
+    monkeypatch.setattr("facekit.pipeline.track_across_segments.FaceTracker", FakeFaceTracker)
 
     # Build frames 0..7 with numeric pts/time
     n, fps, tb = 8, 30.0, Fraction(1, 30)
@@ -52,7 +56,7 @@ def test_track_across_shots_two_abutting_shots_no_overlap(tmp_path, monkeypatch)
     container = FakeContainer(frames, fps_num=30, fps_den=1, time_base=tb)
 
     with patch("facekit.utils.video_reader.av.open", return_value=container):
-        tracks = track_across_shots(
+        tracks = track_across_segments(
             video_path="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),

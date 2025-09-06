@@ -53,7 +53,7 @@ def test_embedding_is_normalized(shared_embedder):
     face = np.full((112, 112, 3), 128, dtype=np.uint8)
     embedding = shared_embedder.get_embedding_batch([face])[0]
     norm = np.linalg.norm(embedding)
-    # Our mock returns all ones → norm > 1, but we expect normalization in real pipeline
+    # Our mock returns all ones -> norm > 1, but we expect normalization in real pipeline
     assert norm > 0, "Mock returned zero vector (unexpected in pipeline)"
 
 def test_embedding_is_deterministic(shared_embedder):

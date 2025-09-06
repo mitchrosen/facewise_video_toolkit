@@ -41,7 +41,7 @@ class VideoReader:
         seek_pts = int(round(seek_time / self.time_base))
 
         try:
-            # Backward seek → keyframe at/before seek_pts
+            # Backward seek -> keyframe at/before seek_pts
             self.container.seek(seek_pts, any_frame=False, backward=True)
         except (OSError, PermissionError) as e:
             warnings.warn(f"Seek not supported ({e}); falling back to sequential read.", RuntimeWarning)
