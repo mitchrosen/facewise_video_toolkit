@@ -55,12 +55,12 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     elapsed = time.time() - start_time
-    print(f"⏱️ setup time: {elapsed:.2f} seconds")
+    print(f"setup time: {elapsed:.2f} seconds")
    
     start_time = time.time()
     scenes = detect_scenes(video_path, threshold)
     elapsed = time.time() - start_time
-    print(f"⏱️ detect_scenes time: {elapsed:.2f} seconds")
+    print(f"detect_scenes time: {elapsed:.2f} seconds")
 
     if not scenes:
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -82,7 +82,7 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
         try:
             face_boxes = extract_faces(frame, detector, frame_w, frame_h)
         except Exception as e:
-            print(f"⚠️  Could not extract faces for shot {idx}: {e}")
+            print(f"Could not extract faces for shot {idx}: {e}")
             face_boxes = []
 
         shots.append({
@@ -101,7 +101,7 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
 
     cap.release()
     elapsed = time.time() - start_time
-    print(f"⏱️ extract_faces and build json struct time: {elapsed:.2f} seconds")
+    print(f"extract_faces and build json struct time: {elapsed:.2f} seconds")
 
     start_time = time.time()
     result = {"shots": shots}
@@ -114,12 +114,12 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
 
     output_path.write_text(json.dumps(result, indent=2))
     elapsed = time.time() - start_time
-    print(f"⏱️ write json file time: {elapsed:.2f} seconds")
+    print(f"write json file time: {elapsed:.2f} seconds")
 
     errors = validate_shot_features_json(str(output_path), "schemas/shot_features.schema.json", total_frames)
     if errors:
-        print("❌ Validation errors:")
+        print("Validation errors:")
         for e in errors:
             print(" -", e)
     else:
-        print(f"✅ JSON valid. Saved to {output_path}")
+        print(f"JSON valid. Saved to {output_path}")

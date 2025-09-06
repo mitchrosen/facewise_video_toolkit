@@ -80,7 +80,7 @@ def test_fallback_when_seek_raises_uses_sequential_and_count(patch_av_open, mk_f
     n, fps, tb = 15, 30.0, Fraction(1, 30)
     frames = mk_frames(n, fps=fps, time_base=tb)
 
-    # First av.open → container whose seek raises; second → fresh container for fallback reopen
+    # First av.open -> container whose seek raises; second -> fresh container for fallback reopen
     class RaisingContainer(mk_container(frames).__class__):
         def seek(self, *a, **k): raise OSError("seek not supported")
 

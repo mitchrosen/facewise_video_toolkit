@@ -13,12 +13,14 @@ class FaceObservation:
     Attributes:
         frame_idx (int): Frame index where the face was observed.
         bbox (tuple): Bounding box in pixel coordinates (x1, y1, x2, y2).
+        track_id (int, optional): Track ID for tracked faces.
         embedding (np.ndarray, optional): Facial feature vector.
         confidence (float, optional): Confidence score from the detector.
         aligned_face (np.ndarray, optional): Aligned face crop (e.g. ArcFace 112x112 RGB)
     """
     frame_idx: int
     bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
+    track_id: Optional[int] = None
     embedding: Optional[np.ndarray] = None
     confidence: Optional[float] = None
     aligned_face: Optional[np.ndarray] = None
@@ -49,7 +51,7 @@ class FaceTrack:
     Identification Fields:
         - shot_id (int): The shot number or video chunk this track belongs to.
         - track_id (int): Unique track identifier within a shot or chunk.
-        - vchunk_id (Optional[int]): Identity assigned *within* a shot or chunk for matching faces.
+        - segment_id (Optional[int]): Identity assigned *within* a shot or chunk for matching faces.
         - global_id (Optional[int]): Identity resolved *across* the full video (multi-shot/global).
 
     Attributes:
@@ -62,7 +64,7 @@ class FaceTrack:
     """
     shot_id: int                      # The shot this track belongs to
     track_id: int                     # Unique within a shot
-    vchunk_id: Optional[int] = None   # Local identity label (per-shot or chunk)
+    segment_id: Optional[int] = None   # Local identity label (per-shot or chunk)
     global_id: Optional[int] = None   # Global identity label across shots
 
     observations: List[FaceObservation] = field(default_factory=list)
@@ -93,6 +95,9 @@ class FaceTrack:
         Raises:
             ValueError: If an observation already exists for the frame index and force is False.
         """
+
+        self.observations.append(obs)
+
         if not self.is_open:
             raise RuntimeError("Cannot add observation to a closed track")
 
@@ -101,7 +106,6 @@ class FaceTrack:
             raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
 
         self._frame_index_map[obs.frame_idx] = obs
-        self.observations.append(obs)
 
         # Store embedding if present
         if obs.embedding is not None:
@@ -112,10 +116,10 @@ class FaceTrack:
                 print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
                 raise ValueError(f"Embedding is not 1D (got shape {obs.embedding.shape}): frame {obs.frame_idx}")
             self.embeddings.append(obs.embedding)
-
+ 
         # For tracking continuity: store landmarks if this was a detection
         if obs.source == "detection" and obs.landmarks is not None:
-            self.last_known_landmarks = obs.landmarks  # ← prepare for optical flow
+            self.last_known_landmarks = obs.landmarks  # <- prepare for optical flow
 
 
     def reset_for_frame(self):
@@ -123,6 +127,7 @@ class FaceTrack:
 
     def mark_closed(self):
         """Mark this track as permanently closed (no more updates)."""
+    
         self.is_open = False
         
     def is_closed(self) -> bool:
@@ -169,8 +174,9 @@ class FaceTrack:
         Returns:
             Optional[np.ndarray]: The mean embedding vector, or None if no embeddings are available.
         """
-        if not self.embeddings:
-            return None
+        if not self.embeddings or any(e is None for e in self.embeddings):
+            raise RuntimeError("Cannot compute average embedding: missing values")
+
         return np.mean(self.embeddings, axis=0)
 
     def duration(self) -> int:
@@ -201,3 +207,9 @@ class FaceTrack:
             float(np.mean(x2s)),
             float(np.mean(y2s))
         )
+    
+    def count_aligned_faces(self):
+        return sum(1 for obs in self.observations if obs.aligned_face is not None)
+
+    def count_embeddings(self):
+        return len(self.embeddings)

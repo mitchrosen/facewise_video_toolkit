@@ -15,7 +15,9 @@ sys.modules.pop("facekit.pipeline", None)
 @patch("facekit.pipeline.mouthtrack_frame_by_frame.draw_faces_and_mouths")
 @patch("cv2.VideoWriter")
 @patch("cv2.VideoCapture")
+@patch("facekit.tracking.face_tracker.FaceTracker.init_trackers")
 def test_pipeline_calls_detection_and_drawing(
+    mock_init,
     mock_capture,
     mock_writer,
     mock_draw,
@@ -27,6 +29,8 @@ def test_pipeline_calls_detection_and_drawing(
     import numpy as np
     from unittest.mock import MagicMock
     from facekit.pipeline.mouthtrack_frame_by_frame import multiface_mouthtrack
+
+    mock_init.side_effect = lambda frame, boxes, track_ids=None: None
 
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
     mock_cap_instance = MagicMock()

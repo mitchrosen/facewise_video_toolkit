@@ -5,8 +5,8 @@ from facekit.detection.detection_helpers import detect_faces_and_embeddings
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.output.drawing import draw_bbox_with_track_id
 from facekit.config import DEFAULT_OUTPUT_DIR
-# temporarily add vchunk_id export
-from facekit.output.json_writer import export_vchunk_id_map
+# temporarily add segment_id export
+from facekit.output.json_writer import export_segment_id_map
 
 def run_tracking_on_video(
     input_path: str,
@@ -66,17 +66,17 @@ def run_tracking_on_video(
 
     print(f"Tracking complete. Output saved to: {output_path}")
 
-    #Temporarily add logic to resolve vchunk IDs
+    #Temporarily add logic to resolve segment IDs
     # return aggregator.finalize_tracks()
 
     tracks = aggregator.finalize_tracks()
 
-    # TEMP: assign vchunk IDs and export map
-    aggregator.resolve_vchunk_ids(
-        vchunk_idcounter=0,
+    # TEMP: assign segment IDs and export map
+    aggregator.resolve_segment_ids(
+        segment_idcounter=0,
         embedding_threshold=0.7
     )
-    export_vchunk_id_map(tracks, output_path.replace(".mp4", "_vchunk_ids.json"))
-    print(f"vchunk ID map written to: {output_path.replace('.mp4', '_vchunk_ids.json')}")
+    export_segment_id_map(tracks, output_path.replace(".mp4", "_segment_ids.json"))
+    print(f"segment ID map written to: {output_path.replace('.mp4', '_segment_ids.json')}")
 
     return tracks

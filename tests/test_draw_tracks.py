@@ -45,8 +45,8 @@ def test_draw_tracks_on_video_mocks(VideoCaptureMock, VideoWriterMock, rectangle
             shot_id=1,
             track_id=1,
             observations=[
-                FaceObservation(frame_idx=0, bbox=(10, 10, 20, 20), confidence=0.9),
-                FaceObservation(frame_idx=2, bbox=(12, 12, 22, 22), confidence=0.95)
+                FaceObservation(frame_idx=0, bbox=(10, 10, 20, 20), confidence=0.9, source='detection'),
+                FaceObservation(frame_idx=2, bbox=(12, 12, 22, 22), confidence=0.95, source='detection')
             ]
         )
     ]

@@ -107,10 +107,10 @@ if __name__ == "__main__":
     errs = validate_shot_features(args.json_file, args.schema,
                                   total_frame_count=args.total_frame_count)
     if errs:
-        print("❌ Validation errors:")
+        print("Validation errors:")
         for e in errs:
             print(" -", e)
         sys.exit(1)
     else:
-        print("✅ shot_features.json is valid!")
+        print("shot_features.json is valid!")
 

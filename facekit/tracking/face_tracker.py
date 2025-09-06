@@ -4,8 +4,7 @@ import numpy as np
 class FaceTracker:
     def __init__(self, tracker_type="CSRT"):
         self.tracker_type = tracker_type
-        self.trackers = []
-        self.track_fail_counts = []
+        self.trackers = []  # list of (track_id, tracker) tuples
 
     def _create_tracker(self):
         # Try modern API first
@@ -21,28 +20,32 @@ class FaceTracker:
                 return cv2.legacy.TrackerKCF_create()
         raise RuntimeError(f"Unsupported tracker type: {self.tracker_type}")
 
-    def init_trackers(self, frame, boxes):
+    def init_trackers(self, frame, boxes, track_ids):
+        """Initialize one tracker per box and store associated track_id."""
         self.trackers = []
-        self.track_fail_counts = []
-        for box in boxes:
+        for box, track_id in zip(boxes, track_ids):
             tracker = self._create_tracker()
             try:
                 tracker.init(frame, tuple(box))
-                self.trackers.append(tracker)
-                self.track_fail_counts.append(0)
+                self.trackers.append((track_id, tracker))
             except Exception as e:
-                print(f"❌ Failed to initialize tracker for box {box}: {e}", flush=True)
+                print(f"Failed to initialize tracker for track_id={track_id} box={box}: {e}", flush=True)
 
     def update_trackers(self, frame):
-        updated_boxes = []
-        for tracker in self.trackers:
+        """Return dict mapping track_id to updated box, only if update succeeded."""
+        updated = {}
+        surviving_trackers = []
+
+        for track_id, tracker in self.trackers:
             success, box = tracker.update(frame)
             if success:
-                updated_boxes.append(box)
+                updated[track_id] = box
+                surviving_trackers.append((track_id, tracker))
             else:
-                updated_boxes.append(None)
-        return updated_boxes
+                print(f"[DEBUG] Tracker for track_id={track_id} failed — removing")
 
+        self.trackers = surviving_trackers
+        return updated
 
 def draw_tracked_face_box(frame, box, color_name="tracked"):
     """
