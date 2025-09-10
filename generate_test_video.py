@@ -29,4 +29,4 @@ for i in range(total_frames):
     out.write(frame)
 
 out.release()
-print(f"✅ Test video saved to: {output_path}")
+print(f"Test video saved to: {output_path}")

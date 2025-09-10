@@ -61,7 +61,7 @@ def crop_video_from_json(json_path, video_path, output_path, aspect_ratio=2.17, 
 
         faces = frame_data.get("faces", [])
 
-        # 🔽 Normalize to [x1, y1, x2, y2] format
+        # Normalize to [x1, y1, x2, y2] format
         add_bbox_to_faces(faces)
 
         face_count = len(faces)

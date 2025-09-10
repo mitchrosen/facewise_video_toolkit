@@ -19,6 +19,7 @@ def to_json_face(box, conf=None, source="tracked"):
 
 
 @patch("facekit.tracking.face_tracker.FaceTracker.update_trackers")
+@patch("facekit.tracking.face_tracker.FaceTracker.init_trackers")
 @patch("facekit.detection.face_detector.FaceDetector.detect_faces_in_frame")
 @patch("facekit.output.json_writer.FaceDetector")
 @patch("facekit.output.json_writer.load_yolo5face_model")
@@ -27,8 +28,11 @@ def to_json_face(box, conf=None, source="tracked"):
 @patch("facekit.output.json_writer.open", new_callable=mock_open)
 def test_multiface_tracking_to_json_precise_boxes(
     mock_file, mock_capture, mock_cuda, mock_load_detector_model,
-    mock_detector_class, mock_detect, mock_track
-):
+    mock_detector_class, mock_detect, mock_init, mock_track
+ ):
+    # init_trackers should tolerate calls without track_ids
+    mock_init.side_effect = lambda frame, boxes, track_ids=None: None
+
     FRAME_BOX_CONFIDENCE = {
         0: ((10, 20, 110, 220), 0.95),  # Detect
         1: (12, 22, 110, 220),          # Track
@@ -60,12 +64,13 @@ def test_multiface_tracking_to_json_precise_boxes(
     mock_detector_class.return_value = mock_detector_instance
 
     # --- Track update behavior across frames ---
+    # multiface_tracking_to_json expects LISTs of (x,y,w,h) for tracked frames
     mock_track.side_effect = [
-        [None],                       # frame 0 — post-detect
-        [FRAME_BOX_CONFIDENCE[1]],   # frame 1 — tracked
-        [None],                       # frame 2 — post-detect
-        [None],                       # frame 3 — track fails
-        [None],                       # frame 3 — post-fallback detect
+        [],                               # frame 0 — post-detect (no tracking yet)
+        [FRAME_BOX_CONFIDENCE[1]],        # frame 1 — tracked
+        [],                               # frame 2 — post-detect
+        [None],                           # frame 3 — track fails (forces fallback detect)
+        [],                               # frame 3 — post-fallback detect
     ]
 
     # --- Execute ---

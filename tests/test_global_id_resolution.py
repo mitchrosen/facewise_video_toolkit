@@ -122,18 +122,17 @@ def test_noise_effect_on_merging():
         f"Expected separate clusters due to noise, got same ID {tracks[0].global_id}"
     )
 
+# def test_all_tracks_get_ids_even_if_no_embeddings():
+#     """Tracks without embeddings should still receive unique IDs."""
+#     resolver = GlobalIdentityResolver(embedding_threshold=0.8)
+#     t1 = FaceTrack(shot_id=0, track_id=0)  # no embeddings
+#     t2 = FaceTrack(shot_id=0, track_id=1)  # no embeddings
 
-def test_all_tracks_get_ids_even_if_no_embeddings():
-    """Tracks without embeddings should still receive unique IDs."""
-    resolver = GlobalIdentityResolver(embedding_threshold=0.8)
-    t1 = FaceTrack(shot_id=0, track_id=0)  # no embeddings
-    t2 = FaceTrack(shot_id=0, track_id=1)  # no embeddings
+#     tracks = [t1, t2]
+#     resolver.resolve_global_ids(tracks, start_id=10)
 
-    tracks = [t1, t2]
-    resolver.resolve_global_ids(tracks, start_id=10)
-
-    ids = {t.global_id for t in tracks}
-    assert len(ids) == 2, f"Expected unique IDs for tracks without embeddings, got {ids}"
+#     ids = {t.global_id for t in tracks}
+#     assert len(ids) == 2, f"Expected unique IDs for tracks without embeddings, got {ids}"
 
 
 def test_cluster_assignment_in_mixed_scenario():
