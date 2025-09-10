@@ -9,6 +9,7 @@ def make_obs(frame_idx, bbox, embedding=None):
         frame_idx=frame_idx,
         bbox=bbox,
         embedding=np.array(embedding) if embedding is not None else None,
+        source='detection'
     )
 
 
@@ -106,8 +107,8 @@ def test_embedding_based_merge():
     # Both tracks should exist
     assert len(aggregator.tracks) == 2
 
-    vchunk_id_counter = 0
-    aggregator.resolve_vchunk_ids(vchunk_id_counter, embedding_threshold=0.6)
+    segment_id_counter = 0
+    aggregator.resolve_segment_ids(segment_id_counter, embedding_threshold=0.6)
 
-    ids = {t.vchunk_id for t in aggregator.tracks}
+    ids = {t.segment_id for t in aggregator.tracks}
     assert len(ids) == 1, f"Expected both tracks to share the same ID, got {ids}"

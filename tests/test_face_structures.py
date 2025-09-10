@@ -13,26 +13,27 @@ def test_face_observation_accepts_tuple_bbox():
         0,
         (10, 20, 30, 40),
         embedding=None,
-        confidence=0.99
+        confidence=0.99,
+        source='detection'
     )
     assert obs.bbox == (10, 20, 30, 40)
 
 def test_face_observation_accepts_list_bbox():
-    obs = FaceObservation(frame_idx=0, bbox=[10, 20, 30, 40])
+    obs = FaceObservation(frame_idx=0, bbox=[10, 20, 30, 40], source='detection')
     assert isinstance(obs.bbox, tuple)
     assert obs.bbox == (10, 20, 30, 40)
 
 def test_face_observation_rejects_invalid_bbox():
     # Too few elements
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox=(10, 20, 30))
+        FaceObservation(frame_idx=0, bbox=(10, 20, 30), source='detection')
 
     # Not all ints
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox=(10, "20", 30, 40))
+        FaceObservation(frame_idx=0, bbox=(10, "20", 30, 40), source='detection')
 
     # Wrong type entirely
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox="not a tuple")
+        FaceObservation(frame_idx=0, bbox="not a tuple", source='detection')
 
 

@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import cv2
 
-from facekit.pipeline.track_across_shots import track_across_shots
+from facekit.pipeline.track_across_segments import track_across_segments
 from facekit.pipeline.generate_shot_features import generate_shot_features_json
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
 from facekit.tracking.serialize import tracks_to_json_dict
@@ -34,7 +34,7 @@ def main():
 
     # Auto-generate shot segmentation if missing
     if not shot_segmentation_path.exists():
-        print(f"⚙️ Generating shot segmentation: {shot_segmentation_path}")
+        print(f"Generating shot segmentation: {shot_segmentation_path}")
         generate_shot_features_json(
             video_path=str(input_path),
             output_json_path=str(shot_segmentation_path),
@@ -42,7 +42,7 @@ def main():
             config_path=args.config
         )
     else:
-        print(f"🎞️ Using existing shot segmentation: {shot_segmentation_path}")
+        print(f"Using existing shot segmentation: {shot_segmentation_path}")
 
     # Auto-select device
     device = "cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu"
@@ -54,7 +54,7 @@ def main():
     embedder = FaceEmbedder(embedding_model_path=args.embedding_model, device=device)
 
     # Track faces across shots
-    tracks = track_across_shots(
+    tracks = track_across_segments(
         video_path=str(input_path),
         shot_json_path=str(shot_segmentation_path),
         detector=detector,
@@ -80,7 +80,7 @@ def main():
         )
 
         def label_with_shot_and_id(track: FaceTrack) -> str:
-            return f"S{track.shot_number}_C{track.vchunk_id}"
+            return f"S{track.shot_number}_C{track.segment_id}"
 
         print(f"Rendering labeled video to {output_video_path}")
         draw_tracks_on_video(

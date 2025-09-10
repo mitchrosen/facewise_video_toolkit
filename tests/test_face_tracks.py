@@ -8,6 +8,7 @@ def make_obs(frame_idx, bbox, embedding=None):
         frame_idx=frame_idx,
         bbox=bbox,
         embedding=np.array(embedding) if embedding is not None else None,
+        source='detection'
     )
 
 
@@ -45,10 +46,10 @@ def test_add_and_retrieve_bboxes():
 
 def test_invalid_bbox_raises_error():
     with pytest.raises(ValueError):
-        FaceObservation(frame_idx=0, bbox=(1, 2, 3))  # Too short
+        FaceObservation(frame_idx=0, bbox=(1, 2, 3), source='detection')  # Too short
 
     with pytest.raises(ValueError):
-        FaceObservation(frame_idx=0, bbox=("a", 2, 3, 4))  # Wrong type
+        FaceObservation(frame_idx=0, bbox=("a", 2, 3, 4), source='detection')  # Wrong type
 
 
 def test_post_init_duplicate_frame_idx_raises():

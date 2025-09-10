@@ -3,7 +3,7 @@
 # Move to project root if not already there
 cd "$(dirname "$0")"
 
-echo "🔍 Scanning and preparing to replace 'mouthtracker.' → 'facekit.'"
+echo "Scanning and preparing to replace 'mouthtracker.' -> 'facekit.'"
 
 find . -type f -name "*.py" | while read -r file; do
     matches=$(grep -n "mouthtracker\." "$file")
@@ -22,4 +22,4 @@ find . -type f -name "*.py" | while read -r file; do
     fi
 done
 
-echo -e "\n✅ All done. Imports updated."
+echo -e "\nAll done. Imports updated."

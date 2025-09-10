@@ -53,7 +53,7 @@ def multiface_tracking_to_json(
     detector = FaceDetector(detector_model)
 
     elapsed = time.time() - start_time
-    print(f"⏱️ startup time: {elapsed:.2f} seconds")
+    print(f"startup time: {elapsed:.2f} seconds")
 
     start_time = time.time()
 
@@ -121,7 +121,7 @@ def multiface_tracking_to_json(
 
     cap.release()
     elapsed = time.time() - start_time
-    print(f"⏱️ detection/tracking time: {elapsed:.2f} seconds")
+    print(f"detection/tracking time: {elapsed:.2f} seconds")
 
     start_time = time.time()
     with open(output_json_path, 'w') as f:
@@ -132,12 +132,12 @@ def multiface_tracking_to_json(
     print(f"Total frames processed: {frame_num}")
 
 
-def export_vchunk_id_map(
+def export_segment_id_map(
     shot_to_tracks: Dict[str, List[FaceTrack]],
     output_path: str
 ):
     """
-    Saves a mapping of shot → track → vchunk ID to a JSON file.
+    Saves a mapping of shot -> track -> segment ID to a JSON file.
 
     Args:
         shot_to_tracks: Dict mapping shot_id to list of FaceTrack objects
@@ -146,9 +146,9 @@ def export_vchunk_id_map(
     result = {}
     for shot_id, track_list in shot_to_tracks.items():
         result[shot_id] = {
-            track.track_id: f"face_{track.vchunk_id}"
+            track.track_id: f"face_{track.segmentid}"
             for track in track_list
-            if track.vchunk_id is not None
+            if track.segment_id is not None
         }
 
     with open(output_path, "w") as f:

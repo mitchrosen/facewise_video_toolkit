@@ -48,7 +48,7 @@ def draw_faces_and_mouths(
 
         # Sanity check bounding box is within frame
         if not (0 <= x1 < width and 0 <= y1 < height and 0 <= x2 <= width and 0 <= y2 <= height):
-            print(f"⚠️ Skipping face {i}: Box out of bounds")
+            print(f"Skipping face {i}: Box out of bounds")
             continue
 
         # Draw bounding box and confidence
@@ -69,7 +69,7 @@ def draw_faces_and_mouths(
         # Clamp inside image just to be safe
         for pt in (mouth_left, mouth_right):
             if not (0 <= pt[0] < width and 0 <= pt[1] < height):
-                print(f"⚠️ Skipping mouth landmark for face {i}: Out of bounds")
+                print(f"Skipping mouth landmark for face {i}: Out of bounds")
                 continue
 
         mouth_center = (

@@ -71,7 +71,7 @@ def visualize_shots_on_video(input_video_path,
     # Open the input video
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"❌ Failed to open video: {input_video_path}")
+        raise RuntimeError(f"Failed to open video: {input_video_path}")
 
     # Extract video properties
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -120,7 +120,7 @@ def visualize_shots_on_video(input_video_path,
 
     cap.release()
     out.release()
-    print(f"✅ Output video saved to: {output_video_path}")
+    print(f"Output video saved to: {output_video_path}")
 
 def parse_bgr(bgr_str):
     try:

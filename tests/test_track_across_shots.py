@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
-import facekit.pipeline.track_across_shots as tacs
-from facekit.pipeline.track_across_shots import track_across_shots
+import facekit.pipeline.track_across_segments as tacs
+from facekit.pipeline.track_across_segments import track_across_segments
 from tests.utils.video_mocks import make_pyav_like_frames
 from tests.utils.video_mocks import make_frames_without_time
 
@@ -14,7 +14,7 @@ def dummy_video(tmp_path):
     dummy_path.write_bytes(b"not a real video")
     return str(dummy_path)
 
-def test_track_across_shots_with_mock_av(tmp_path):
+def test_track_across_segments_with_mock_av(tmp_path):
     dummy_shot_json = tmp_path / "shot_features.json"
     shots = [
         {"shot_number": 1, "first_frame": 0, "last_frame": 2},
@@ -22,7 +22,22 @@ def test_track_across_shots_with_mock_av(tmp_path):
     ]
     dummy_shot_json.write_text(json.dumps({"shots": shots}, indent=2))
 
-    with patch("facekit.utils.video_reader.av.open") as mock_av_open:
+    class FakeTracker:
+        def __init__(self, tracker_type="CSRT", *args, **kwargs):
+            self.trackers = []
+            self.track_ids = []
+
+        def init_trackers(self, frame, boxes, track_ids=None, *a, **k):
+            self.trackers = list(boxes)
+            # Mirror aggregator behavior in this code path: IDs start at 2
+            n = len(self.trackers)
+            self.track_ids = list(track_ids) if track_ids is not None else list(range(len(self.trackers)))
+
+        def update_trackers(self, frame):
+            return {tid: box for tid, box in zip(self.track_ids, self.trackers)}
+        
+    with patch("facekit.utils.video_reader.av.open") as mock_av_open, \
+     patch.object(tacs, "FaceTracker", FakeTracker):
         mock_container = MagicMock()
         mock_stream = MagicMock()
         mock_stream.type = "video"
@@ -44,7 +59,7 @@ def test_track_across_shots_with_mock_av(tmp_path):
                 K = len(aligned_faces)
                 return np.ones((K, 512), dtype=np.float32)
 
-        tracks = track_across_shots(
+        tracks = track_across_segments(
             video_path="dummy.mp4",
             shot_json_path=str(dummy_shot_json),
             detector=FakeDetector(),
@@ -54,7 +69,7 @@ def test_track_across_shots_with_mock_av(tmp_path):
         assert isinstance(tracks, list)
         assert all(hasattr(t, "track_id") for t in tracks)
 
-def test_all_tracks_have_valid_vchunk_ids(monkeypatch, dummy_video, tmp_path):
+def test_all_tracks_have_valid_segment_ids(monkeypatch, dummy_video, tmp_path):
     dummy_shot_json = tmp_path / "shot_features.json"
     dummy_shot_json.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 4}]}))
 
@@ -75,8 +90,24 @@ def test_all_tracks_have_valid_vchunk_ids(monkeypatch, dummy_video, tmp_path):
             for i in range(K):
                 embs[i, i % 512] = 1.0
             return embs
+        
+    class FakeTracker:
+        def __init__(self, tracker_type="CSRT", *args, **kwargs):
+            self.trackers = []
+            self.track_ids = []
 
-    with patch("facekit.utils.video_reader.av.open") as mock_av_open:
+        def init_trackers(self, frame, boxes, track_ids=None, *a, **k):
+            self.trackers = list(boxes)
+            # Mirror aggregator behavior in this code path: IDs start at 2
+            n = len(self.trackers)
+            self.track_ids = list(track_ids) if track_ids is not None else list(range(len(self.trackers)))
+
+
+        def update_trackers(self, frame):
+            return {tid: box for tid, box in zip(self.track_ids, self.trackers)}
+
+    with patch("facekit.utils.video_reader.av.open") as mock_av_open, \
+     patch.object(tacs, "FaceTracker", FakeTracker):
         mock_container = MagicMock()
         mock_stream = MagicMock()
         mock_stream.type = "video"
@@ -85,20 +116,34 @@ def test_all_tracks_have_valid_vchunk_ids(monkeypatch, dummy_video, tmp_path):
         mock_container.decode.return_value = make_pyav_like_frames(5)
         mock_av_open.return_value = mock_container
 
-        tracks = track_across_shots(
+        tracks = track_across_segments(
             video_path=str(dummy_video),
             shot_json_path=str(dummy_shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
         )
 
-        assert all(hasattr(track, "vchunk_id") for track in tracks)
+        assert all(hasattr(track, "segment_id") for track in tracks)
 
 def test_detector_none_disables_tracker(tmp_path, monkeypatch):
     shot_json = tmp_path / "shots.json"
     shot_json.write_text(json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":9}]}))
 
-    with patch("facekit.utils.video_reader.av.open") as mock_open:
+    class FakeTracker:
+        def __init__(self, tracker_type="CSRT", *args, **kwargs):
+            self.trackers = []
+            self.track_ids = []
+
+        def init_trackers(self, frame, boxes, track_ids=None, *a, **k):
+            self.trackers = list(boxes)
+            self.track_ids = list(track_ids) if track_ids else list(range(len(self.trackers)))
+
+        def update_trackers(self, frame):
+            # track_across_segments expects a dict {track_id: (x,y,w,h)}
+            return {tid: box for tid, box in zip(self.track_ids, self.trackers)}
+
+    with patch("facekit.utils.video_reader.av.open") as mock_open, \
+     patch.object(tacs, "FaceTracker", FakeTracker):
         c = MagicMock()
         s = MagicMock(); s.type="video"; s.frames=10
         c.streams.video=[s]
@@ -112,7 +157,7 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
         class FakeEmbedder:
             def get_embedding_batch(self, aligned, batch_size=32):
                 return np.zeros((len(aligned),512), dtype=np.float32)
-
+            
         # Minimal tracker stub to ensure we don't call update when disabled
         class TrackerStub:
             def __init__(self, *a, **k): self.init_called=False; self.update_called=False
@@ -121,14 +166,14 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
 
         monkeypatch.setattr(tacs, "FaceTracker", TrackerStub)
 
-        tracks = track_across_shots(
+        tracks = track_across_segments(
             video_path="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
             detect_interval=3,
         )
-        # No detections → no tracks
+        # No detections -> no tracks
         assert tracks == []
 
 # def test_video_reader_fallback_without_time(monkeypatch, tmp_path):
@@ -154,7 +199,7 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
 #                 import numpy as np
 #                 return np.zeros((len(faces), 512), dtype=np.float32)
 
-#         tracks = track_across_shots(
+#         tracks = track_across_segments(
 #             video_path="dummy.mp4",
 #             shot_json_path=str(shots_json),
 #             detector=FakeDetector(),
@@ -170,7 +215,7 @@ def test_align_face_returns_none_is_skipped(tmp_path, monkeypatch):
     # 0..4 frames; align_face returns None half the time
     # Expect: no exception; embedding batch sees only non‑None crops
     import json, numpy as np
-    from facekit.pipeline.track_across_shots import track_across_shots
+    from facekit.pipeline.track_across_segments import track_across_segments
 
     shot_json = tmp_path / "shots.json"
     shot_json.write_text(json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":4}]}))
@@ -187,7 +232,7 @@ def test_align_face_returns_none_is_skipped(tmp_path, monkeypatch):
 
         # Force align_face_for_arcface to return None on odd calls
         calls = {"n":0}
-        def fake_align(frame, lm):
+        def fake_align(frame, lm, frame_idx=None, source=None):
             calls["n"] += 1
             return None if calls["n"] % 2 else np.zeros((112,112,3), dtype=np.uint8)
 
@@ -198,7 +243,7 @@ def test_align_face_returns_none_is_skipped(tmp_path, monkeypatch):
                 # Should only get crops for even calls
                 return np.ones((len(aligned_faces),512), dtype=np.float32)
 
-        tracks = track_across_shots(
+        tracks = track_across_segments(
             video_path="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),

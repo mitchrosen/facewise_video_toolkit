@@ -15,7 +15,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     patch_batch_dim_dynamic(str(in_path), str(out_path), batch_symbol=args.symbol)
-    print(f"✅ Patched dynamic batch dimension written to: {out_path}")
+    print(f"Patched dynamic batch dimension written to: {out_path}")
 
 if __name__ == "__main__":
     main()
