@@ -22,38 +22,30 @@ class VideoReader:
         self.time_base = self.stream.time_base
 
     def get_frames(self, start_frame: int, end_frame: int):
-        """
-        Retrieve frames from start_frame to end_frame (inclusive).
-        Returns: List[np.ndarray] in BGR format.
-        """
         frames = []
         target_count = end_frame - start_frame + 1
         if target_count <= 0:
             return frames
 
-        # Convert frame indices to time/PTS
         start_time = start_frame / self.fps
         start_pts = int(round(start_time / self.time_base))
 
-        # Seek slightly BEFORE the shot start, then decode forward
-        preroll_frames = 5  # small safety margin
+        preroll_frames = 5
         seek_time = max(0.0, start_time - preroll_frames / self.fps)
         seek_pts = int(round(seek_time / self.time_base))
 
         try:
-            # Backward seek -> keyframe at/before seek_pts
             self.container.seek(seek_pts, any_frame=False, backward=True)
         except (OSError, PermissionError) as e:
+            import warnings
             warnings.warn(f"Seek not supported ({e}); falling back to sequential read.", RuntimeWarning)
             return self._sequential_fallback(start_frame, end_frame)
 
-        # Fallback counters for mocks / edge streams
         to_skip_by_count = max(0, int(round((start_time - seek_time) * self.fps)))
         eps = 1e-9
 
         emitted = 0
         for frame in self.container.decode(video=0):
-            # Skip until we reach the requested start
             usable_pts = isinstance(getattr(frame, "pts", None), (int, float))
             usable_time = isinstance(getattr(frame, "time", None), (int, float))
 
@@ -68,12 +60,23 @@ class VideoReader:
                     to_skip_by_count -= 1
                     continue
 
-            # Emit exactly target_count frames
             frames.append(frame.to_ndarray(format="bgr24"))
             emitted += 1
             if emitted >= target_count:
                 break
 
+        # >>> NEW: if seeked decode produced nothing, fall back to sequential.
+        if not frames:
+            return self._sequential_fallback(start_frame, end_frame)
+
+        return frames
+        
+    def read_next_n(self, n: int):
+        frames = []
+        for frame in self.container.decode(video=0):
+            frames.append(frame.to_ndarray(format="bgr24"))
+            if len(frames) >= n:
+                break
         return frames
 
     def _sequential_fallback(self, start_frame: int, end_frame: int):

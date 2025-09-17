@@ -383,7 +383,6 @@ class ShotFaceTrackAggregator:
         ]
 
         if missing_tracks:
-            print("\n[DEBUG] Summary of tracks missing embeddings:")
             for t in missing_tracks:
                 aligned_count = sum(1 for obs in t.observations if obs.aligned_face is not None)
                 valid_embeds = sum(1 for e in t.embeddings if e is not None)
@@ -427,11 +426,8 @@ class ShotFaceTrackAggregator:
             # Assign segment_id
             if best_match:
                 current.segment_id = best_match.segment_id
-                print(f"[DEBUG] Assigned existing segment_id {current.segment_id} to track {current.track_id} "
-                    f"(similarity={best_score:.3f})")
             else:
                 current.segment_id = segment_id_counter
-                print(f"[DEBUG] Assigned new segment_id {segment_id_counter} to track {current.track_id}")
                 segment_id_counter += 1
 
         return segment_id_counter
@@ -441,11 +437,6 @@ class ShotFaceTrackAggregator:
         Close all remaining open tracks and return them.
         Call prior to 
         """
-
-        #DEBUG
-        for t in self.tracks:
-            if t.first_frame() in {14863, 14864}:
-                print(f"[DEBUG] Final track {t.track_id} starts at frame {t.first_frame()} with frames {t.get_frame_indices()}")
 
         for t in self.tracks:
             if not t.is_closed():
