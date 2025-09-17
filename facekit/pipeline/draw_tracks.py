@@ -54,24 +54,21 @@ def draw_tracks_on_video(
                 label = f"{track.track_id}"
             overlay_map.setdefault(obs.frame_idx, []).append((obs.bbox, label))
 
-    print(f"[DEBUG] total_frames (video) = {total_frames}")
-
     if overlay_map:
         min_overlay_frame = min(overlay_map.keys())
         max_overlay_frame = max(overlay_map.keys())
-        print(f"[DEBUG] overlay_map frames: min={min_overlay_frame}, max={max_overlay_frame}, count={len(overlay_map)}")
+ 
         # Frames that have overlays but are beyond the video length (they will never be drawn)
         extra_overlay_frames = sorted(k for k in overlay_map.keys() if k >= total_frames)[:10]
         if extra_overlay_frames:
             print(f"[WARN] {len(extra_overlay_frames)} overlay frames >= total_frames (showing up to 10): {extra_overlay_frames}")
+ 
         # Quick look at last 10 video frames and whether overlays exist
         tail_probe_start = max(0, total_frames - 10)
         tail_probe = [(f, len(overlay_map.get(f, []))) for f in range(tail_probe_start, total_frames)]
-        print(f"[DEBUG] overlays per last 10 video frames: {tail_probe}")
     else:
         max_overlay_frame = 0
-        print("[DEBUG] overlay_map is EMPTY (no observations to draw)")
-
+ 
     end_frame = max(total_frames, max_overlay_frame + 1)
 
     # Timing variables
@@ -95,12 +92,9 @@ def draw_tracks_on_video(
         # --- DEBUG: tail frames and per-frame overlay details ---
         if frame_idx >= total_frames - 5:  # focus on the last 5 video frames
             labels_here = [lbl for _, lbl in overlays]
-            print(f"[DEBUG] f={frame_idx}/{total_frames-1} "
-                  f"overlays={len(overlays)} labels={labels_here} ")
             # If present, show one bbox sample to verify coordinates look sane
             if overlays:
                 (x1, y1, x2, y2), _ = overlays[0]
-                print(f"[DEBUG] sample bbox on f={frame_idx}: ({x1},{y1},{x2},{y2})")
         
         for bbox, label in overlays:
             x1, y1, x2, y2 = bbox
@@ -118,9 +112,6 @@ def draw_tracks_on_video(
 
     cap.release()
     out.release()
-
-    # --- DEBUG: loop end summary ---
-    print(f"[DEBUG] Finished draw loop at frame_idx={frame_idx if 'frame_idx' in locals() else 'N/A'}")
 
     print(f"\nVideo with overlays written to {output_path}")
     print(f"[TIMING SUMMARY]")

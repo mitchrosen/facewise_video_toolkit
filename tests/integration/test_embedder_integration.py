@@ -71,5 +71,4 @@ def test_real_arcface_similarity():
     sim_same = cosine_similarity(emb1, emb2)
     sim_diff = cosine_similarity(emb1, emb3)
 
-    print(f"[DEBUG] sim_same={sim_same:.4f}, sim_diff={sim_diff:.4f}")
     assert sim_same > sim_diff, f"Expected same-person sim ({sim_same:.4f}) > diff-person sim ({sim_diff:.4f})"

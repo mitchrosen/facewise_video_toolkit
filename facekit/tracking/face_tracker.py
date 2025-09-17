@@ -32,20 +32,29 @@ class FaceTracker:
                 print(f"Failed to initialize tracker for track_id={track_id} box={box}: {e}", flush=True)
 
     def update_trackers(self, frame):
-        """Return dict mapping track_id to updated box, only if update succeeded."""
-        updated = {}
-        surviving_trackers = []
+        """
+        Update all active trackers with `frame`.
 
-        for track_id, tracker in self.trackers:
-            success, box = tracker.update(frame)
-            if success:
-                updated[track_id] = box
-                surviving_trackers.append((track_id, tracker))
+        Returns
+        -------
+        dict[int, tuple|None]
+            Mapping track_id -> (x, y, w, h) on success, or None if that tracker failed.
+            NOTE: Failed trackers are removed from self.trackers after reporting None.
+        """
+        results = {}
+        surviving = []
+
+        # Snapshot the ids we’re attempting this frame, so every id gets a result
+        for track_id, tracker in list(self.trackers):
+            ok, box = tracker.update(frame)
+            if ok:
+                results[track_id] = box  # (x, y, w, h)
+                surviving.append((track_id, tracker))
             else:
-                print(f"[DEBUG] Tracker for track_id={track_id} failed — removing")
+                results[track_id] = None
 
-        self.trackers = surviving_trackers
-        return updated
+        self.trackers = surviving
+        return results
 
 def draw_tracked_face_box(frame, box, color_name="tracked"):
     """
