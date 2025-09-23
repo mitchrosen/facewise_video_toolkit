@@ -45,8 +45,7 @@ class GlobalIdentityResolver:
         Returns:
             int: The next available global_id after assignment.
         """
-        print(f"[DEBUG] Starting global resolution: {len(tracks)} tracks")
-
+    
         # Collect normalized embeddings for valid tracks
         valid_indices, embeddings = [], []
         for i, track in enumerate(tracks):
@@ -56,7 +55,6 @@ class GlobalIdentityResolver:
                 embeddings.append(avg_emb)
 
         if not embeddings:
-            print("[DEBUG] No valid embeddings; assigning unique IDs")
             for track in tracks:
                 track.global_id = start_id
                 start_id += 1
@@ -102,5 +100,4 @@ class GlobalIdentityResolver:
                 track.global_id = start_id
                 start_id += 1
 
-        print(f"[DEBUG] Global ID assignment complete. Next ID: {start_id}")
         return start_id

@@ -12,6 +12,7 @@ from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.face_detector import FaceDetector
 from facekit.utils.geometry import normalize_face_bbox
 from facekit.postprocessing.validate_shot_features_json import validate_shot_features_json
+from facekit.utils.video_reader import VideoReader
 
 def detect_scenes(video_path, threshold=30.0):
     video_manager = VideoManager([str(video_path)])
@@ -23,13 +24,6 @@ def detect_scenes(video_path, threshold=30.0):
     scene_manager.detect_scenes(frame_source=video_manager)
 
     return scene_manager.get_scene_list()
-
-def get_frame_at(video_capture, frame_num):
-    video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-    success, frame = video_capture.read()
-    if not success:
-        raise RuntimeError(f"Failed to read frame {frame_num}")
-    return frame
 
 def extract_faces(frame, detector: FaceDetector, frame_w, frame_h):
     result = detector.detect_faces_in_frame(frame, target_size=640)
@@ -47,28 +41,43 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
     video_path = Path(video_path)
     output_path = Path(output_json_path)
 
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-    
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    reader = VideoReader(str(video_path))
+    stream = reader.stream
+    fps = reader.fps
+    frame_w = stream.codec_context.width
+    frame_h = stream.codec_context.height
     elapsed = time.time() - start_time
     print(f"setup time: {elapsed:.2f} seconds")
    
+    # Scene detection
     start_time = time.time()
     scenes = detect_scenes(video_path, threshold)
     elapsed = time.time() - start_time
     print(f"detect_scenes time: {elapsed:.2f} seconds")
 
+    # If no scenes, create a single scene covering the whole video.
+    # Derive a frame count from PyAV if available; otherwise estimate from duration.
     if not scenes:
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames - 1, fps))]
+        # Try to estimate total frames robustly
+        total_frames_guess = int(stream.frames) if getattr(stream, "frames", 0) else 0
+        if total_frames_guess <= 0 and getattr(stream, "duration", None):
+            # duration is in "time_base" units; convert to seconds then to frames
+            seconds = float(stream.duration * reader.time_base)
+            total_frames_guess = max(1, int(round(seconds * fps)))
+        if total_frames_guess <= 0:
+            total_frames_guess = 1  # last resort
+        scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames_guess, fps))]
 
     device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
     detector_model = load_yolo5face_model(detector_model_path=detector_model_path, config_path=config_path, device=device)
     detector = FaceDetector(detector_model)
+
+    # Helper: fetch exactly one frame by index via PyAV reader
+    def _get_frame_at(reader: VideoReader, frame_num: int):
+        arrs = reader.get_frames(frame_num, frame_num)
+        if not arrs:
+            raise RuntimeError(f"Failed to read frame {frame_num}")
+        return arrs[0]
 
     start_time = time.time()
     shots = []
@@ -77,7 +86,7 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
         end_frame_num = scene_end.get_frames() - 1
         mid_frame_num = (start_frame_num + end_frame_num) // 2
 
-        frame = get_frame_at(cap, mid_frame_num)
+        frame = _get_frame_at(reader, mid_frame_num)
 
         try:
             face_boxes = extract_faces(frame, detector, frame_w, frame_h)
@@ -96,21 +105,19 @@ def generate_shot_features_json(video_path: str, output_json_path: str,
             "detected_graphics": {}
         })
 
+    # Use the scene end for a consistent total frame count under VFR
+    total_frames = scenes[-1][1].get_frames()
+
     if shots and int(shots[-1]["last_frame"]) < total_frames - 1:
        shots[-1]["last_frame"] = total_frames - 1
 
-    cap.release()
+    reader.close()
     elapsed = time.time() - start_time
     print(f"extract_faces and build json struct time: {elapsed:.2f} seconds")
 
     start_time = time.time()
     result = {"shots": shots}
 
-    print(f"[DEBUG] total_frames={total_frames}")
-    for s in shots:
-        print(f"[DEBUG] shot {s['shot_number']}: {s['first_frame']}..{s['last_frame']}")
-    max_last = max(s['last_frame'] for s in shots) if shots else -1
-    print(f"[DEBUG] max last_frame in shots={max_last}")
 
     output_path.write_text(json.dumps(result, indent=2))
     elapsed = time.time() - start_time

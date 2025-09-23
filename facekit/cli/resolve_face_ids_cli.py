@@ -13,6 +13,7 @@ from facekit.pipeline.generate_shot_features import generate_shot_features_json
 from facekit.embedding.embedder import FaceEmbedder
 from facekit.detection.face_detector import FaceDetector
 from facekit.detection.yolo5face_model import load_yolo5face_model
+from facekit.output.audio_tools import restore_audio_from_source
 
 def _resolve_device(arg_device: str) -> str:
     """
@@ -127,7 +128,7 @@ def main():
         global_path.write_text(json.dumps(tracks_to_json_dict(tracks), indent=2))
         print(f"Wrote globally resolved tracks to {global_path}")
 
-    # Optionally render annotated video
+    # Optionally render annotated video with audio
     if args.output_video:
         if args.output_video is True:
             output_video_path = input_path.with_name(f"{input_path.stem}_global_faceIDs.mp4")
@@ -157,7 +158,6 @@ def main():
             tracks=tracks,
             label_fmt=label_with_shot_track_face_segment_frame_ids
         )
-
 
 if __name__ == "__main__":
     main()
