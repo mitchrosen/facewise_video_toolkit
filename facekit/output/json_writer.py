@@ -99,7 +99,8 @@ def multiface_tracking_to_json(
                     tracker.init_trackers(frame, [
                         (x1, y1, x2 - x1, y2 - y1) for x1, y1, x2, y2 in boxes
                     ])
-                    _ = tracker.update_trackers(frame)  # <- Ensures tracker is initialized fully
+                    # Ensure tracker is initialized fully
+                    _ = tracker.update_trackers(frame)  
 
                     for (x1, y1, x2, y2), conf in zip(boxes, confidences):
                         frame_faces.append({

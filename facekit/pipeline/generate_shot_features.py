@@ -1,26 +1,26 @@
-# facekit/pipeline/generate_shot_features.py
-
-import json
-import cv2
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Optional
+from importlib.resources import files
+import json
+import torch
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from scenedetect.frame_timecode import FrameTimecode
+import numpy as np
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.face_detector import FaceDetector
 from facekit.utils.geometry import normalize_face_bbox
-from facekit.postprocessing.validate_shot_features_json import validate_shot_features_json
-from facekit.utils.video_reader import VideoReader
+from facekit.validation.json.validate_shot_features_json_v1 import validate_shot_features_json_v1
+from facekit.io.frame_provider import ReaderCoordinator
 
 def detect_scenes(video_path, threshold=30.0):
     video_manager = VideoManager([str(video_path)])
-    scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(threshold=threshold))
-
     video_manager.set_downscale_factor()
     video_manager.start()
+
+    scene_manager = SceneManager()
+    scene_manager.add_detector(ContentDetector(threshold=threshold))
     scene_manager.detect_scenes(frame_source=video_manager)
 
     return scene_manager.get_scene_list()
@@ -32,98 +32,88 @@ def extract_faces(frame, detector: FaceDetector, frame_w, frame_h):
     boxes, _, _ = result
     return [normalize_face_bbox((x1, y1, x2, y2), frame_w, frame_h) for x1, y1, x2, y2 in boxes]
 
-def generate_shot_features_json(video_path: str, output_json_path: str,
-                                 detector_model_path: str = "models/detector/yolov5n_state_dict.pt",
-                                 config_path: str = "models/detector/yolov5n.yaml",
-                                 threshold: float = 30.0):
+def generate_shot_features_json(
+        video_path: str, 
+        output_json_path: str,
+        detector_model_path: str = "models/detector/yolov5n_state_dict.pt",
+        config_path: str = "models/detector/yolov5n.yaml",
+        threshold: float = 30.0
+):
     import time
-    start_time = time.time()
+    t0 = time.time()
     video_path = Path(video_path)
     output_path = Path(output_json_path)
 
-    reader = VideoReader(str(video_path))
-    stream = reader.stream
-    fps = reader.fps
-    frame_w = stream.codec_context.width
-    frame_h = stream.codec_context.height
-    elapsed = time.time() - start_time
-    print(f"setup time: {elapsed:.2f} seconds")
-   
-    # Scene detection
-    start_time = time.time()
-    scenes = detect_scenes(video_path, threshold)
-    elapsed = time.time() - start_time
-    print(f"detect_scenes time: {elapsed:.2f} seconds")
-
-    # If no scenes, create a single scene covering the whole video.
-    # Derive a frame count from PyAV if available; otherwise estimate from duration.
-    if not scenes:
-        # Try to estimate total frames robustly
-        total_frames_guess = int(stream.frames) if getattr(stream, "frames", 0) else 0
-        if total_frames_guess <= 0 and getattr(stream, "duration", None):
-            # duration is in "time_base" units; convert to seconds then to frames
-            seconds = float(stream.duration * reader.time_base)
-            total_frames_guess = max(1, int(round(seconds * fps)))
-        if total_frames_guess <= 0:
-            total_frames_guess = 1  # last resort
-        scenes = [(FrameTimecode(0, fps), FrameTimecode(total_frames_guess, fps))]
-
-    device = 'cuda' if cv2.cuda.getCudaEnabledDeviceCount() > 0 else 'cpu'
-    detector_model = load_yolo5face_model(detector_model_path=detector_model_path, config_path=config_path, device=device)
-    detector = FaceDetector(detector_model)
-
-    # Helper: fetch exactly one frame by index via PyAV reader
-    def _get_frame_at(reader: VideoReader, frame_num: int):
-        arrs = reader.get_frames(frame_num, frame_num)
-        if not arrs:
-            raise RuntimeError(f"Failed to read frame {frame_num}")
-        return arrs[0]
-
-    start_time = time.time()
     shots = []
-    for idx, (scene_start, scene_end) in enumerate(scenes, start=1):
-        start_frame_num = scene_start.get_frames()
-        end_frame_num = scene_end.get_frames() - 1
-        mid_frame_num = (start_frame_num + end_frame_num) // 2
 
-        frame = _get_frame_at(reader, mid_frame_num)
+    with ExitStack() as stack:
+        frame_provider = stack.enter_context(ReaderCoordinator(str(video_path)))  # auto-close
+       
+        # Basic metadata via provider (avoid separate cv2 VideoCapture)
+        total_frames = frame_provider.total_frames()
+        fps = frame_provider.fps() or 30.0
+        size = frame_provider.size() or (0, 0)
+        frame_w, frame_h = size if size != (0, 0) else (0, 0)
 
-        try:
-            face_boxes = extract_faces(frame, detector, frame_w, frame_h)
-        except Exception as e:
-            print(f"Could not extract faces for shot {idx}: {e}")
-            face_boxes = []
+        # Scene detection
+        t1 = time.time()
+        scenes = detect_scenes(video_path, threshold)
+        t2 = time.time()
+        print(f"setup+scene detect: {(t2 - t0):.2f}s (scenes in {t2-t1:.2f}s)")
 
-        shots.append({
-            "shot_number": idx,
-            "first_frame": start_frame_num,
-            "last_frame": end_frame_num,
-            "detected_faces": {
-                "face_count": len(face_boxes),
-                "face_details": face_boxes
-            },
-            "detected_graphics": {}
-        })
+        if not scenes:
+            tf = total_frames if total_frames > 0 else 1 # If video has 0 frames, synthesize a trivial 0..0 scene
+            scenes = [(FrameTimecode(0, fps), FrameTimecode(tf - 1, fps))]
 
-    # Use the scene end for a consistent total frame count under VFR
-    total_frames = scenes[-1][1].get_frames()
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        detector_model = load_yolo5face_model(detector_model_path=detector_model_path, config_path=config_path, device=device)
+        detector = FaceDetector(detector_model)
 
-    if shots and int(shots[-1]["last_frame"]) < total_frames - 1:
-       shots[-1]["last_frame"] = total_frames - 1
+        t3 = time.time()
+        shots = []
+        for idx, (scene_start, scene_end) in enumerate(scenes, start=1):
+            start_frame_num = scene_start.get_frames()
+            end_frame_num = scene_end.get_frames() - 1
+            mid_frame_num = (start_frame_num + end_frame_num) // 2
 
-    reader.close()
-    elapsed = time.time() - start_time
+            frame = frame_provider.get_frame(frame_idx=mid_frame_num)
+            
+            if frame is None:
+                face_boxes = []
+            else:
+                try:
+                    face_boxes = extract_faces(frame, detector, frame_w, frame_h)
+                except Exception as e:
+                    print(f"Could not extract faces for shot {idx}: {e}")
+                    face_boxes = []
+
+            shots.append({
+                "shot_number": idx,
+                "first_frame": start_frame_num,
+                "last_frame": end_frame_num,
+                "detected_faces": {
+                    "face_count": len(face_boxes),
+                    "face_details": face_boxes
+                },
+                "detected_graphics": {}
+            })
+        print(f"face sampling+json build: {(time.time()-t2):.2f}s")
+
+    if total_frames and shots:
+        shots[-1]["last_frame"] = min(shots[-1]["last_frame"], total_frames - 1)
+
+    elapsed = time.time() - t0
     print(f"extract_faces and build json struct time: {elapsed:.2f} seconds")
 
-    start_time = time.time()
+    t4 = time.time()
     result = {"shots": shots}
 
-
     output_path.write_text(json.dumps(result, indent=2))
-    elapsed = time.time() - start_time
+    elapsed = time.time() - t4
     print(f"write json file time: {elapsed:.2f} seconds")
 
-    errors = validate_shot_features_json(str(output_path), "schemas/shot_features.schema.json", total_frames)
+    SCHEMA_PATH = Path("schemas/shot_features_v1.schema.json")
+    errors = validate_shot_features_json_v1(str(output_path), SCHEMA_PATH, total_frames)
     if errors:
         print("Validation errors:")
         for e in errors:

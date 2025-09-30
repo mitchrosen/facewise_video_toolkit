@@ -29,7 +29,16 @@ class ValidatorParams:
 
         if not (_is_num(self.hsv_thresh) and -1.0 <= self.hsv_thresh <= 1.0):
             raise ValueError(f"hsv_thresh must be in [-1,1]; got {self.hsv_thresh}")
-
+        
+    def to_generation_dict(self) -> dict:
+        """Stable names."""
+        return {
+            "iou": float(self.iou_thresh),
+            "area_delta": float(self.area_delta_max),
+            "asp_delta": float(self.asp_ratio_delta_max),
+            "v_max": float(self.v_max),
+            "hsv_thresh": float(self.hsv_thresh),
+        }
 
 class TrackerValidator:
     """
@@ -62,7 +71,6 @@ class TrackerValidator:
         self._prev_idx: Optional[int] = None
         self._sig_by_tid: Dict[int, np.ndarray] = {}
 
-    # --- optional: seed immediately after detection init ---
     def set_baseline(self, boxes_xywh: Dict[int, BBoxXYWH], frame_idx: int) -> None:
         self._prev_boxes = dict(boxes_xywh)
         self._prev_idx = frame_idx
@@ -161,6 +169,9 @@ class TrackerValidator:
         # Success; update baseline to current
         self.set_baseline(curr_boxes, frame_idx)
         return True
+    
+    def provenance(self) -> dict:
+        return self.p.to_generation_dict()
 
     # --- helpers ---
     def _clear_baseline(self):
@@ -211,10 +222,11 @@ class TrackerValidator:
 
         crop = frame[y:y2, x:x2]
         if crop.size == 0: return None
+        crop = cv2.resize(crop, (64, 64), interpolation=cv2.INTER_AREA)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
 
         # 16x8x8 bins across H,S,V; normalized
-        hist = cv2.calcHist([hsv], [0,1,2], None, [16,8,8], [0,180, 0,256, 0,256]).flatten()
+        hist = cv2.calcHist([hsv], [0,1,2], None, [8,4,4], [0,180, 0,256, 0,256]).flatten()
         hist /= (hist.sum() + 1e-6)
         return hist
 

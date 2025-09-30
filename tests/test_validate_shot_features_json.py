@@ -1,11 +1,11 @@
 import os
 import pytest
 import json
-from jsonschema.exceptions import ValidationError
-from facekit.postprocessing.validate_shot_features_json import validate_shot_features_json
-
 from pathlib import Path
-SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "shot_features.schema.json"
+from jsonschema.exceptions import ValidationError
+from facekit.validation.json.validate_shot_features_json_v1 import validate_shot_features_json_v1
+
+SCHEMA_PATH = Path("schemas/shot_features_v1.schema.json")
 
 VALID_JSON_EXAMPLE = {
     "shots": [
@@ -43,7 +43,7 @@ def test_valid_json_passes(tmp_path):
     with open(path, "w") as f:
         json.dump(VALID_JSON_EXAMPLE, f)
 
-    errors = validate_shot_features_json(str(path), SCHEMA_PATH, total_frame_count=201)
+    errors = validate_shot_features_json_v1(str(path), SCHEMA_PATH, total_frame_count=201)
     assert errors == []
 
 
@@ -62,7 +62,7 @@ def test_missing_required_field_returns_error(tmp_path):
     path = tmp_path / "invalid_missing_field.json"
     path.write_text(json.dumps(bad_data))
 
-    errors = validate_shot_features_json(str(path), SCHEMA_PATH)
+    errors = validate_shot_features_json_v1(str(path), SCHEMA_PATH)
     assert len(errors) == 1
     assert "first_frame" in errors[0]
 
@@ -88,7 +88,7 @@ def test_non_contiguous_shots_returns_error(tmp_path):
     path = tmp_path / "invalid_non_contiguous.json"
     path.write_text(json.dumps(bad_data))
 
-    errors = validate_shot_features_json(str(path), SCHEMA_PATH, total_frame_count=201)
+    errors = validate_shot_features_json_v1(str(path), SCHEMA_PATH, total_frame_count=201)
     assert len(errors) == 1
     assert "contiguity" in errors[0]
 
@@ -111,7 +111,7 @@ def test_missing_detected_graphics_field_allowed(tmp_path):
         json.dump(valid_data, f)
     
     # Should not raise any exceptions
-    errors = validate_shot_features_json(str(path), SCHEMA_PATH, total_frame_count=101)
+    errors = validate_shot_features_json_v1(str(path), SCHEMA_PATH, total_frame_count=101)
     assert errors == []
 
 def test_detected_graphics_must_be_empty_object_returns_error(tmp_path):
@@ -129,7 +129,7 @@ def test_detected_graphics_must_be_empty_object_returns_error(tmp_path):
     path = tmp_path / "invalid_nonempty_graphics.json"
     path.write_text(json.dumps(bad_data))
 
-    errors = validate_shot_features_json(str(path), SCHEMA_PATH)
+    errors = validate_shot_features_json_v1(str(path), SCHEMA_PATH)
     assert len(errors) == 1
     assert "detected_graphics" in errors[0]
 

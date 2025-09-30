@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shot Features V2 Schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^2(\\.0)?$"
+    },
+    "video": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "fps": { "type": "number", "exclusiveMinimum": 0 },
+        "size": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "total_frames": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["path", "fps", "size", "total_frames"],
+      "additionalProperties": true
+    },
+    "generation": {
+      "type": "object",
+      "properties": {
+        "created_utc": { "type": "string", "format": "date-time" },
+        "commit": { "type": "string" },
+        "branch": { "type": "string" },
+        "params_hash": { "type": "string" },
+        "detector": { "type": "object" },
+        "embedder": { "type": "object" },
+        "tracking": { "type": "object" },
+        "validator": { "type": "object" },
+        "emb_store": {
+          "type": "string",
+          "enum": ["inline", "sidecar", "none"]
+        }
+      },
+      "required": ["created_utc", "commit", "branch", "params_hash"],
+      "additionalProperties": true
+    },
+    "face_metadata": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "face_label": { "type": "string" },
+          "speaker_label": { "type": "string" },
+          "occurance_count": { "type": "integer", "minimum": 0 }
+        },
+        "anyOf": [
+          { "required": ["face_label", "occurance_count"] },
+          { "required": ["speaker_label", "occurance_count"] }
+        ],
+        "additionalProperties": false
+      }
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "properties": {
+          "shot_number": { "type": "integer", "minimum": 1 },
+          "first_frame": { "type": "integer", "minimum": 0 },
+          "last_frame": { "type": "integer", "minimum": 0 },
+          "face_tracks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "first_frame": { "type": "integer", "minimum": 0 },
+                "last_frame": { "type": "integer", "minimum": 0 },
+                "face_label": { "type": "string" },
+                "avg_center_x": { "type": "number", "minimum": 0, "maximum": 100 },
+                "avg_center_y": { "type": "number", "minimum": 0, "maximum": 100 },
+                "avg_face_width": { "type": "number", "minimum": 0, "maximum": 100 },
+                "avg_face_height": { "type": "number", "minimum": 0, "maximum": 100 },
+                "is_static": { "type": "boolean" },
+                "obs": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "f": { "type": "integer", "minimum": 0 },
+                      "bbox_xyxy": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 4,
+                        "maxItems": 4
+                      },
+                      "bbox_xywh": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 4,
+                        "maxItems": 4
+                      },
+                      "src": { "type": "string", "enum": ["detected", "tracked", "flow"] },
+                      "conf": { "type": "number", "minimum": 0, "maximum": 1 },
+                      "embedding": {
+                        "type": "array",
+                        "items": { "type": "number" },
+                        "minItems": 1
+                      },
+                      "emb_idx": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "allOf": [
+                      {
+                        "oneOf": [
+                          { "required": ["f", "bbox_xyxy", "src"] },
+                          { "required": ["f", "bbox_xywh", "src"] }
+                        ]
+                      },
+                      {
+                        "oneOf": [
+                          {
+                            "not": {
+                              "anyOf": [
+                                { "required": ["embedding"] },
+                                { "required": ["emb_idx"] }
+                              ]
+                            }
+                          },
+                          { "required": ["embedding"], "not": { "required": ["emb_idx"] } },
+                          { "required": ["emb_idx"], "not": { "required": ["embedding"] } }
+                        ]
+                      }
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "first_frame",
+                "last_frame",
+                "face_label",
+                "avg_center_x",
+                "avg_center_y",
+                "avg_face_width",
+                "avg_face_height",
+                "is_static",
+                "obs"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["shot_number", "first_frame", "last_frame", "face_tracks"],
+        "additionalProperties": false
+      }
+    },
+    "embedding_sidecar": {
+      "type": "object",
+      "properties": {
+        "path":   { "type": "string", "minLength": 1 },
+        "format": { "type": "string", "enum": ["npz", "npy"] },
+        "dtype":  { "type": "string", "enum": ["float32"] },
+        "dim":    { "type": "integer", "minimum": 0 },
+        "count":  { "type": "integer", "minimum": 0 }
+      },
+      "required": ["path", "format", "dtype", "dim", "count"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["schema_version", "video", "generation", "shots"],
+  "additionalProperties": false
+}

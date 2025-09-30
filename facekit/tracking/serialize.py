@@ -2,6 +2,125 @@ import json
 from pathlib import Path
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
 
+def to_v2_manifest(
+    tracks,
+    *,
+    video_path: str,
+    video_size: tuple[int, int],
+    fps: float,
+    total_frames: int,
+    face_metadata: list[dict] | None = None,
+    generation_overrides: dict | None = None,
+) -> dict:
+    """
+    Build the canonical **JSON V2** manifest from in-memory tracking results.
+
+    This is a thin adapter that delegates to the public writer in
+    `facekit.output.json_v2` so there is a **single source of truth** for the
+    file format. Use this any time you want to publish/export results that
+    downstream tools will consume.
+
+    What it does
+    ------------
+    - Groups `tracks` by `track.shot_id` into `shots[]`.
+    - Emits each track with:
+        * `first_frame` / `last_frame` (absolute frame indices)
+        * `face_label` (prefers `global_id`, then `segment_id`, else `track_id`)
+        * `avg_center_x`, `avg_center_y`, `avg_face_width`, `avg_face_height`
+          normalized to **percent [0,100]** with 2-decimal rounding
+        * `is_static` heuristic (low center variance ⇒ True)
+        * `obs[]` per observation with:
+            - `f` (frame index)
+            - `bbox_xyxy` (x1,y1,x2,y2)
+            - `src` in {"detected","tracked","flow"}  (spelled-out)
+            - optional `conf` if present on the observation
+    - Adds top-level `video` (path/fps/size/total_frames).
+    - Adds top-level `generation`:
+        * auto-fills `created_utc`, `commit`, `branch`, `emb_store` (default "inline")
+        * computes stable `params_hash` (sha256 over generation minus `created_utc`)
+        * merges any keys from `generation_overrides` (e.g., detector/embedder/tracking/validator).
+    - Optionally adds `face_metadata` (e.g., `{"face_label": "face_0", "occurance_count": 27}`).
+
+    Guarantees
+    ----------
+    - Output conforms to `schemas/shot_features_v2.0.schema.json`
+      (use the validator at `facekit.validation.validate_shot_features_v2`
+      for enforcement in tests/CI).
+    - Normalization uses video_size you provide; be sure it matches the frames
+      used during detection/tracking.
+    - Embeddings are **not** included in JSON V2 (provenance only via `generation`).
+
+    Parameters
+    ----------
+    tracks : list[FaceTrack]
+        Sequence of finished tracks; each item must expose:
+        - `shot_id`, `observations` (with `.frame_idx`, `.bbox`, optional `.source`, `.confidence`)
+        - optional `global_id` / `segment_id` / `track_id`
+        - optional `first_frame()` / `last_frame()` helpers
+    video_path : str
+        Source video path written to `video.path`.
+    video_size : (int, int)
+        (width, height) used for normalization and emitted in `video.size`.
+    fps : float
+        Video frames-per-second written to `video.fps`.
+    total_frames : int
+        Total frame count written to `video.total_frames`.
+    face_metadata : list[dict], optional
+        Precomputed face metadata array; if omitted you can build one with
+        `facekit.output.json_v2.derive_face_metadata(tracks)`.
+    generation_overrides : dict, optional
+        Any fields to merge into `generation` (e.g., detector/embedder/tracking/validator,
+        or explicit `commit`, `branch`, `emb_store`). Missing required fields are backfilled.
+
+    Returns
+    -------
+    dict
+        The JSON-serializable manifest (use `write_v2_json(path, manifest)` to publish).
+
+    Example
+    -------
+    >>> manifest = to_v2_manifest(
+    ...     tracks,
+    ...     video_path="/data/input.mp4",
+    ...     video_size=(1920,1080),
+    ...     fps=29.97,
+    ...     total_frames=12345,
+    ...     face_metadata=derive_face_metadata(tracks),
+    ...     generation_overrides={
+    ...         "detector": {"name": "yolov5s-face", "weights": "...", "config": "..."},
+    ...         "embedder": {"name": "arcface-r50", "dim": 512},
+    ...         "tracking": {"tracker": "CSRT", "detect_interval": 10},
+    ...         "validator": {"iou": 0.5, "area_delta": 0.5, "asp_delta": 0.5, "v_max": 0.8, "hsv_thresh": 0.35},
+    ...         "emb_store": "inline",
+    ...     },
+    ... )
+    >>> from facekit.output.json_v2 import write_v2_json
+    >>> write_v2_json("out/video.v2.json", manifest)
+
+    See also
+    --------
+    - facekit.output.json_v2.V2WriterConfig
+    - facekit.output.json_v2.build_v2_manifest_from_tracks
+    - facekit.output.json_v2.derive_face_metadata
+    - facekit.validation.validate_shot_features_v2
+    """
+    # Import inside to avoid import cycles.
+    from facekit.output.json_v2 import V2WriterConfig, build_v2_manifest_from_tracks
+
+    cfg = V2WriterConfig(
+        video_path=video_path,
+        video_size=video_size,
+        fps=fps,
+        total_frames=total_frames,
+        normalize_to_percent=True,
+    )
+    return build_v2_manifest_from_tracks(
+        tracks,
+        cfg,
+        face_metadata=face_metadata,
+        generation=generation_overrides,
+    )
+
 
 def tracks_to_json_dict(tracks, include_embeddings=False):
     """
@@ -19,7 +138,7 @@ def tracks_to_json_dict(tracks, include_embeddings=False):
             {
                 "shot_id": track.shot_id,
                 "track_id": track.track_id,
-                "face_label": track.global_id,  # <-- Added field
+                "face_label": track.global_id,
                 "observations": [
                     {
                         "frame_idx": obs.frame_idx,
