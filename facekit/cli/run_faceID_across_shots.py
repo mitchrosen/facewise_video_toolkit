@@ -55,7 +55,7 @@ def main():
 
     # Track faces across shots
     tracks = track_across_segments(
-        video_path=str(input_path),
+        frame_source=str(input_path),
         shot_json_path=str(shot_segmentation_path),
         detector=detector,
         embedder=embedder

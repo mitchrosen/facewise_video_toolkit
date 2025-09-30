@@ -88,13 +88,6 @@ def draw_tracks_on_video(
         # Draw overlays
         t0 = time.time()
         overlays = overlay_map.get(frame_idx, [])
-
-        # --- DEBUG: tail frames and per-frame overlay details ---
-        if frame_idx >= total_frames - 5:  # focus on the last 5 video frames
-            labels_here = [lbl for _, lbl in overlays]
-            # If present, show one bbox sample to verify coordinates look sane
-            if overlays:
-                (x1, y1, x2, y2), _ = overlays[0]
         
         for bbox, label in overlays:
             x1, y1, x2, y2 = bbox
