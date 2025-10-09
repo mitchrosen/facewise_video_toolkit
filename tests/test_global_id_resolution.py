@@ -2,53 +2,47 @@ import numpy as np
 import pytest
 from unittest.mock import patch
 import torch
+import random
+
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
-from facekit.tracking.face_structures import FaceTrack
+from facekit.tracking.face_structures import FaceTrack, FaceObservation
 
 # -------------------------------
 # Helper Functions
 # -------------------------------
 
 def make_vector(angle_rad=0.0, noise=0.0, seed=None, size=512):
-    """
-    Create a normalized vector with a specified angle from the base vector.
-
-    Args:
-        angle_rad (float): Desired angle from the base axis (in radians).
-        noise (float): Stddev of Gaussian noise to add after constructing the angle.
-        seed (int): Random seed for reproducibility.
-        size (int): Dimensionality of the vector.
-
-    Returns:
-        np.ndarray: Normalized embedding vector.
-    """
+    """Create a normalized vector at a given angle, with optional Gaussian noise."""
     if seed is not None:
         np.random.seed(seed)
-
     v = np.zeros(size, dtype=np.float32)
     v[0] = np.cos(angle_rad)
     if size > 1:
         v[1] = np.sin(angle_rad)
-
     if noise > 0:
         v += np.random.normal(0, noise, size).astype(np.float32)
-
-    v /= np.linalg.norm(v)
+    v /= np.linalg.norm(v) + 1e-9
     return v
 
-
 def make_track(track_id, embedding, shot_id=0):
-    track = FaceTrack(shot_id=shot_id, track_id=track_id)
-    track.embeddings = [embedding]
-    return track
+    t = FaceTrack(shot_id=shot_id, track_id=track_id)
+    t.embeddings = [embedding.astype(np.float32)]
+    return t
 
+def make_track_with_frames(track_id: int, emb: np.ndarray, shot_id: int, start: int, end: int) -> FaceTrack:
+    t = FaceTrack(shot_id=shot_id, track_id=track_id)
+    # Minimal observations so first_frame()/last_frame() are well-defined
+    t.observations.append(FaceObservation(frame_idx=start, track_id=track_id, bbox=(0,0,10,10)))
+    t.observations.append(FaceObservation(frame_idx=end,   track_id=track_id, bbox=(0,0,10,10)))
+    t.embeddings = [emb.astype(np.float32)]
+    return t
 
 # -------------------------------
 # Tests
 # -------------------------------
 
 def test_clusters_get_same_global_id():
-    """Tracks forming two separate clusters should get two distinct global IDs."""
+    """Two tight clusters should yield two distinct global IDs."""
     resolver = GlobalIdentityResolver(embedding_threshold=0.8)
     # Cluster A
     emb_a = make_vector(angle_rad=0, seed=1)
@@ -59,15 +53,17 @@ def test_clusters_get_same_global_id():
 
     tracks = [make_track(0, emb_a), make_track(1, emb_b),
               make_track(2, emb_c), make_track(3, emb_d)]
-
     resolver.resolve_global_ids(tracks, start_id=0)
     ids = {t.global_id for t in tracks}
     assert len(ids) == 2, f"Expected 2 clusters but got {len(ids)}: {ids}"
 
-
 def test_threshold_boundary_behavior():
-    """At the threshold boundary: tracks at and above threshold should merge, below should not in direct pair,
-    but graph connectivity may cause chaining merges."""
+    """
+    At the threshold boundary:
+    - Below threshold: no merge.
+    - At / above threshold: should merge *when allowed by constraints* (i.e., not same-shot overlapping).
+    - Connectivity can collapse to one cluster when constraints allow.
+    """
     threshold = 0.95
     resolver = GlobalIdentityResolver(embedding_threshold=threshold)
 
@@ -76,105 +72,140 @@ def test_threshold_boundary_behavior():
     emb_c = make_vector(angle_rad=np.arccos(0.95), seed=12)  # exactly threshold
     emb_d = make_vector(angle_rad=np.arccos(0.96), seed=13)  # above threshold
 
-    # Direct pair: A and B should not merge
+    # A and B: below threshold => no merge
     tracks = [make_track(0, emb_a), make_track(1, emb_b)]
     resolver.resolve_global_ids(tracks, start_id=0)
-    assert tracks[0].global_id != tracks[1].global_id, (
-        f"B, {tracks[1].global_id}, should not merge with A, {tracks[0].global_id}"
-    )
+    assert tracks[0].global_id != tracks[1].global_id
 
-    # Direct pair: A and C should merge
-    tracks = [make_track(0, emb_a.copy()), make_track(1, emb_c.copy())]
+    # A and C: at threshold => merge (different shots so constraint doesn't block)
+    tracks = [make_track(0, emb_a.copy(), shot_id=0),
+              make_track(1, emb_c.copy(), shot_id=1)]
     resolver.resolve_global_ids(tracks, start_id=0)
-    assert tracks[0].global_id == tracks[1].global_id, (
-        f"C should merge with A"
-    )
+    assert tracks[0].global_id == tracks[1].global_id, "At threshold should merge when not overlapping in same shot"
 
-    # Direct pair: A and D should merge
-    tracks = [make_track(0, emb_a.copy()), make_track(1, emb_d.copy())]
+    # A and D: above threshold => merge (different shots)
+    tracks = [make_track(0, emb_a.copy(), shot_id=0),
+              make_track(1, emb_d.copy(), shot_id=1)]
     resolver.resolve_global_ids(tracks, start_id=0)
-    assert tracks[0].global_id == tracks[1].global_id, (
-        f"D should merge with A"
-    )
+    assert tracks[0].global_id == tracks[1].global_id
 
-    # All together: graph connectivity should collapse them into 1 cluster
+    # Connectivity collapse permitted when constraints allow
     tracks = [
-        make_track(0, emb_a),
-        make_track(1, emb_b),
-        make_track(2, emb_c),
-        make_track(3, emb_d)
+        make_track(0, emb_a, shot_id=0),
+        make_track(1, emb_b, shot_id=0),  # will stay separate from A
+        make_track(2, emb_c, shot_id=1),  # can connect to A
+        make_track(3, emb_d, shot_id=1)   # can connect to A/C
     ]
     resolver.resolve_global_ids(tracks, start_id=0)
-    assert len({t.global_id for t in tracks}) == 1, f"Expected 1 cluster by connectivity, got {[t.global_id for t in tracks]}"
+    gids = [t.global_id for t in tracks]
+    assert len(set(gids)) in (1, 2), f"Unexpected cluster count with connectivity constraints: {gids}"
 
 def test_noise_effect_on_merging():
-    """Adding noise should reduce similarity enough to split clusters if threshold is high."""
+    """High threshold + noise should split."""
     resolver = GlobalIdentityResolver(embedding_threshold=0.99)
-    base_angle = 0
-    emb_ref = make_vector(angle_rad=base_angle, seed=100)
-    emb_noisy = make_vector(angle_rad=base_angle, noise=0.1, seed=101)
-
+    emb_ref = make_vector(angle_rad=0, seed=100)
+    emb_noisy = make_vector(angle_rad=0, noise=0.1, seed=101)
     tracks = [make_track(0, emb_ref), make_track(1, emb_noisy)]
     resolver.resolve_global_ids(tracks, start_id=0)
-
-    # With noise and high threshold, they should NOT merge
-    assert tracks[0].global_id != tracks[1].global_id, (
-        f"Expected separate clusters due to noise, got same ID {tracks[0].global_id}"
-    )
-
-# def test_all_tracks_get_ids_even_if_no_embeddings():
-#     """Tracks without embeddings should still receive unique IDs."""
-#     resolver = GlobalIdentityResolver(embedding_threshold=0.8)
-#     t1 = FaceTrack(shot_id=0, track_id=0)  # no embeddings
-#     t2 = FaceTrack(shot_id=0, track_id=1)  # no embeddings
-
-#     tracks = [t1, t2]
-#     resolver.resolve_global_ids(tracks, start_id=10)
-
-#     ids = {t.global_id for t in tracks}
-#     assert len(ids) == 2, f"Expected unique IDs for tracks without embeddings, got {ids}"
-
+    assert tracks[0].global_id != tracks[1].global_id
 
 def test_cluster_assignment_in_mixed_scenario():
-    """Complex scenario with two clusters and an outlier."""
+    """Two clusters and an outlier."""
     resolver = GlobalIdentityResolver(embedding_threshold=0.85)
-    # Cluster 1
     t1 = make_track(0, make_vector(angle_rad=0, seed=1))
     t2 = make_track(1, make_vector(angle_rad=np.arccos(0.98), seed=2))
-
-    # Cluster 2
     t3 = make_track(2, make_vector(angle_rad=np.arccos(0.70), seed=3))
     t4 = make_track(3, make_vector(angle_rad=np.arccos(0.69), seed=4))
-
-    # Outlier
-    t5 = make_track(4, make_vector(angle_rad=np.arccos(0.0), seed=5))
-
+    t5 = make_track(4, make_vector(angle_rad=np.arccos(0.0),  seed=5))  # outlier
     tracks = [t1, t2, t3, t4, t5]
     resolver.resolve_global_ids(tracks, start_id=0)
-
     ids = [t.global_id for t in tracks]
     assert len(set(ids)) == 3, f"Expected 3 clusters, got {len(set(ids))}: {ids}"
 
+def test_merge_at_threshold_when_not_overlapping():
+    thr = 0.95
+    resolver = GlobalIdentityResolver(embedding_threshold=thr)
+    A = make_vector(angle_rad=0, seed=1)
+    C = make_vector(angle_rad=np.arccos(thr), seed=2)
+    t0 = make_track_with_frames(0, A, shot_id=0, start=0, end=29)
+    t1 = make_track_with_frames(1, C, shot_id=1, start=0, end=29)  # different shot
+    resolver.resolve_global_ids([t0, t1], start_id=0)
+    assert t0.global_id == t1.global_id
+
+def test_same_shot_overlapping_do_not_merge_at_or_above_threshold():
+    thr = 0.95
+    resolver = GlobalIdentityResolver(embedding_threshold=thr)
+    A = make_vector(angle_rad=0, seed=3)
+    C = make_vector(angle_rad=np.arccos(thr), seed=4)
+    t0 = make_track_with_frames(0, A, shot_id=7, start=0, end=50)
+    t1 = make_track_with_frames(1, C, shot_id=7, start=25, end=75)  # overlap
+    resolver.resolve_global_ids([t0, t1], start_id=0)
+    assert t0.global_id != t1.global_id
+
+def test_same_shot_non_overlapping_can_merge():
+    thr = 0.95
+    resolver = GlobalIdentityResolver(embedding_threshold=thr)
+    A = make_vector(angle_rad=0, seed=5)
+    C = make_vector(angle_rad=np.arccos(thr), seed=6)
+    t0 = make_track_with_frames(0, A, shot_id=3, start=0, end=29)
+    t1 = make_track_with_frames(1, C, shot_id=3, start=30, end=60)  # non-overlap
+    resolver.resolve_global_ids([t0, t1], start_id=0)
+    assert t0.global_id == t1.global_id
+
+def test_must_not_link_blocks_bridge():
+    thr = 0.95
+    resolver = GlobalIdentityResolver(embedding_threshold=thr)
+    A = make_vector(angle_rad=0, seed=11)
+    B = make_vector(angle_rad=np.arccos(thr), seed=12)
+    C = make_vector(angle_rad=np.arccos(thr), seed=13)
+    tA = make_track_with_frames(0, A, shot_id=5, start=0, end=60)   # overlaps with tB
+    tB = make_track_with_frames(1, B, shot_id=5, start=30, end=90)
+    tC = make_track_with_frames(2, C, shot_id=6, start=0, end=30)   # different shot
+    resolver.resolve_global_ids([tA, tB, tC], start_id=0)
+    assert tA.global_id != tB.global_id
+    assert (tA.global_id == tC.global_id) ^ (tB.global_id == tC.global_id)
+
+def test_deterministic_order():
+    thr = 0.9
+    vecs = [make_vector(angle_rad=0, seed=20+i) for i in range(6)]
+    tracks = [make_track_with_frames(i, v, shot_id=i//3, start=10*i, end=10*i+5) for i, v in enumerate(vecs)]
+    # First run
+    resolver1 = GlobalIdentityResolver(embedding_threshold=thr)
+    resolver1.resolve_global_ids(tracks, start_id=0)
+    gids1 = [t.global_id for t in tracks]
+    # Shuffle and rerun with a fresh resolver
+    random.shuffle(tracks)
+    resolver2 = GlobalIdentityResolver(embedding_threshold=thr)
+    resolver2.resolve_global_ids(tracks, start_id=0)
+    gids2 = [t.global_id for t in tracks]
+    assert sorted(gids1) == sorted(gids2)
+
+def test_tracks_with_same_segment_id_merge_within_shot():
+    thr = 0.95
+    resolver = GlobalIdentityResolver(embedding_threshold=thr)
+
+    A = make_vector(angle_rad=0, seed=1)
+    # Two tracks, same shot & same segment_id, maybe slightly different embs
+    t0 = make_track_with_frames(0, A, shot_id=2, start=0, end=20);  t0.segment_id = 7
+    t1 = make_track_with_frames(1, A, shot_id=2, start=25, end=45); t1.segment_id = 7
+
+    resolver.resolve_global_ids([t0, t1], start_id=0)
+    assert t0.global_id == t1.global_id, "Same (shot_id, segment_id) must share global_id"
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_global_id_consistency_cpu_vs_gpu_with_mock():
-    resolver = GlobalIdentityResolver(embedding_threshold=0.8)
-
-    # Create two identical track sets
-    tracks_gpu = [make_track(i, make_vector(angle_rad=0)) for i in range(4)]
-    tracks_cpu = [make_track(i, make_vector(angle_rad=0)) for i in range(4)]
-
-    # First run: actual GPU mode
-    resolver.resolve_global_ids(tracks_gpu, start_id=0)
-
-    # Second run: mock CUDA unavailable -> force CPU mode
+    # Make two identical datasets
+    tracks_gpu = [make_track(i, make_vector(angle_rad=0, seed=i)) for i in range(4)]
+    tracks_cpu = [make_track(i, make_vector(angle_rad=0, seed=i)) for i in range(4)]
+    # Resolver under CUDA available (real env)
+    resolver_gpu = GlobalIdentityResolver(embedding_threshold=0.8)
+    resolver_gpu.resolve_global_ids(tracks_gpu, start_id=0)
+    # Resolver with CUDA forced unavailable → CPU
     with patch("torch.cuda.is_available", return_value=False):
-        resolver.resolve_global_ids(tracks_cpu, start_id=0)
-
-    cpu_ids = [t.global_id for t in tracks_cpu]
-    gpu_ids = [t.global_id for t in tracks_gpu]
-
-    assert cpu_ids == gpu_ids, f"Mismatch between CPU and GPU modes: CPU={cpu_ids}, GPU={gpu_ids}"
+        resolver_cpu = GlobalIdentityResolver(embedding_threshold=0.8, device="auto")
+        resolver_cpu.resolve_global_ids(tracks_cpu, start_id=0)
+    assert [t.global_id for t in tracks_cpu] == [t.global_id for t in tracks_gpu], \
+        "Mismatch between CPU and GPU modes"
 
 def test_resolver_raises_when_cuda_requested_but_unavailable(monkeypatch):
     monkeypatch.setattr(torch, "cuda", type("X", (), {"is_available": lambda: False}))

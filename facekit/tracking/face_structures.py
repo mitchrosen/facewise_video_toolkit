@@ -119,7 +119,8 @@ class FaceTrack:
  
         # For tracking continuity: store landmarks if this was a detection
         if obs.source == "detection" and obs.landmarks is not None:
-            self.last_known_landmarks = obs.landmarks  # <- prepare for optical flow
+            # prepare for optical flow
+            self.last_known_landmarks = obs.landmarks  
 
 
     def reset_for_frame(self):

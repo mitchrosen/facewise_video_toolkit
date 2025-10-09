@@ -57,7 +57,7 @@ def test_track_across_segments_two_abutting_shots_no_overlap(tmp_path, monkeypat
 
     with patch("facekit.utils.video_reader.av.open", return_value=container):
         tracks = track_across_segments(
-            video_path="dummy.mp4",
+            frame_source="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
