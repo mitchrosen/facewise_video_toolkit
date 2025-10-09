@@ -1,5 +1,5 @@
 """
-Validation helper for shot_features.json files.
+Validation helper for shot_features_v1.schema.json files.
 
 Usage:
     errors = validate_shot_features(json_path, schema_path,
@@ -17,10 +17,10 @@ from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker
 
 # ---------- core validator -------------------------------------------------- #
-def validate_shot_features_json(json_path: str | Path,
+def validate_shot_features_json_v1(json_path: str | Path,
                            schema_path: str | Path,
                            total_frame_count: int | None = None) -> list[str]:
-    """Validate file against schema + supplemental business rules.
+    """Validate file against v1 shot features schema + supplemental business rules.
 
     Returns a list of error strings (empty list = success).
     """
@@ -97,8 +97,8 @@ def validate_shot_features_json(json_path: str | Path,
 if __name__ == "__main__":
     import argparse, sys
     p = argparse.ArgumentParser()
-    p.add_argument("json_file", help="shot_features.json to validate")
-    p.add_argument("--schema", default="shot_features_schema.json",
+    p.add_argument("json_file", help="shot_features_v1.schema.json to validate")
+    p.add_argument("--schema", default="shot_features_v1.schema.json",
                    help="Path to the JSON Schema file")
     p.add_argument("--total-frames", type=int,
                    help="Total number of frames in the source video")
@@ -112,5 +112,5 @@ if __name__ == "__main__":
             print(" -", e)
         sys.exit(1)
     else:
-        print("shot_features.json is valid!")
+        print("shot_features_v1.schmema.json is valid!")
 

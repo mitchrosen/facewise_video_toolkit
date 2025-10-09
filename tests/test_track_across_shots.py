@@ -3,10 +3,12 @@ import numpy as np
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from fractions import Fraction
+
+from tests.utils.video_mocks import make_pyav_like_frames 
 import facekit.pipeline.track_across_segments as tacs
 from facekit.pipeline.track_across_segments import track_across_segments
 from tests.utils.video_mocks import make_pyav_like_frames
-from tests.utils.video_mocks import make_frames_without_time
 
 @pytest.fixture
 def dummy_video(tmp_path):
@@ -60,7 +62,7 @@ def test_track_across_segments_with_mock_av(tmp_path):
                 return np.ones((K, 512), dtype=np.float32)
 
         tracks = track_across_segments(
-            video_path="dummy.mp4",
+            frame_source="dummy.mp4",
             shot_json_path=str(dummy_shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
@@ -117,7 +119,7 @@ def test_all_tracks_have_valid_segment_ids(monkeypatch, dummy_video, tmp_path):
         mock_av_open.return_value = mock_container
 
         tracks = track_across_segments(
-            video_path=str(dummy_video),
+            frame_source=str(dummy_video),
             shot_json_path=str(dummy_shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
@@ -152,7 +154,7 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
 
         class FakeDetector:
             def detect_faces_in_frame(self, frame, target_size=640):
-                return None   # <- explicitly None
+                return None   # explicitly None
 
         class FakeEmbedder:
             def get_embedding_batch(self, aligned, batch_size=32):
@@ -167,7 +169,7 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
         monkeypatch.setattr(tacs, "FaceTracker", TrackerStub)
 
         tracks = track_across_segments(
-            video_path="dummy.mp4",
+            frame_source="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
@@ -212,43 +214,56 @@ def test_detector_none_disables_tracker(tmp_path, monkeypatch):
 #         assert total_obs > 0
 
 def test_align_face_returns_none_is_skipped(tmp_path, monkeypatch):
-    # 0..4 frames; align_face returns None half the time
-    # Expect: no exception; embedding batch sees only non‑None crops
-    import json, numpy as np
-    from facekit.pipeline.track_across_segments import track_across_segments
-
     shot_json = tmp_path / "shots.json"
-    shot_json.write_text(json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":4}]}))
+    shot_json.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 4}]}))
 
+    # Patch av.open to behave like the real thing:
+    # - acts as a context manager
+    # - yields fresh frames on every call to av.open(...).decode(...)
     with patch("facekit.utils.video_reader.av.open") as mock_open:
-        c = MagicMock()
-        s = MagicMock(); s.type="video"; s.frames=5
-        c.streams.video=[s]; c.decode.return_value = make_pyav_like_frames(5)
-        mock_open.return_value = c
+        # Describe the video stream once (shape/fps/etc)
+        stream = MagicMock()
+        stream.type = "video"
+        stream.frames = 5
+        stream.average_rate = Fraction(30, 1)
+        stream.base_rate = Fraction(30, 1)
+        stream.time_base = Fraction(1, 30)
+
+        def make_context():
+            c = MagicMock()
+            c.streams.video = [stream]
+            # Fresh iterator every time decode() is called
+            c.decode.side_effect = lambda video=0: iter(make_pyav_like_frames(5))
+            mgr = MagicMock()
+            mgr.__enter__.return_value = c
+            mgr.__exit__.return_value = False
+            return mgr
+
+        # Return a NEW context-managed container on each av.open(...)
+        mock_open.side_effect = lambda *a, **k: make_context()
 
         class FakeDetector:
             def detect_faces_in_frame(self, frame, target_size=640):
-                return [(10,10,50,50)], [[(20,20)]*5], [0.9]
+                return [(10, 10, 50, 50)], [[(20, 20)] * 5], [0.9]
 
         # Force align_face_for_arcface to return None on odd calls
-        calls = {"n":0}
+        calls = {"n": 0}
         def fake_align(frame, lm, frame_idx=None, source=None):
             calls["n"] += 1
-            return None if calls["n"] % 2 else np.zeros((112,112,3), dtype=np.uint8)
+            return None if calls["n"] % 2 else np.zeros((112, 112, 3), dtype=np.uint8)
 
         monkeypatch.setattr(tacs, "align_face_for_arcface", fake_align)
 
         class FakeEmbedder:
             def get_embedding_batch(self, aligned_faces, batch_size=32):
                 # Should only get crops for even calls
-                return np.ones((len(aligned_faces),512), dtype=np.float32)
+                return np.ones((len(aligned_faces), 512), dtype=np.float32)
 
         tracks = track_across_segments(
-            video_path="dummy.mp4",
+            frame_source="dummy.mp4",
             shot_json_path=str(shot_json),
             detector=FakeDetector(),
             embedder=FakeEmbedder(),
             detect_interval=1,
         )
-        # Should produce one track with some observations; no crash
-        assert tracks
+        assert tracks  # at least one track, and no crash

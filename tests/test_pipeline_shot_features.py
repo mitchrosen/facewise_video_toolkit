@@ -4,10 +4,20 @@ from pathlib import Path
 import numpy as np
 import pytest
 from facekit.pipeline import generate_shot_features
-from facekit.postprocessing.validate_shot_features_json import validate_shot_features_json
+from facekit.validation.json.validate_shot_features_json_v1 import validate_shot_features_json_v1
+from tests.utils.video_mocks import FakeVideoReader
 
-SCHEMA_PATH = Path(__file__).parent.parent / "schemas" / "shot_features.schema.json"
+SCHEMA_PATH = Path("schemas/shot_features_v1.schema.json")
 
+@pytest.fixture(autouse=True)
+def _patch_reader_for_this_module(monkeypatch):
+    # Make ReaderCoordinator use a 6-frame, 640x480 fake so math matches cv2 mock.
+    import facekit.io.frame_provider as fp
+    monkeypatch.setattr(
+        fp, "VideoReader",
+        lambda path: FakeVideoReader(path, total=6, w=640, h=480, fps=30.0)
+    )
+    yield
 
 @pytest.mark.timeout(10)
 @patch("facekit.pipeline.generate_shot_features.FaceDetector")
@@ -128,5 +138,5 @@ def test_generate_shot_features_schema_compliance(
     generate_shot_features.generate_shot_features_json(str(input_video), str(output_path))
 
     # Validate schema
-    result = validate_shot_features_json(str(output_path), SCHEMA_PATH, total_frame_count=6)
+    result = validate_shot_features_json_v1(str(output_path), SCHEMA_PATH, total_frame_count=6)
     assert result == []

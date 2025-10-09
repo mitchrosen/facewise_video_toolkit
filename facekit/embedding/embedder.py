@@ -14,16 +14,15 @@ class FaceEmbedder:
             device: 'cuda' to prefer GPU, 'cpu' to force CPU.
                     ArcFaceONNX: ctx_id >= 0 → GPU, ctx_id < 0 → CPU.
         """
-        if not os.path.exists(embedding_model_path):
-            print(f"DEBUG Model file not found: {embedding_model_path}")
-        else:
-            sz_mb = os.path.getsize(embedding_model_path) / (1024 * 1024)
-            print(f"DEBUG Model file found: {embedding_model_path} (size: {sz_mb:.2f} MB)")
-
         self.embedding_model = ArcFaceONNX(model_file=embedding_model_path)
+        # Keep explicit paths/knobs for provenance
+        self.model_path: str = embedding_model_path
+        self.device: str = (device or "cpu").lower()
+        self.embedding_dim: int = 512
+        self.max_batch_size: int = 512
 
         # Prepare the model (ArcFaceONNX controls ORT session creation)
-        dev = (device or "cpu").lower()
+        dev = self.device
         ctx_id = 0 if dev == "cuda" else -1
         self.embedding_model.prepare(ctx_id=ctx_id)
 
@@ -34,29 +33,14 @@ class FaceEmbedder:
             model_file = getattr(self.embedding_model, "model_file", embedding_model_path)
             if sess is not None:
                 if dev == "cuda":
-                    # Prefer TensorRT→CUDA→CPU, but only those actually available.
                     avail = ort.get_available_providers()
-                    want = [p for p in ["TensorrtExecutionProvider",
-                                        "CUDAExecutionProvider",
-                                        "CPUExecutionProvider"] if p in avail]
-
-                    current = sess.get_providers()
-                    if not any(p in current for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider")):
-                        # Try switching in-place first
-                        try:
-                            sess.set_providers(want)
-                            current = sess.get_providers()
-                        except Exception:
-                            current = []
-
-                        if not any(p in current for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider")):
-                            # Rebuild session on GPU providers
-                            so = ort.SessionOptions()
-                            self.embedding_model.session = ort.InferenceSession(
-                                model_file, so, providers=want
-                            )
+                    want = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
+                    try:
+                        sess.set_providers(want)
+                    except Exception:
+                        so = ort.SessionOptions()
+                        self.embedding_model.session = ort.InferenceSession(model_file, so, providers=want)
                 else:
-                    # CPU path: ensure CPUExecutionProvider
                     try:
                         sess.set_providers(["CPUExecutionProvider"])
                     except Exception:
@@ -66,19 +50,28 @@ class FaceEmbedder:
                         )
         except Exception as e:
             print("WARN: could not enforce ORT providers:", repr(e))
-            
-
-        # Debug visibility
-        try:
-            sess = getattr(self.embedding_model, "session", None)
-            inp = getattr(self.embedding_model, "input_size", None)
-            if sess is not None and inp is not None:
-                print(f"DEBUG prepare(): {inp}, {sess}")
-                print("DEBUG ArcFace ORT providers:", sess.get_providers())
-        except Exception as e:
-            print("DEBUG ArcFace ORT providers: <unknown>", repr(e))
 
         self.input_size = (112, 112)
+
+    def set_max_batch_size(self, batch_size: int) -> None:
+        try:
+            self.max_batch_size = int(batch_size)
+        except Exception:
+            pass
+
+    def provenance(self) -> dict:
+        """
+        Stable, minimal provenance.
+        """
+        # Try to get the final model file path from the underlying object, fall back to arg
+        model_file = getattr(self.embedding_model, "model_file", None) or self.model_path
+        return {
+            "name": "arcface",
+            "model": str(model_file),
+            "dim": int(self.embedding_dim),
+            "batch_max": int(self.max_batch_size),
+            "device": self.device,
+        }
 
     def get_embedding_batch(self, aligned_faces: List[np.ndarray], batch_size: int = 512) -> np.ndarray:
         """
@@ -91,6 +84,8 @@ class FaceEmbedder:
         Returns:
             (N, 512) float32 L2-normalized embeddings.
         """
+        self.set_max_batch_size(batch_size)
+
         if not isinstance(aligned_faces, (list, tuple)) or not all(isinstance(f, np.ndarray) for f in aligned_faces):
             raise TypeError("aligned_faces must be a list of numpy arrays.")
         if not aligned_faces:
@@ -99,6 +94,7 @@ class FaceEmbedder:
             raise ValueError("Each face must be aligned to (112,112,3).")
 
         out_chunks = []
+
         for i in range(0, len(aligned_faces), batch_size):
             batch = aligned_faces[i:i + batch_size]
             # ArcFaceONNX.get_feat accepts a list and does its own preprocessing.

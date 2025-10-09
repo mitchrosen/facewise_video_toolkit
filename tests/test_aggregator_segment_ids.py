@@ -197,7 +197,7 @@ from facekit.tracking.face_structures import FaceTrack, FaceObservation
 # ---------------------------
 def make_track(track_id, embedding, first_frame=0):
     t = FaceTrack(shot_id=0, track_id=track_id)
-    t.embeddings = [embedding]  # <-- This is the critical line
+    t.embeddings = [embedding]
     t._embedding = embedding  # Optional, for legacy test checks
     t._first_frame = first_frame  # If needed for sorting
     return t
