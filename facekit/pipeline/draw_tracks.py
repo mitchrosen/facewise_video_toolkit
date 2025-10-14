@@ -3,6 +3,7 @@ import cv2
 import time
 from pathlib import Path
 from facekit.tracking.face_structures import FaceTrack
+import logging
 
 def draw_tracks_on_video(
     video_path: str,
@@ -36,6 +37,7 @@ def draw_tracks_on_video(
     # Use MJPEG for speed and .avi extension
     fourcc = cv2.VideoWriter_fourcc(*'MJPG')
     if output_path.suffix.lower() != ".avi":
+        logging.warning(f"Overlay video format request of {output_path.suffix}, but will be rendered to AVI ")
         output_path = output_path.with_suffix(".avi")
 
     out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
@@ -61,7 +63,7 @@ def draw_tracks_on_video(
         # Frames that have overlays but are beyond the video length (they will never be drawn)
         extra_overlay_frames = sorted(k for k in overlay_map.keys() if k >= total_frames)[:10]
         if extra_overlay_frames:
-            print(f"[WARN] {len(extra_overlay_frames)} overlay frames >= total_frames (showing up to 10): {extra_overlay_frames}")
+            logging.warning(f"[WARN] {len(extra_overlay_frames)} overlay frames >= total_frames (showing up to 10): {extra_overlay_frames}")
  
         # Quick look at last 10 video frames and whether overlays exist
         tail_probe_start = max(0, total_frames - 10)
@@ -79,7 +81,7 @@ def draw_tracks_on_video(
         t0 = time.time()
         ret, frame = cap.read()
         if not ret:
-            print(f"[WARN] cap.read() returned False at frame_idx={frame_idx}. "
+            logging.warning(f"[WARN] cap.read() returned False at frame_idx={frame_idx}. "
                 f"end_frame={end_frame}, total_frames={total_frames}. Stopping read.")
             break
         t1 = time.time()
@@ -106,8 +108,8 @@ def draw_tracks_on_video(
     cap.release()
     out.release()
 
-    print(f"\nVideo with overlays written to {output_path}")
-    print(f"[TIMING SUMMARY]")
-    print(f"Frame Reading    : {total_read:.2f}s")
-    print(f"Overlay Drawing  : {total_draw:.2f}s")
-    print(f"Frame Writing    : {total_write:.2f}s")
+    logging.info(f"\nVideo with overlays written to {output_path}")
+    logging.info(f"[TIMING SUMMARY]")
+    logging.info(f"Frame Reading    : {total_read:.2f}s")
+    logging.info(f"Overlay Drawing  : {total_draw:.2f}s")
+    logging.info(f"Frame Writing    : {total_write:.2f}s")

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from typing import List
 from facekit.tracking.face_structures import FaceTrack
+import logging
 
 
 class GlobalIdentityResolver:
@@ -29,7 +30,7 @@ class GlobalIdentityResolver:
         else:
             self.device = device
 
-        print(f"[INFO] GlobalIdentityResolver initialized on {self.device}")
+        logging.info(f"[INFO] GlobalIdentityResolver initialized on {self.device}")
 
     def resolve_global_ids(self, tracks: List[FaceTrack], start_id: int = 0) -> int:
         """

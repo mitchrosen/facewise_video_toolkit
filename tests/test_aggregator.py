@@ -2,6 +2,7 @@ import pytest
 import numpy as np
 from facekit.tracking.face_structures import FaceObservation, FaceTrack
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
+from facekit.common.obs_consts import Source
 
 
 def make_obs(frame_idx, bbox, embedding=None):
@@ -9,9 +10,8 @@ def make_obs(frame_idx, bbox, embedding=None):
         frame_idx=frame_idx,
         bbox=bbox,
         embedding=np.array(embedding) if embedding is not None else None,
-        source='detection'
+        source=Source.DETECTED
     )
-
 
 def test_single_observation_creates_one_track():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
@@ -20,7 +20,6 @@ def test_single_observation_creates_one_track():
     tracks = aggregator.finalize_tracks()
     assert len(tracks) == 1
     assert tracks[0].get_frame_indices() == [0]
-
 
 def test_same_face_across_multiple_frames():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
@@ -31,7 +30,6 @@ def test_same_face_across_multiple_frames():
     tracks = aggregator.finalize_tracks()
     assert len(tracks) == 1
     assert tracks[0].get_frame_indices() == [0, 1]
-
 
 def test_different_faces_create_different_tracks():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
@@ -44,7 +42,6 @@ def test_different_faces_create_different_tracks():
     all_indices = [track.get_frame_indices() for track in tracks]
     assert sorted(all_indices) == [[0], [1]]
 
-
 def test_multiple_faces_same_frame():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
     obs1 = make_obs(0, (10, 10, 50, 50))
@@ -53,7 +50,6 @@ def test_multiple_faces_same_frame():
     tracks = aggregator.finalize_tracks()
     assert len(tracks) == 2
     assert all([track.get_frame_indices() == [0] for track in tracks])
-
 
 def test_track_extension_and_creation():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
@@ -68,7 +64,6 @@ def test_track_extension_and_creation():
     assert len(tracks) == 2
     lengths = sorted(len(track.observations) for track in tracks)
     assert lengths == [1, 2]
-
 
 def test_get_tracks_in_frame():
     aggregator = ShotFaceTrackAggregator(shot_number=1)

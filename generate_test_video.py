@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+import logging
 
 # Parameters
 output_path = "tests/data/short_video.mp4"
@@ -29,4 +30,4 @@ for i in range(total_frames):
     out.write(frame)
 
 out.release()
-print(f"Test video saved to: {output_path}")
+logging.info(f"Test video saved to: {output_path}")
