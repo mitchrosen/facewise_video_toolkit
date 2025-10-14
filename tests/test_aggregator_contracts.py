@@ -1,10 +1,11 @@
 import numpy as np, pytest
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.tracking.face_structures import FaceObservation
+from facekit.common.obs_consts import Source
 
 def _one_track():
     ag = ShotFaceTrackAggregator(shot_number=1)
-    ag.update_tracks_with_frame(0,[FaceObservation(0,(0,0,1,1),source='detection')])
+    ag.update_tracks_with_frame(0,[FaceObservation(0,(0,0,1,1),source=Source.DETECTED)])
     return ag, ag.tracks[0].track_id
 
 def test_attach_embeddings_rejects_non_array():

@@ -1,13 +1,14 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import numpy as np
+from facekit.common.obs_consts import Source
 
 
 @dataclass
 class Obs:
     frame_idx: int
     bbox: Tuple[float, float, float, float]  # xyxy
-    source: str = "detection"
+    source: str = Source.DETECTED
     confidence: float = 0.9
     embedding: Optional[np.ndarray] = None   # optional (512,) vector
 

@@ -1,9 +1,10 @@
 import numpy as np
 from facekit.tracking.face_structures import FaceObservation, FaceTrack
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
+from facekit.common.obs_consts import Source
 
 def dummy_observation(frame_idx, bbox, embedding=None):
-    return FaceObservation(frame_idx=frame_idx, bbox=bbox, embedding=embedding, source='detection')
+    return FaceObservation(frame_idx=frame_idx, bbox=bbox, embedding=embedding, source=Source.DETECTED)
 
 def dummy_track(segment_id, track_id, emb_val):
     obs = dummy_observation(0, (0, 0, 10, 10), embedding=emb_val)
@@ -40,7 +41,7 @@ def test_global_id_resolution_merges_similar_embeddings():
     tracks = []
     for i in range(3):
         t = FaceTrack(shot_id=0, track_id=i)
-        obs = FaceObservation(frame_idx=i, bbox=(0, 0, 10, 10), embedding=shared_embedding, source='detection')
+        obs = FaceObservation(frame_idx=i, bbox=(0, 0, 10, 10), embedding=shared_embedding, source=Source.DETECTED)
         t.add_observation(obs)
         tracks.append(t)
 

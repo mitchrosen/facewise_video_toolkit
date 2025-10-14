@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import logging
 
 class FaceTracker:
     def __init__(self, tracker_type="CSRT"):
@@ -29,7 +30,7 @@ class FaceTracker:
                 tracker.init(frame, tuple(box))
                 self.trackers.append((track_id, tracker))
             except Exception as e:
-                print(f"Failed to initialize tracker for track_id={track_id} box={box}: {e}", flush=True)
+                logging.error(f"Failed to initialize tracker for track_id={track_id} box={box}: {e}", flush=True)
 
     def update_trackers(self, frame):
         """
