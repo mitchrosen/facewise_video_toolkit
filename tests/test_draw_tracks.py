@@ -5,6 +5,7 @@ from unittest import mock
 import numpy as np
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
 from facekit.tracking.face_structures import FaceTrack, FaceObservation, FaceTrack
+from facekit.common.obs_consts import Source
 
 @mock.patch("cv2.putText")
 @mock.patch("cv2.rectangle")
@@ -45,8 +46,8 @@ def test_draw_tracks_on_video_mocks(VideoCaptureMock, VideoWriterMock, rectangle
             shot_id=1,
             track_id=1,
             observations=[
-                FaceObservation(frame_idx=0, bbox=(10, 10, 20, 20), confidence=0.9, source='detection'),
-                FaceObservation(frame_idx=2, bbox=(12, 12, 22, 22), confidence=0.95, source='detection')
+                FaceObservation(frame_idx=0, bbox=(10, 10, 20, 20), confidence=0.9, source=Source.DETECTED),
+                FaceObservation(frame_idx=2, bbox=(12, 12, 22, 22), confidence=0.95, source=Source.DETECTED)
             ]
         )
     ]

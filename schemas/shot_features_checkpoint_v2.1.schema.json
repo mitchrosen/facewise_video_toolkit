@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FaceKit Checkpoint v1",
+  "type": "object",
+  "properties": {
+    "schema": { "type": "string", "const": "checkpoint_v1" },
+
+    "code": {
+      "type": "object",
+      "properties": {
+        "commit": { "type": "string" },
+        "branch": { "type": "string" }
+      },
+      "required": ["commit","branch"],
+      "additionalProperties": false
+    },
+
+    "video": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "hash": { "type": "string" },
+        "fps":  { "type": "number", "exclusiveMinimum": 0 },
+        "size": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 2, "maxItems": 2 },
+        "total_frames": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["path","hash","fps","size","total_frames"],
+      "additionalProperties": false
+    },
+
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "detect_interval": { "type": "integer", "minimum": 1 },
+        "embedding_batch_size_max": { "type": "integer", "minimum": 1 },
+        "emb_store": { "type": "string", "enum": ["inline","sidecar","none"] },
+        "emb_sidecar_path": { "type": "string" },
+        "emb_count_written": { "type": "integer", "minimum": 0 },
+
+        "obs_sidecar_path": { "type": "string" },
+        "obs_count_written": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["detect_interval","embedding_batch_size_max","emb_store","obs_sidecar_path","obs_count_written"],
+      "additionalProperties": true
+    },
+
+    "shots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "shot_number": { "type": "integer", "minimum": 1 },
+          "first_frame": { "type": "integer", "minimum": 0 },
+          "last_frame":  { "type": "integer", "minimum": 0 },
+          "status":      { "type": "string", "enum": ["pending","done","failed"] },
+          "retries":     { "type": "integer", "minimum": 0 },
+          "artifacts":   { "type": "object", "additionalProperties": true },
+          "notes":       { "type": "string" }
+        },
+        "required": ["shot_number","first_frame","last_frame","status"],
+        "additionalProperties": true
+      }
+    },
+
+    "resolver": {
+      "type": "object",
+      "properties": {
+        "incremental": { "type": "boolean" }
+      },
+      "required": ["incremental"],
+      "additionalProperties": true
+    },
+
+    "rng_seed":   { "type": "integer" },
+    "started_utc": { "type": "string", "format": "date-time" },
+    "updated_utc": { "type": "string", "format": "date-time" },
+    "last_error":  { "type": "string" }
+  },
+  "required": ["schema","code","video","runtime","shots","resolver","started_utc","updated_utc"],
+  "additionalProperties": false
+}

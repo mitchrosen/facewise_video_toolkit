@@ -2,6 +2,7 @@ import os
 from typing import List
 import numpy as np
 from insightface.model_zoo import ArcFaceONNX
+import logging
 
 
 class FaceEmbedder:
@@ -49,7 +50,7 @@ class FaceEmbedder:
                             model_file, so, providers=["CPUExecutionProvider"]
                         )
         except Exception as e:
-            print("WARN: could not enforce ORT providers:", repr(e))
+            logging.warning("WARN: could not enforce ORT providers:", repr(e))
 
         self.input_size = (112, 112)
 

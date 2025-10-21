@@ -5,9 +5,6 @@ import json as _json
 import re
 from typing import Callable, Protocol, Dict, Tuple, List
 
-from .json.validate_shot_features_json_v1 import validate_shot_features_json_v1
-from .json.validate_shot_features_json_v2 import validate_shot_features_json_v2
-
 # ---- Registry of implemented validators (source of truth) ------------------
 class JsonValidator(Protocol):
     def __call__(self,
@@ -37,11 +34,9 @@ SUPPORTED_VALIDATORS: Dict[int, JsonValidator] = {
 }
 
 # ---- Schema discovery ------------------------------------------------------
+from facekit.errors import UnknownSchemaVersion
+
 _SCHEMA_RX = re.compile(r"^shot_features_v(?P<ver>\d+(?:\.\d+)?)\.schema\.json$")
-
-class UnknownSchemaVersion(ValueError):
-    pass
-
 def _parse_ver(v: str) -> Tuple[int,int]:
     if not re.fullmatch(r"\d+(?:\.\d+)?", v):
         raise UnknownSchemaVersion(f"Bad schema_version format: {v!r} (use '1', '1.0', '2', '2.0', or 'latest')")

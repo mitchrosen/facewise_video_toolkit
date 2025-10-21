@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Literal
 import numpy as np
 from facekit.utils.geometry import compute_iou
-
-SourceT = Literal["detection", "tracking", "flow"]
+import logging
+from facekit.common.obs_consts import Source
 
 @dataclass
 class FaceObservation:
@@ -26,7 +26,7 @@ class FaceObservation:
     aligned_face: Optional[np.ndarray] = None
 
     landmarks: Optional[List[Tuple[float,float]]] = None
-    source: Optional[SourceT] = None  # "detection" | "tracking" | "flow"
+    source: Optional[Source] = None
 
     def __post_init__(self):
         # Defensive: coerce bbox to tuple and validate
@@ -110,10 +110,10 @@ class FaceTrack:
         # Store embedding if present
         if obs.embedding is not None:
             if not isinstance(obs.embedding, np.ndarray):
-                print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
+                logging.error(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
                 raise TypeError(f"Embedding is not a numpy array (got {type(obs.embedding)}): frame {obs.frame_idx}")
             if obs.embedding.ndim != 1:
-                print(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
+                logging.error(f"BAD EMBEDDING at frame {obs.frame_idx}: {obs.embedding}")
                 raise ValueError(f"Embedding is not 1D (got shape {obs.embedding.shape}): frame {obs.frame_idx}")
             self.embeddings.append(obs.embedding)
  

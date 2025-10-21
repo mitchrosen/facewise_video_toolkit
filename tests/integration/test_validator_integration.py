@@ -2,14 +2,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Tuple, Optional
-
 import numpy as np
 import pytest
-
-try:
-    import cv2
-except Exception:
-    cv2 = None
+import cv2
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.face_detector import FaceDetector
@@ -176,7 +171,6 @@ def _sanitize_for_init(box, shape):
 # -----------------------
 # @pytest.mark.slow
 def test_detect_track_and_validate_then_break_each_rule():
-    _need_cv2()
     video = _video_path()
 
     # Load YOLOv5Face detector

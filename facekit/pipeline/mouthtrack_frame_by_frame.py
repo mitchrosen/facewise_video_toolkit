@@ -1,11 +1,14 @@
 import cv2
 import torch
 from typing import Optional
+import logging
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.detection_helpers import draw_faces_and_mouths
 from facekit.output.audio_tools import restore_audio_from_source
 from facekit.tracking.face_tracker import FaceTracker, draw_tracked_face_box
 from facekit.detection.face_detector import FaceDetector
+from facekit.common.obs_consts import Source
+
 
 def multiface_mouthtrack(
     input_path: str,
@@ -33,7 +36,7 @@ def multiface_mouthtrack(
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"Could not open video: {input_path}")
+        logging.error(f"Could not open video: {input_path}")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -77,7 +80,7 @@ def multiface_mouthtrack(
                         draw_tracked_face_box(
                             frame,
                             (box[0], box[1], box[2] - box[0], box[3] - box[1]),
-                            color_name="detected" if should_detect else "fallback"
+                            color_name= "detected" if should_detect else "fallback",
                         )
                     max_faces = max(max_faces, face_count)
                 else:
@@ -94,7 +97,7 @@ def multiface_mouthtrack(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
         if show_periodic and frame_num % display_interval == 0:
-            print(f"Processing frame {frame_num}")
+            logging.info(f"Processing frame {frame_num}")
             try:
                 from google.colab.patches import cv2_imshow
             except ImportError:
@@ -112,5 +115,5 @@ def multiface_mouthtrack(
     out.release()
     restore_audio_from_source(input_path, output_path)
 
-    print(f"Mouth tracking complete. Output saved to: {output_path}")
-    print(f"Max faces detected at once: {max_faces}")
+    logging.info(f"Mouth tracking complete. Output saved to: {output_path}")
+    logging.info(f"Max faces detected at once: {max_faces}")

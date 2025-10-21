@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import numbers
 from facekit.utils.geometry import compute_iou
+import logging
 
 BBoxXYWH = Tuple[float, float, float, float]
 
@@ -114,8 +115,8 @@ class TrackerValidator:
         # No missing tracks
         if not prev_ids.issubset(curr_ids):
             self._clear_baseline()
-            if verbose: 
-                print(f"[TRACK VALIDATION] missing ids: {sorted(prev_ids - curr_ids)}")
+            if verbose:
+                logging.debug(f"[TRACK VALIDATION] missing ids: {sorted(prev_ids - curr_ids)}")
             return False
 
         # iterate through tracks
@@ -125,32 +126,32 @@ class TrackerValidator:
             b0 = prev[tid]; b1 = curr_boxes[tid]
             if b0 is None or b1 is None:
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} missing box")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} missing box")
                 return False
 
             # IoU is within bounds
             iou = compute_iou(self._xywh_to_xyxy(b0), self._xywh_to_xyxy(b1))
             if iou < self.p.iou_thresh:
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} IoU={iou:.3f} (min {self.p.iou_thresh})")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} IoU={iou:.3f} (min {self.p.iou_thresh})")
                 return False
 
             # Area changes are within bounds
             if not self._area_ok(b0, b1, self.p.area_delta_max, verbose):
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} area not within bounds (max {self.p.area_delta_max})")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} area not within bounds (max {self.p.area_delta_max})")
                 return False
 
             # aspect ratio (use asp_ratio terminology)
             if not self._asp_ratio_ok(b0, b1, self.p.asp_ratio_delta_max):
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} asp ratio not within bounds (max {self.p.asp_ratio_delta_max})")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} asp ratio not within bounds (max {self.p.asp_ratio_delta_max})")
                 return False
 
             # velocity
             if not self._velocity_ok(b0, b1, self.p.v_max):
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} velocity not within bounds (max {self.p.v_max})")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} velocity not within bounds (max {self.p.v_max})")
                 return False
 
             # appearance
@@ -159,11 +160,11 @@ class TrackerValidator:
             sig_curr = self._hsv_sig(frame, b1)
             if sig_prev is None or sig_curr is None:
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} appearance fails due to lack of previous signature")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} appearance fails due to lack of previous signature")
                 return False
             if self._hsv_dist(sig_prev, sig_curr) > self.p.hsv_thresh:
                 self._clear_baseline()
-                if verbose: print(f"[TRACK VALIDATION] tid={tid} appearance not within bounds (max {self.p.hsv_thresh})")
+                if verbose: logging.debug(f"[TRACK VALIDATION] tid={tid} appearance not within bounds (max {self.p.hsv_thresh})")
                 return False
 
         # Success; update baseline to current

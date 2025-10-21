@@ -15,6 +15,7 @@ Usage:
 import json
 from pathlib import Path
 from jsonschema import Draft202012Validator, FormatChecker
+import logging
 
 # ---------- core validator -------------------------------------------------- #
 def validate_shot_features_json_v1(json_path: str | Path,
@@ -107,10 +108,10 @@ if __name__ == "__main__":
     errs = validate_shot_features(args.json_file, args.schema,
                                   total_frame_count=args.total_frame_count)
     if errs:
-        print("Validation errors:")
+        logging.error("Validation errors:")
         for e in errs:
-            print(" -", e)
+            logging.error(" -", e)
         sys.exit(1)
     else:
-        print("shot_features_v1.schmema.json is valid!")
+        logging.info("shot_features_v1.schmema.json is valid!")
 

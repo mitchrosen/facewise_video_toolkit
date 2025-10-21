@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 from facekit.tracking.face_structures import FaceObservation
+from facekit.common.obs_consts import Source
 
 def dummy_landmarks():
     return [(1, 2)] * 68
@@ -14,26 +15,26 @@ def test_face_observation_accepts_tuple_bbox():
         (10, 20, 30, 40),
         embedding=None,
         confidence=0.99,
-        source='detection'
+        source=Source.DETECTED
     )
     assert obs.bbox == (10, 20, 30, 40)
 
 def test_face_observation_accepts_list_bbox():
-    obs = FaceObservation(frame_idx=0, bbox=[10, 20, 30, 40], source='detection')
+    obs = FaceObservation(frame_idx=0, bbox=[10, 20, 30, 40], source=Source.DETECTED)
     assert isinstance(obs.bbox, tuple)
     assert obs.bbox == (10, 20, 30, 40)
 
 def test_face_observation_rejects_invalid_bbox():
     # Too few elements
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox=(10, 20, 30), source='detection')
+        FaceObservation(frame_idx=0, bbox=(10, 20, 30), source=Source.DETECTED)
 
     # Not all ints
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox=(10, "20", 30, 40), source='detection')
+        FaceObservation(frame_idx=0, bbox=(10, "20", 30, 40), source=Source.DETECTED)
 
     # Wrong type entirely
     with pytest.raises(ValueError, match=r"Invalid bbox: could not convert to 4-tuple of ints — received"):
-        FaceObservation(frame_idx=0, bbox="not a tuple", source='detection')
+        FaceObservation(frame_idx=0, bbox="not a tuple", source=Source.DETECTED)
 
 
