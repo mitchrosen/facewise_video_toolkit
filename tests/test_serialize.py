@@ -3,6 +3,7 @@ import tempfile
 import json
 from pathlib import Path
 import tempfile
+from facekit.common.obs_consts import Source
 
 from facekit.tracking.serialize import (
     save_tracks_to_json_file,
@@ -15,11 +16,11 @@ from facekit.tracking.face_structures import FaceTrack, FaceObservation
 def create_dummy_tracks():
     return [
         FaceTrack(shot_id=0,track_id=0, observations=[
-            FaceObservation(frame_idx=5, bbox=(10, 10, 20, 20), confidence=0.9, source='detection'),
-            FaceObservation(frame_idx=6, bbox=(12, 12, 22, 22), confidence=0.91, source='detection'),
+            FaceObservation(frame_idx=5, bbox=(10, 10, 20, 20), confidence=0.9, source=Source.DETECTED),
+            FaceObservation(frame_idx=6, bbox=(12, 12, 22, 22), confidence=0.91, source=Source.DETECTED),
         ]),
         FaceTrack(shot_id=1, track_id=1, observations=[
-            FaceObservation(frame_idx=5, bbox=(100, 100, 110, 110), confidence=0.85, source='detection'),
+            FaceObservation(frame_idx=5, bbox=(100, 100, 110, 110), confidence=0.85, source=Source.DETECTED),
         ])
     ]
 

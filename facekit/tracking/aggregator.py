@@ -1,7 +1,9 @@
 from typing import List, Dict, Tuple, Optional
 import numpy as np
-from .face_structures import FaceTrack, FaceObservation
+import logging
+from facekit.tracking.face_structures import FaceTrack, FaceObservation
 from facekit.utils.geometry import compute_iou
+from facekit.common.obs_consts import Source
 
 
 class ShotFaceTrackAggregator:
@@ -20,132 +22,79 @@ class ShotFaceTrackAggregator:
         self.embedding_threshold = embedding_threshold
         self.tracks: List[FaceTrack] = []
         self.next_track_id = 0
+        self._by_frame: dict[int, list[FaceObservation]] = {}
 
     # -------------------
     # Internal Utilities
     # -------------------
 
-    def _claim_matches(
-        self,
-        items: List,
-        candidates: List,
-        score_fn,
-        threshold: float,
-        skip_condition=None
-    ) -> Dict[int, List[Tuple]]:
-        """
-        Compute match candidates (items -> candidates) with scores ≥ threshold.
-        Returns dict keyed by candidate_id, values = list of (candidate, item, score).
-        """
-        claims = {}
-        for item in items:
-            for cand in candidates:
-                if skip_condition and skip_condition(cand):
-                    continue
-                score = score_fn(cand, item)
-                if score >= threshold:
-                    if cand.track_id not in claims:
-                        claims[cand.track_id] = []
-                    claims[cand.track_id].append((cand, item, score))
-
-        # Sort candidates for each track by descending score
-        for k in claims:
-            claims[k].sort(key=lambda x: x[2], reverse=True)
-        return claims
-
-    def _resolve_conflicts(self, claims: Dict[int, List[Tuple]]) -> Tuple[List[Tuple], List]:
-        """
-        Resolve conflicts where multiple observations claim the same track.
-        Strategy: keep the highest-scoring observation per track, return losers for reallocation.
-        """
-        assignments = []
-        losers = []
-        used_items = []
-        for _, candidates in claims.items():
-            for idx, (cand, item, _) in enumerate(candidates):
-                if idx == 0 and all(item is not u for u in used_items):
-                    assignments.append((cand, item))
-                    used_items.append(item)
-                else:
-                    losers.append(item)
-        return assignments, losers
-    
-    def assign_track_ids(self, frame_idx: int, observations: List[FaceObservation]) -> List[int]:
-        """
-        Assigns track_ids to observations using the same logic as update_tracks_with_frame,
-        but returns the assigned track_ids instead of updating internal state.
-
-        Intended for use on detection frames to allow tracker init with known IDs.
-        """
-        assigned_ids = []
-        temp_active_flags = [False for _ in self.tracks]
-        unassigned_obs = observations.copy()
-
-        for obs in observations:
-            best_track = None
-            best_iou = 0.0
-            best_idx = -1
-
-            for idx, track in enumerate(self.tracks):
-                if track.is_closed():
-                    continue
-                last_bbox = track.get_last_bbox()
-                if last_bbox is None:
-                    continue
-                iou = compute_iou(last_bbox, obs.bbox)
-                if iou > best_iou and iou >= self.iou_threshold:
-                    best_iou = iou
-                    best_track = track
-                    best_idx = idx
-
-            if best_track:
-                assigned_ids.append(best_track.track_id)
-                temp_active_flags[best_idx] = True
-                unassigned_obs.remove(obs)
-            else:
-                assigned_ids.append(None)  # Will replace later
-
-        # Fill in None values for new tracks
-        for i, tid in enumerate(assigned_ids):
-            if tid is None:
-                new_track_id = self.next_track_id
-                self.next_track_id += 1
-                assigned_ids[i] = new_track_id
-
-        return assigned_ids
-
-
+    def _index_obs(self, obs: FaceObservation) -> None:
+        self._by_frame.setdefault(obs.frame_idx, []).append(obs)
+        
     # -------------------
     # Frame-Level Assignment
     # -------------------
 
-    def update_tracks_with_frame(self, frame_idx: int, observations: List[FaceObservation]):
+    def update_tracks_with_frame(
+        self,
+        frame_idx: int,
+        observations: Optional[List[FaceObservation]] = None,
+        ) -> int:
+        """
+        Update aggregator with observations from `frame_idx`.
+
+        Returns
+        -------
+        int
+            Number of tracks that were created on this frame (0 if none).
+        """
         if not observations:
-            return  # No observations to process
-        
-        sources = set(obs.source for obs in observations)
+            return 0
+    
+        # In this pipeline, a frame's observations are all from one source.
+        sources = {obs.source for obs in observations}
         assert len(sources) == 1, f"Mixed observation sources in frame {frame_idx}: {sources}"
-        source = sources.pop()
+        source = next(iter(sources))
 
-        if source == 'tracking':
+        if source == Source.TRACKED:
+            # Tracking frames should not create new tracks.
             self.update_tracks_with_tracking_frame(frame_idx, observations)
-        elif source == 'detection':
-            self.update_tracks_with_detection_frame(frame_idx, observations)
-        else:
-            raise ValueError(f"Unknown source '{source}' in frame {frame_idx}")
+            return 0
 
-    def update_tracks_with_detection_frame(self, frame_idx: int, observations: List[FaceObservation]):
-        """
-        Called when current frame contains detection-based observations.
-        Performs IoU-based matching against open tracks, creates new tracks for unmatched detections.
-        """
+        if source == Source.DETECTED:
+            # Have this return how many new tracks were made by associating detections.
+            created_count = self.update_tracks_with_detection_frame(frame_idx, observations)
+            return int(created_count)
 
+        raise ValueError(f"Unknown source '{source}' in frame {frame_idx}")
+ 
+    def update_tracks_with_detection_frame(
+        self, frame_idx: int, observations: List[FaceObservation]
+    ) -> int:
+        """
+        Associate detections to existing tracks, create new tracks for unmatched detections,
+        and update internal state.
+
+        Returns
+        -------
+        int
+            Number of new tracks created on this frame.
+        """
+        if not observations:
+            return 0
+
+        # Contract: this method only handles detection observations.
+        sources = {obs.source for obs in observations}
+        assert sources == {Source.DETECTED}, f"Non-detection sources at frame {frame_idx}: {sources}"
+
+        # Mark all tracks inactive; we’ll flip to active if matched this frame.
         for track in self.tracks:
             track.is_active = False
 
-        unassigned_obs = observations.copy()
+        assigned_tracks: set[int] = set()
+        unmatched_obs: list[FaceObservation] = []
 
-        # Match via IoU
+        # Greedy IoU assignment: each detection → at most one track; each track ← at most one detection.
         for obs in observations:
             best_track = None
             best_iou = 0.0
@@ -153,30 +102,55 @@ class ShotFaceTrackAggregator:
             for track in self.tracks:
                 if track.is_closed():
                     continue
+                if track.track_id in assigned_tracks:
+                    continue
+
                 last_bbox = track.get_last_bbox()
                 if last_bbox is None:
                     continue
+
                 iou = compute_iou(last_bbox, obs.bbox)
-                if iou > best_iou and iou >= self.iou_threshold:
+                if iou >= self.iou_threshold and iou > best_iou:
                     best_iou = iou
                     best_track = track
 
-            if best_track:
-                best_track.add_observation(obs)
-                best_track.is_active = True
-                unassigned_obs.remove(obs)
+            if best_track is not None:
+                obs.track_id = best_track.track_id
+                if hasattr(obs, "shot_id"):
+                    obs.shot_id = self.shot_number
 
-        # Create new tracks for unmatched
-        for obs in unassigned_obs:
+                best_track.add_observation(obs)
+
+                best_track.is_active = True
+                assigned_tracks.add(best_track.track_id)
+                self._index_obs(obs)
+            else:
+                unmatched_obs.append(obs)
+
+        # Create new tracks for unmatched detections
+        num_created = 0
+        for obs in unmatched_obs:
             new_track = FaceTrack(track_id=self.next_track_id, shot_id=self.shot_number)
+            
+            obs.track_id = new_track.track_id
+            if hasattr(obs, "shot_id"):
+                obs.shot_id = self.shot_number
+
             new_track.add_observation(obs)
+
             new_track.is_active = True
             self.tracks.append(new_track)
             self.next_track_id += 1
+            self._index_obs(obs)
+            num_created += 1
 
+        # On a detection frame, any not-matched open tracks are closed.
         for track in self.tracks:
             if not track.is_active and not track.is_closed():
                 track.mark_closed()
+
+        return num_created
+
 
     def update_tracks_with_tracking_frame(self, frame_idx: int, observations: List[FaceObservation]):
         """
@@ -199,6 +173,7 @@ class ShotFaceTrackAggregator:
 
             track.add_observation(obs)
             track.is_active = True
+            self._index_obs(obs)
 
         for track in self.tracks:
             if not track.is_active and not track.is_closed():
@@ -218,8 +193,12 @@ class ShotFaceTrackAggregator:
         """
         face_observations = []
         for bbox, _landmarks, aligned_face in observations:
-
-            obs = FaceObservation(frame_idx=frame_idx, bbox=bbox, aligned_face=aligned_face)
+            x1, y1, x2, y2 = map(int, bbox[:4])
+            obs = FaceObservation(
+                frame_idx=frame_idx, 
+                bbox=(x1,y1,x2,y2), 
+                aligned_face=aligned_face,
+                source=Source.DETECTED)
             face_observations.append(obs)
         self.update_tracks_with_frame(frame_idx, face_observations)
 
@@ -252,78 +231,6 @@ class ShotFaceTrackAggregator:
 
         for i in range(embeddings.shape[0]):
             track.embeddings.append(embeddings[i].copy())
-
-
-    # def resolve_segment_ids(self, segment_id_counter: int, embedding_threshold: float = 0.6) -> int:
-    #     """
-    #     Assign segment IDs to tracks in a shot:
-    #     - Reuse existing segment_ids where possible based on embedding similarity.
-    #     - Ensure no temporal overlap in reuse.
-    #     - Cluster remaining unassigned tracks by embedding similarity (and no overlap).
-    #     """
-
-    #     def similarity(emb1, emb2):
-    #         emb1 = emb1 / np.linalg.norm(emb1)
-    #         emb2 = emb2 / np.linalg.norm(emb2)
-    #         return float(np.dot(emb1, emb2))
-
-    #     def tracks_temporally_overlap(t1, t2):
-    #         return not (t1.last_frame() < t2.first_frame() or t2.last_frame() < t1.first_frame())
-
-    #     # Split into assigned and unassigned
-    #     unassigned = [t for t in self.tracks if t.segment_id is None]
-    #     existing = [t for t in self.tracks if t.segment_id is not None]
-
-
-    #     # Pass 1: Reuse existing IDs
-    #     for u in unassigned[:]:
-    #         if not u.has_embedding():
-    #             continue
-    #         best_match, best_score = None, -1.0
-    #         for e in existing:
-    #             if not e.has_embedding():
-    #                 continue
-    #             if tracks_temporally_overlap(u, e):
-    #                 continue
-    #             score = similarity(u.compute_average_embedding(), e.compute_average_embedding())
-    #             if score >= embedding_threshold and score > best_score:
-    #                 best_match, best_score = e, score
-    #         if best_match:
-    #             u.segment_id = best_match.segment_id
-    #             existing.append(u)  # Now it can help future matches
-    #             unassigned.remove(u)
-    #             print(f"[DEBUG] Reused ID {u.segment_id} for track {u.track_id} (match={best_match.track_id}, score={best_score:.3f})")
-
-    #     # Pass 2: Assign new IDs (with grouping)
-    #     while unassigned:
-    #         base = unassigned.pop(0)
-    #         base.segment_id = segment_id_counter
-    #         group = [base]
-
-    #         if base.has_embedding():
-    #             # Group other similar, non-overlapping tracks
-    #             candidates = []
-    #             for t in unassigned:
-    #                 if not t.has_embedding():
-    #                     continue
-    #                 if tracks_temporally_overlap(base, t):
-    #                     continue
-    #                 score = similarity(base.compute_average_embedding(), t.compute_average_embedding())
-    #                 if score >= embedding_threshold:
-    #                     candidates.append((t, score))
-
-    #             # Sort candidates by similarity
-    #             candidates.sort(key=lambda x: x[1], reverse=True)
-    #             for t, _ in candidates:
-    #                 t.segment_id = segment_id_counter
-    #                 group.append(t)
-
-    #             # Remove grouped tracks
-    #             unassigned = [t for t in unassigned if t.segment_id is None]
-
-    #         segment_id_counter += 1
-
-    #     return segment_id_counter
 
     def resolve_segment_ids(
         self,
@@ -386,7 +293,7 @@ class ShotFaceTrackAggregator:
             for t in missing_tracks:
                 aligned_count = sum(1 for obs in t.observations if obs.aligned_face is not None)
                 valid_embeds = sum(1 for e in t.embeddings if e is not None)
-                print(f"  - Track {t.track_id}: duration={t.duration()}, "
+                logging.error(f"  - Track {t.track_id}: duration={t.duration()}, "
                     f"frames={t.get_frame_indices()}, "
                     f"aligned_faces={aligned_count}, "
                     f"embeddings={valid_embeds}/{len(t.embeddings)}")
@@ -435,7 +342,6 @@ class ShotFaceTrackAggregator:
     def finalize_tracks(self) -> List[FaceTrack]:
         """
         Close all remaining open tracks and return them.
-        Call prior to 
         """
 
         for t in self.tracks:
@@ -448,3 +354,32 @@ class ShotFaceTrackAggregator:
         Get all tracks that contain an observation for the given frame index.
         """
         return [t for t in self.tracks if frame_idx in t.get_frame_indices()]
+
+    def observations_at(
+        self,
+        frame_idx: int,
+        *,
+        source: Optional[Source] = None,
+        require_track_id: bool = True,
+    ) -> list[FaceObservation]:
+        """
+        Return the aggregator-owned observations for a given frame.
+
+        Args:
+            frame_idx: absolute frame index.
+            source: if set, filter by Source (e.g., Source.DETECTED / Source.TRACKED).
+            require_track_id: if True, only return observations that have an assigned track_id.
+
+        Returns:
+            A list of FaceObservation objects (owned by the aggregator).
+            Do not mutate these; treat as read-only.
+        """
+        # Simple implementation (scan tracks). Easy to swap out later if you index by frame.
+        out: list[FaceObservation] = []
+        for o in self._by_frame.get(frame_idx, []):
+            if require_track_id and (o.track_id is None):
+                continue
+            if (source is not None) and (getattr(o, "source", None) != source):
+                continue
+            out.append(o)
+        return out

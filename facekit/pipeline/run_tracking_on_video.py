@@ -7,6 +7,7 @@ from facekit.output.drawing import draw_bbox_with_track_id
 from facekit.config import DEFAULT_OUTPUT_DIR
 # temporarily add segment_id export
 from facekit.output.json_writer import export_segment_id_map
+import logging
 
 def run_tracking_on_video(
     input_path: str,
@@ -64,7 +65,7 @@ def run_tracking_on_video(
     if writer:
         writer.release()
 
-    print(f"Tracking complete. Output saved to: {output_path}")
+    logging.info(f"Tracking complete. Output saved to: {output_path}")
 
     #Temporarily add logic to resolve segment IDs
     # return aggregator.finalize_tracks()
@@ -77,6 +78,6 @@ def run_tracking_on_video(
         embedding_threshold=0.7
     )
     export_segment_id_map(tracks, output_path.replace(".mp4", "_segment_ids.json"))
-    print(f"segment ID map written to: {output_path.replace('.mp4', '_segment_ids.json')}")
+    logging.info(f"segment ID map written to: {output_path.replace('.mp4', '_segment_ids.json')}")
 
     return tracks

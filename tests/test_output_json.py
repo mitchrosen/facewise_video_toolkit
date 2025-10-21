@@ -3,13 +3,14 @@ import numpy as np
 import pytest
 from unittest.mock import patch, MagicMock, mock_open
 from facekit.output.json_writer import multiface_tracking_to_json
+from facekit.common.obs_consts import Source
 
 
 # --- Helpers for expected structure ---
 def to_det_result(box, conf):
     return [list(box)], [[(0, 0)] * 5], [conf]
 
-def to_json_face(box, conf=None, source="tracked"):
+def to_json_face(box, conf=None, source=Source.TRACKED):
     if len(box) == 4 and isinstance(conf, float):  # detection box
         x1, y1, x2, y2 = box
         return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1, "conf": round(conf, 3), "source": source}

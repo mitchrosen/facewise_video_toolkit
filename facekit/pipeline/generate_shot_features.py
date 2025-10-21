@@ -7,6 +7,7 @@ from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from scenedetect.frame_timecode import FrameTimecode
 import numpy as np
+import logging
 
 from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.face_detector import FaceDetector
@@ -59,7 +60,7 @@ def generate_shot_features_json(
         t1 = time.time()
         scenes = detect_scenes(video_path, threshold)
         t2 = time.time()
-        print(f"setup+scene detect: {(t2 - t0):.2f}s (scenes in {t2-t1:.2f}s)")
+        logging.info(f"setup+scene detect: {(t2 - t0):.2f}s (scenes in {t2-t1:.2f}s)")
 
         if not scenes:
             tf = total_frames if total_frames > 0 else 1 # If video has 0 frames, synthesize a trivial 0..0 scene
@@ -84,39 +85,39 @@ def generate_shot_features_json(
                 try:
                     face_boxes = extract_faces(frame, detector, frame_w, frame_h)
                 except Exception as e:
-                    print(f"Could not extract faces for shot {idx}: {e}")
+                    logging.error(f"Could not extract faces for shot {idx}: {e}")
                     face_boxes = []
+            det_faces = {"face_count": len(face_boxes)}
+            if face_boxes:
+                det_faces["face_details"] = face_boxes
 
             shots.append({
                 "shot_number": idx,
                 "first_frame": start_frame_num,
                 "last_frame": end_frame_num,
-                "detected_faces": {
-                    "face_count": len(face_boxes),
-                    "face_details": face_boxes
-                },
+                "detected_faces": det_faces,
                 "detected_graphics": {}
             })
-        print(f"face sampling+json build: {(time.time()-t2):.2f}s")
+        logging.info(f"face sampling+json build: {(time.time()-t2):.2f}s")
 
     if total_frames and shots:
         shots[-1]["last_frame"] = min(shots[-1]["last_frame"], total_frames - 1)
 
     elapsed = time.time() - t0
-    print(f"extract_faces and build json struct time: {elapsed:.2f} seconds")
+    logging.info(f"extract_faces and build json struct time: {elapsed:.2f} seconds")
 
     t4 = time.time()
     result = {"shots": shots}
 
     output_path.write_text(json.dumps(result, indent=2))
     elapsed = time.time() - t4
-    print(f"write json file time: {elapsed:.2f} seconds")
+    logging.info(f"write json file time: {elapsed:.2f} seconds")
 
     SCHEMA_PATH = Path("schemas/shot_features_v1.schema.json")
     errors = validate_shot_features_json_v1(str(output_path), SCHEMA_PATH, total_frames)
     if errors:
-        print("Validation errors:")
+        logging.error("Validation errors:")
         for e in errors:
-            print(" -", e)
+            logging.error(" - %s", e)
     else:
-        print(f"JSON valid. Saved to {output_path}")
+        logging.info(f"JSON valid. Saved to {output_path}")

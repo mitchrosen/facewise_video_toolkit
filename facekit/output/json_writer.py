@@ -6,6 +6,8 @@ from facekit.detection.yolo5face_model import load_yolo5face_model
 from facekit.detection.face_detector import FaceDetector
 from facekit.tracking.face_tracker import FaceTracker
 from facekit.tracking.face_structures import FaceTrack
+from facekit.common.obs_consts import Source
+import logging
 
 def multiface_tracking_to_json(
     input_path: str,
@@ -53,13 +55,13 @@ def multiface_tracking_to_json(
     detector = FaceDetector(detector_model)
 
     elapsed = time.time() - start_time
-    print(f"startup time: {elapsed:.2f} seconds")
+    logging.info(f"startup time: {elapsed:.2f} seconds")
 
     start_time = time.time()
 
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"Could not open video: {input_path}")
+        logging.error(f"Could not open video: {input_path}")
         return
 
     tracker = FaceTracker(tracker_type=tracker_type)
@@ -86,7 +88,7 @@ def multiface_tracking_to_json(
                         "y": y,
                         "w": w,
                         "h": h,
-                        "source": "tracked"
+                        "source": Source.TRACKED
                     })
                 else:
                     do_fallback = True
@@ -102,6 +104,9 @@ def multiface_tracking_to_json(
                     # Ensure tracker is initialized fully
                     _ = tracker.update_trackers(frame)  
 
+                    # If we’re here because a tracker failed this frame,
+                    # mark the detections as a fallback; otherwise they are plain detected.
+                    _src = Source.FALLBACK if do_fallback and not should_detect else Source.DETECTED
                     for (x1, y1, x2, y2), conf in zip(boxes, confidences):
                         frame_faces.append({
                             "x": int(x1),
@@ -109,7 +114,7 @@ def multiface_tracking_to_json(
                             "w": int(x2 - x1),
                             "h": int(y2 - y1),
                             "conf": round(float(conf), 3),
-                            "source": "detected" if should_detect else "fallback"
+                            "source": _src
                         })
 
         results.append({
@@ -122,15 +127,15 @@ def multiface_tracking_to_json(
 
     cap.release()
     elapsed = time.time() - start_time
-    print(f"detection/tracking time: {elapsed:.2f} seconds")
+    logging.info(f"detection/tracking time: {elapsed:.2f} seconds")
 
     start_time = time.time()
     with open(output_json_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"Write json time: {elapsed:.2f} seconds")
+    logging.info(f"Write json time: {elapsed:.2f} seconds")
 
-    print(f"JSON tracking output saved to: {output_json_path}")
-    print(f"Total frames processed: {frame_num}")
+    logging.info(f"JSON tracking output saved to: {output_json_path}")
+    logging.info(f"Total frames processed: {frame_num}")
 
 
 def export_segment_id_map(

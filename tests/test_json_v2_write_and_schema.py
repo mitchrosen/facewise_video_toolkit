@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 from unittest import mock
 import pytest
+from facekit.common.obs_consts import Source
 
 # Make sure we can import helpers co-located with this file
 import sys, os
@@ -25,7 +26,7 @@ from facekit.validation import (
 def test_v2_writer_and_schema(tmp_path: Path):
     W, H = 1000, 500
     t1 = Track(1, 1, gid=0, obs=[Obs(108, (100, 100, 200, 300)), Obs(109, (110, 110, 210, 310))])
-    t2 = Track(1, 2, gid=1, obs=[Obs(114, (400, 100, 600, 350), "tracking", 0.8)])
+    t2 = Track(1, 2, gid=1, obs=[Obs(114, (400, 100, 600, 350), Source.DETECTED, 0.8)])
 
     cfg = V2WriterConfig(
         video_path="/vid.mp4",
@@ -57,16 +58,20 @@ def test_v2_writer_and_schema(tmp_path: Path):
 
 
 # --------------------------- error routes -----------------------------------
-def test_get_schema_path_errors_unknown_minor():
-    # Assuming 2.1 does not exist in facekit/schemas
-    with pytest.raises(UnknownSchemaVersion):
-        get_schema_path("2.1")
+def test_get_schema_path_v2_1_exists():
+    # Pick a version (major and minor) known to exist
+    p = get_schema_path("2.1")
+    assert p.exists()
 
+def test_get_schema_path_errors_unknown_minor():
+    # Pick a major that is known to exist with a minor that is known NOT to exist
+    with pytest.raises(UnknownSchemaVersion):
+        get_schema_path("2.9")
 
 def test_get_schema_path_errors_unknown_major():
+# Pick a major that is known NOT to exist
     with pytest.raises(UnknownSchemaVersion):
         get_schema_path("3")
-
 
 def test_dispatcher_no_validator_for_major(monkeypatch, tmp_path: Path):
     # Create a tiny V2-like manifest file
@@ -79,7 +84,7 @@ def test_dispatcher_no_validator_for_major(monkeypatch, tmp_path: Path):
             "branch": "main",
             "params_hash": "sha256:deadbeef",
         },
-        "shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 9, "face_tracks": []}],
+        "shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 9, "num_tracks": 0, "face_tracks": []}],
     }
     p = tmp_path / "m.json"
     p.write_text(json.dumps(manifest))
