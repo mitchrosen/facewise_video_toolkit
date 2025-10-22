@@ -724,7 +724,7 @@ class CheckpointManager (TrackingCheckpoint):
 
             # Final summary line — this is the one you usually watch
             logging.info(
-                "ckpt:anchor trimmed obs %s→%s (anchor=%d) emb %s→%s (anchor=%d) @ frame=%s shot=%s",
+                "ckpt:anchor trimmed obs %s→%s (obs_anchor=%d) emb %s→%s (emb_anchor=%d) @ frame=%s shot=%s",
                 pre_obs, post_obs, od, pre_emb, post_emb, ed, lf, ls
             )
         else:

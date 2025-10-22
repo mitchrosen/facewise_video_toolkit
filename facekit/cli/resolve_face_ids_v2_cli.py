@@ -129,9 +129,10 @@ def run_pipeline(args):
             else CheckpointManager.compute_parent_dir(Path("checkpoints"), video_path)
         )
         # ---- collectors ---------------------------------------------------------
-        # Output collectors (used for the final manifest only):
-        # - 2.1: observations must be built *after* tracking, from finalized tracks.
-        obs_collector = ObservationsCollector()          # stays EMPTY until after tracking
+        # Single source of truth for the whole run (fresh or resume):
+        # These are used by checkpointing during the run AND by the final writers.
+        obs_collector = ObservationsCollector()
+        emb_collector = EmbeddingCollector(mode="sidecar", dim=512)
 
         options_snapshot = {
             "schema_version": args.schema_version,
@@ -172,16 +173,13 @@ def run_pipeline(args):
                 force=args.force,
             )          
 
-        ckpt_obs = ObservationsCollector()
-        ckpt_emb = EmbeddingCollector(mode="sidecar", dim=512)
-
         if not args.no_resume:
-                # If resuming, hydrate & trim the checkpoint collectors
-                ckpt.load_and_anchor_collectors(ckpt_obs, ckpt_emb)
+            # Hydrate & anchor the SAME collectors used for the rest of the run.
+            ckpt.load_and_anchor_collectors(obs_collector, emb_collector)
 
         ckpt.start(
-            ckpt_obs, 
-            ckpt_emb, 
+            obs_collector,
+           emb_collector, 
             frames_done=0, 
             shots_done=0, 
             tracks_seen=0,
@@ -242,11 +240,6 @@ def run_pipeline(args):
             out_glob = Path(args.output_global_json)
 
         emb_store = None if args.emb_store == "none" else args.emb_store
-        emb_collector = (
-            EmbeddingCollector(emb_store, dim=512)
-            if emb_store in ("inline", "sidecar")
-            else None
-        )
 
         # resolve embedding sidecar path (if needed)
         sidecar_path = (
@@ -290,14 +283,14 @@ def run_pipeline(args):
                 embedder=embedder,
                 tracking_params={"detect_interval": int(args.detect_interval)},
                 validator=None,
-                emb_collector=emb_collector,   # may be None or sidecar
+                emb_collector=(emb_collector if emb_store == "sidecar" else None),
                 obs_collector=obs_collector, 
             )
             # finalize observations sidecar
             manifest["observations_sidecar"] = obs_collector.finalize_sidecar(obs_path)
 
         # ---- finalize embedding sidecar  ---------------------
-        if emb_store == "sidecar" and emb_collector is not None:
+        if emb_store == "sidecar":
             epath = cfg.emb_sidecar_path or video_path.with_suffix(".embeddings.npz")
             manifest["embedding_sidecar"] = emb_collector.finalize_sidecar(epath)
 

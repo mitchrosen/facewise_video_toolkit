@@ -9,6 +9,7 @@ from facekit.common.obs_consts import (
     Source,
     VALID_SOURCES,
     SRC_TO_CODE,
+    CODE_TO_SRC
 )
 from facekit.utils.io import fsync_parent_dir
 
@@ -140,6 +141,10 @@ class ObservationsCollector:
     def __init__(self) -> None:
         self._rows: List[np.ndarray] = []   # list of (k,) structured arrays
         self._count: int = 0
+
+    def reset(self) -> None:
+        self._rows.clear()
+        self._count = 0
 
     def find_rows(
         self,
@@ -852,17 +857,6 @@ def build_v2_1_manifest_from_tracks(
     if cfg.total_frames is not None: video["total_frames"] = int(cfg.total_frames)
 
     shots_out: list[dict] = []
-
-    # Helper: get emb_idx for an observation
-    def _emb_idx_for_obs(o) -> int:
-        if emb_collector is None:
-            return -1
-        v = getattr(o, "embedding", None)
-        if v is None:
-            return -1
-        # assign returns {"emb_idx": i} or {} (no inline in 2.1)
-        out = emb_collector.assign(v)
-        return int(out.get("emb_idx", -1))
 
     for shot_number in sorted(shots_map.keys()):
         t_out: list[dict] = []
