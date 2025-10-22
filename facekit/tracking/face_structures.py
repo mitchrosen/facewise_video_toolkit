@@ -3,7 +3,7 @@ from typing import List, Tuple, Optional, Literal
 import numpy as np
 from facekit.utils.geometry import compute_iou
 import logging
-from facekit.common.obs_consts import Source
+from facekit.common.obs_consts import Source, code_to_src, src_to_code
 
 @dataclass
 class FaceObservation:
@@ -19,29 +19,41 @@ class FaceObservation:
         aligned_face (np.ndarray, optional): Aligned face crop (e.g. ArcFace 112x112 RGB)
     """
     frame_idx: int
-    bbox: Tuple[int, int, int, int]  # (x1, y1, x2, y2)
-    track_id: Optional[int] = None
-    embedding: Optional[np.ndarray] = None
-    confidence: Optional[float] = None
-    aligned_face: Optional[np.ndarray] = None
-
+    source: Source  
+    track_id: int | None = None
+    bbox: tuple[int, int, int, int] | None = None
+    embedding: np.ndarray | None = None
+    confidence: float | None = None
+    aligned_face: np.ndarray | None = None
     landmarks: Optional[List[Tuple[float,float]]] = None
-    source: Optional[Source] = None
 
-    def __post_init__(self):
-        # Defensive: coerce bbox to tuple and validate
-        self.bbox = tuple(self.bbox)
-        self.validate_bbox()
-
-    def validate_bbox(self):
-        if not (
-            isinstance(self.bbox, tuple) and
-            len(self.bbox) == 4 and
-            all(isinstance(v, int) for v in self.bbox)
-        ):
-            raise ValueError(
-                f"Invalid bbox: could not convert to 4-tuple of ints — received {self.bbox}"
+    def __post_init__(self) -> None:
+        # STRICT: source must already be a Source enum (fail-fast; no coercion here)
+        if not isinstance(self.source, Source):
+            raise TypeError(
+                f"FaceObservation.source must be Source enum, got {type(self.source).__name__}: {self.source!r}"
             )
+        # Normalize bbox if present, else allow None
+        if self.bbox is not None:
+            try:
+                x1, y1, x2, y2 = self.bbox  # may raise
+            except Exception as e:
+                raise ValueError(f"bbox must be a 4-sequence, got {self.bbox!r}") from e
+            # Cast to ints (upstream may hand floats); store canonical (x1,y1,x2,y2)
+            self.bbox = (int(x1), int(y1), int(x2), int(y2))
+            self.validate_bbox()
+
+
+    def validate_bbox(self) -> None:
+        # Allow None upstream (e.g., some FLOW/FALLBACK cases)
+        if self.bbox is None:
+            return
+        x1, y1, x2, y2 = self.bbox
+        if not all(isinstance(v, int) for v in (x1, y1, x2, y2)):
+            raise ValueError(f"bbox must be a 4-tuple of ints, got {self.bbox!r}")
+        # Optional geometry sanity (cheap invariants)
+        if x2 < x1 or y2 < y1:
+            raise ValueError(f"bbox has negative width/height: {self.bbox!r}")
 
 @dataclass
 class FaceTrack:
@@ -75,7 +87,15 @@ class FaceTrack:
     last_landmarks: Optional[np.ndarray] = None     # shape (5,2), float32
     last_bbox: Optional[Tuple[int,int,int,int]] = None
     last_gray_roi: Optional[np.ndarray] = None      # previous ROI gray for LK
-    last_det_frame_idx: Optional[int] = None        # when we last had “real” landmarks
+
+    last_frame_idx = -1
+    last_det_frame_idx = -1
+    last_bbox = (0, 0, 0, 0)
+
+    #   Authoritative cached DET frame index (kept in sync on every DET add)
+    _last_det_frame_idx: int | None = -1
+
+    closed = False
     
     def __post_init__(self):
         self._frame_index_map = {}
@@ -96,10 +116,11 @@ class FaceTrack:
             ValueError: If an observation already exists for the frame index and force is False.
         """
 
-        self.observations.append(obs)
-
         if not self.is_open:
             raise RuntimeError("Cannot add observation to a closed track")
+        
+        # Append after the closed check so we don't mutate on error
+        self.observations.append(obs)
 
         existing = self._frame_index_map.get(obs.frame_idx)
         if existing and not force:
@@ -118,10 +139,21 @@ class FaceTrack:
             self.embeddings.append(obs.embedding)
  
         # For tracking continuity: store landmarks if this was a detection
-        if obs.source == "detection" and obs.landmarks is not None:
+        if obs.source == Source.DETECTED and obs.landmarks is not None:
             # prepare for optical flow
-            self.last_known_landmarks = obs.landmarks  
+            self.last_known_landmarks = obs.landmarks
 
+        # Update last_bbox helper
+        if obs.bbox is not None:
+            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
+        
+        # Keep the DET cache authoritative
+        if getattr(obs, "source", None) == Source.DETECTED:
+            self._last_det_frame_idx = int(obs.frame_idx)
+      
+        # Update last_bbox helper
+        if obs.bbox is not None:
+            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
 
     def reset_for_frame(self):
         self.is_active = False
@@ -130,6 +162,10 @@ class FaceTrack:
         """Mark this track as permanently closed (no more updates)."""
     
         self.is_open = False
+
+    def mark_open(self):
+        """Re-open this track (used during resume hydration)."""
+        self.is_open = True
         
     def is_closed(self) -> bool:
         """Return True if this track has been permanently closed."""
@@ -157,14 +193,30 @@ class FaceTrack:
         return obs.bbox if obs else None
 
     def get_last_bbox(self):
-        return self.observations[-1].bbox if self.observations else None
+        if not self.observations:
+            return None
+        return tuple(int(v) for v in self.observations[-1].bbox[:4])
 
     def get_first_bbox(self):
         return self.observations[0].bbox if self.observations else None
 
-    def last_frame(self) -> int:
-        return self.observations[-1].frame_idx if self.observations else -1
-    
+    def last_frame(self) -> Optional[int]:
+        return int(self.observations[-1].frame_idx) if self.observations else None
+
+    def last_det_frame(self) -> Optional[int]:
+        """
+        Authoritative 'last frame with a DETECTED observation'.
+        Uses cached value; falls back to scan only if cache is missing
+        (e.g., legacy/constructed objects).
+        """
+        if self._last_det_frame_idx is not None:
+            return int(self._last_det_frame_idx)
+        for o in reversed(self.observations or []):
+            if getattr(o, "source", None) == Source.DETECTED:
+                self._last_det_frame_idx = int(o.frame_idx)
+                return self._last_det_frame_idx
+        return None
+
     def first_frame(self):
         return self.observations[0].frame_idx if self.observations else float("inf")
 
@@ -214,3 +266,10 @@ class FaceTrack:
 
     def count_embeddings(self):
         return len(self.embeddings)
+
+    def last_det_bbox(self) -> Optional[tuple[int,int,int,int]]:
+        for o in reversed(self.observations or []):
+            if getattr(o, "source", None) == Source.DETECTED and o.bbox is not None:
+                x1,y1,x2,y2 = map(int, o.bbox[:4])
+                return (x1,y1,x2,y2)
+        return None

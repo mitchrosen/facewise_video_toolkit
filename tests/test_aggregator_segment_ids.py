@@ -2,6 +2,8 @@ import pytest
 import numpy as np
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
+from facekit.common.obs_consts import Source
+from facekit.tracking.face_structures import FaceObservation
 
 
 # def dummy_observation(frame_idx, bbox, embedding=None):
@@ -195,11 +197,33 @@ from facekit.tracking.face_structures import FaceTrack, FaceObservation
 # ---------------------------
 # Helper functions
 # ---------------------------
-def make_track(track_id, embedding, first_frame=0):
-    t = FaceTrack(shot_id=0, track_id=track_id)
-    t.embeddings = [embedding]
-    t._embedding = embedding  # Optional, for legacy test checks
-    t._first_frame = first_frame  # If needed for sorting
+def _src_detection():
+    return Source.DETECTED
+
+def _src_tracking():
+    return Source.TRACKED
+
+def make_track(tid, embedding, first_frame=0, last_frame=None):
+    """Minimal valid track for tests: has at least one observation, and a representative embedding."""
+    t = FaceTrack(shot_id=0, track_id=int(tid))
+    f0 = int(first_frame)
+    t.add_observation(FaceObservation(
+        frame_idx=f0, bbox=(0, 0, 10, 10), source=_src_detection()
+    ))
+    if last_frame is not None and int(last_frame) > f0:
+        t.add_observation(FaceObservation(
+            frame_idx=int(last_frame), bbox=(1, 1, 11, 11), source=_src_tracking()
+        ))
+    if embedding is not None:
+        emb = np.asarray(embedding, dtype=np.float32)
+        n = float(np.linalg.norm(emb)) or 1.0
+        emb = emb / n
+        # Cover all access patterns used across the codebase/tests
+        t.embeddings = [emb]
+        t._embedding = emb
+        t.embedding_avg = emb
+        t._representative_embedding = emb
+        setattr(t, "get_representative_embedding", lambda e=emb: e)
     return t
 
 def random_embedding(dim=512, seed=None):
@@ -270,11 +294,24 @@ def test_segment_id_reuse_on_embedding_similarity():
 
 def test_no_segment_id_reuse_when_similarity_below_threshold():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t1 = make_track(0, random_embedding(seed=1))
-    t2 = make_track(1, random_embedding(seed=3), first_frame=1)
+    # Build two embeddings with low cosine similarity.
+    e1 = random_embedding(seed=1)
+    e2 = random_embedding(seed=3)
+    # Orthogonalize e2 against e1 to ensure similarity << 0.99.
+    e1u = e1 / (np.linalg.norm(e1) or 1.0)
+    e2 = e2 - float(np.dot(e1u, e2)) * e1u
+    if np.linalg.norm(e2) < 1e-6:
+        # Fallback: if numerical degeneracy, use opposite direction.
+        e2 = -e1
+    t1 = make_track(0, e1)
+    t2 = make_track(1, e2, first_frame=1)
+
 
     aggregator.tracks.extend([t1, t2])
-    counter = aggregator.resolve_segment_ids(0, embedding_threshold=0.99)
+    # Disable relaxed IoU path so only embedding similarity can drive reuse.
+    counter = aggregator.resolve_segment_ids(
+        0, embedding_threshold=0.99, emb_relax_factor=1.0, iou_threshold=2.0
+    )
 
     assert t1.segment_id != t2.segment_id
     assert counter == 2

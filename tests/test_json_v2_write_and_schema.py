@@ -12,7 +12,6 @@ from helpers_v2 import Obs, Track  # noqa: E402
 from facekit.output.json_v2 import (
     V2WriterConfig,
     build_v2_manifest_from_tracks,
-    derive_face_metadata,
     build_generation,
 )
 from facekit.validation import (
@@ -35,11 +34,9 @@ def test_v2_writer_and_schema(tmp_path: Path):
         total_frames=1000,
     )
 
-    face_meta = derive_face_metadata([t1, t2])
     manifest = build_v2_manifest_from_tracks(
         [t1, t2],
         cfg,
-        face_metadata=face_meta,
         generation={"emb_store": "inline"},  # let commit/branch auto-fill
     )
 
