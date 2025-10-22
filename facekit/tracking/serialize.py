@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
+import numpy as np
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
+from facekit.common.obs_consts import Source
 
 def to_v2_manifest(
     tracks,
@@ -133,25 +135,35 @@ def tracks_to_json_dict(tracks, include_embeddings=False):
     Returns:
         dict: JSON-compatible dictionary
     """
-    return {
-        "tracks": [
-            {
-                "shot_id": track.shot_id,
-                "track_id": track.track_id,
-                "face_label": track.global_id,
-                "observations": [
-                    {
-                        "frame_idx": obs.frame_idx,
-                        "bbox": list(obs.bbox),
-                        "confidence": obs.confidence,
-                        **({"embedding": obs.embedding.tolist()} if include_embeddings and obs.embedding is not None else {})
-                    }
-                    for obs in track.observations
-                ]
+    out_tracks = []
+    for track in tracks:
+        obs_rows = []
+        for idx, obs in enumerate(track.observations or []):
+            # Prefer the true enum if present; otherwise infer legacy default: first=detected, rest=tracked.
+            if hasattr(obs, "source") and isinstance(obs.source, Source):
+                src_str = obs.source.value
+            else:
+                src_str = Source.DETECTED.value if idx == 0 else Source.TRACKED.value
+
+            row = {
+                "frame_idx": int(obs.frame_idx),
+                "bbox": list(obs.bbox) if obs.bbox is not None else None,
+                "confidence": obs.confidence,
+                "src": src_str,
             }
-            for track in tracks
-        ]
-    }
+            if include_embeddings and getattr(obs, "embedding", None) is not None:
+                row["embedding"] = obs.embedding.tolist()
+            obs_rows.append(row)
+
+        out_tracks.append({
+            "shot_id": track.shot_id,
+            "track_id": track.track_id,
+            "face_label": getattr(track, "global_id", None),
+            "observations": obs_rows,
+        })
+
+    return {"tracks": out_tracks}
+
 
 def load_tracks_from_json_dict(json_dict):
     """
@@ -167,16 +179,29 @@ def load_tracks_from_json_dict(json_dict):
     for t in json_dict.get("tracks", []):
         shot_id = t["shot_id"]
         track_id = t["track_id"]
-        observations = [
-            FaceObservation(
-                frame_idx=obs["frame_idx"],
-                bbox=tuple(obs["bbox"]),
+        observations = []
+        for idx, obs in enumerate(t.get("observations", [])):
+            # Prefer stored string "src" (detected/tracked/flow/fallback) → enum; else infer legacy default.
+            if "src" in obs and obs["src"] is not None:
+                try:
+                    src_enum = Source(str(obs["src"]).lower())
+                except ValueError as e:
+                    raise ValueError(f"Unknown observation src {obs['src']!r} for track {track_id} at index {idx}") from e
+            else:
+                src_enum = Source.DETECTED if idx == 0 else Source.TRACKED
+
+            bbox = tuple(obs["bbox"]) if obs.get("bbox") is not None else None
+            emb = np.array(obs["embedding"]) if "embedding" in obs else None
+
+            observations.append(FaceObservation(
+                frame_idx=int(obs["frame_idx"]),
+                bbox=bbox,
                 confidence=obs.get("confidence", 1.0),
-                embedding=np.array(obs["embedding"]) if "embedding" in obs else None
-            )
-            for obs in t["observations"]
-        ]
-        tracks.append(FaceTrack(shot_id= shot_id, track_id=track_id, observations=observations))
+                embedding=emb,
+                source=src_enum,   # <-- enforce source here
+            ))
+
+        tracks.append(FaceTrack(shot_id=shot_id, track_id=track_id, observations=observations))
     return tracks
 
 def save_tracks_to_json_file(tracks, output_path, include_embeddings=False):

@@ -2,8 +2,11 @@ import pytest
 import sys
 from pathlib import Path
 import json
+import types
+
 from facekit.cli import resolve_face_ids_v2_cli as cli
 from facekit.common.obs_consts import Source
+from facekit.tracking.face_structures import FaceObservation
 
 @pytest.mark.parametrize("ver,expected_suffix", [("2.0","_v2.json"), ("2.1","_v2_1.json")])
 def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
@@ -25,13 +28,18 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
         def get_embedding_batch(self, *a, **k):
             import numpy as np
             return np.zeros((0,512),np.float32)
-    class _Obs:
+    class _Obs(FaceObservation):
         def __init__(self, f, shot_id=1, track_id=1, src=Source.DETECTED):
-            self.frame_idx = f
-            self.bbox = (0.0, 0.0, 1.0, 1.0)
+            super().__init__(
+                frame_idx=int(f),
+                track_id=int(track_id),
+                bbox=(0.0, 0.0, 1.0, 1.0),
+                embedding=None,
+                confidence=None,
+                aligned_face=None,
+                source=src,
+            )
             self.shot_id = shot_id
-            self.track_id = track_id
-            self.source = src
     class _Track:
         shot_id = 1
         track_id = 1
@@ -48,14 +56,14 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
             json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":1}]})
         )
 
-    monkeypatch.setattr(cli, "track_across_segments", fake_track_across_segments)
+    monkeypatch.setattr(cli, "track_across_segments", types.SimpleNamespace(track_across_segments=fake_track_across_segments),)
     monkeypatch.setattr(cli, "generate_shot_features_json", fake_generate_shot_features_json)
     monkeypatch.setattr(cli, "ReaderCoordinator", lambda p: DummyFP())
     monkeypatch.setattr(cli, "load_yolo5face_model", fake_load_model)
     monkeypatch.setattr(cli, "FaceDetector", lambda m: _FD())
     monkeypatch.setattr(cli, "FaceEmbedder", lambda *a,**k: _Emb())
     monkeypatch.setattr(cli, "_validate_manifest_dict",
-                    lambda manifest, schema_version, total_frame_count: [])
+                    lambda manifest, schema_version, total_frame_count, schema_dir: [])
 
     argv = [
         "prog", "--input", str(tmp_path/"in.mp4"),

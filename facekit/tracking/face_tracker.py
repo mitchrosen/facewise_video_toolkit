@@ -30,7 +30,7 @@ class FaceTracker:
                 tracker.init(frame, tuple(box))
                 self.trackers.append((track_id, tracker))
             except Exception as e:
-                logging.error(f"Failed to initialize tracker for track_id={track_id} box={box}: {e}", flush=True)
+                logging.error("Failed to initialize tracker for track_id=%s box=%s: %s", track_id, box, e)
 
     def update_trackers(self, frame):
         """

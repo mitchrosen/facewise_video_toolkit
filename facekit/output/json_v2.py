@@ -3,19 +3,26 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Literal, Union, Callable
 from pathlib import Path
 import numpy as np
-import json, os, subprocess, hashlib
+import json
+import os
+import subprocess
+import hashlib
+import logging
 from datetime import datetime, timezone
 from facekit.common.obs_consts import (
     Source,
-    VALID_SOURCES,
-    SRC_TO_CODE,
+    src_to_code,
+    code_to_src,
 )
-from facekit.utils.io import fsync_parent_dir
+from facekit.utils.io import atomic_write_npz, atomic_write_npy
+from facekit.tracking.face_structures import FaceObservation
 
 XYXY = Tuple[float, float, float, float]
 
 SCHEMA_VERSION_V2_0 = "2.0"
 SCHEMA_VERSION_V2_1 = "2.1"
+
+PARANOID = bool(os.environ.get("FACEKIT_PARANOID"))
 
 @dataclass
 class V2WriterConfig:
@@ -75,13 +82,50 @@ def _track_center_series(track: Any) -> List[Tuple[float,float]]:
         centers.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
     return centers
 
-def derive_face_metadata(tracks: List[Any]) -> List[Dict[str, Any]]:
-    counts: Dict[str, int] = {}
+def derive_face_metadata_from_observations(
+    obs_collector: "ObservationsCollector",
+    tracks: List[Any],
+) -> List[Dict[str, Any]]:
+    """
+    Compute face_metadata by counting rows in the *observations* source of truth.
+    This is deterministic across resume and golden runs.
+    """
+    # Build a stable map (shot_id, track_id) -> face_label from tracks
+    id_to_label: Dict[Tuple[int, int], str] = {}
     for t in tracks:
-        label = _track_label(t)
-        n = len(getattr(t, "observations", []))
-        counts[label] = counts.get(label, 0) + int(n)
-    return [{"face_label": k, "occurance_count": v} for k, v in sorted(counts.items())]
+        shot_id = int(getattr(t, "shot_id", 1))
+        track_id = int(getattr(t, "track_id", -1))
+        id_to_label[(shot_id, track_id)] = _track_label(t)
+
+    counts: Dict[str, int] = {}
+    # Iterate obs grouped by (shot, track_id); rows is ascending by frame
+    for s, tid, rows in obs_collector.iter_tracks():
+        label = id_to_label.get((int(s), int(tid)))
+        if not label:
+            # If a (shot,track) has no label mapping (should be rare), skip it
+            # rather than inventing a transient label that would harm determinism.
+            continue
+        counts[label] = counts.get(label, 0) + int(len(rows))
+
+    return [{"face_label": k, "occurance_count": int(v)} for k, v in sorted(counts.items())]
+
+
+def _derive_face_metadata_from_tracks(shots_out: list[dict]) -> list[dict]:
+    """
+    Derive metadata straight from the *manifest's* tracks (v2.1):
+    sum obs_count per face_label across all shots.
+    This avoids any dependence on in-memory, pre-merge tracks and is resume-stable.
+    """
+    counts: dict[str, int] = {}
+    for shot in shots_out or []:
+        for t in shot.get("face_tracks", []):
+            lbl = t.get("face_label")
+            cnt = int(t.get("obs_count", 0))
+            if not lbl:
+                continue
+            counts[lbl] = counts.get(lbl, 0) + cnt
+    return [{"face_label": k, "occurance_count": int(v)} for k, v in sorted(counts.items())]
+
 
 def _git_info(repo_dir: str | Path = ".") -> tuple[Optional[str], Optional[str]]:
     # Try git CLI
@@ -99,12 +143,12 @@ def _git_info(repo_dir: str | Path = ".") -> tuple[Optional[str], Optional[str]]
 
     # Parse .git/HEAD best-effort
     try:
-        head = Path(repo_dir) / ".git" / "HEAD"
+        head = Path(repo_dir, ".git", "HEAD")
         if head.exists():
             ref_line = head.read_text().strip()
             if ref_line.startswith("ref:"):
                 rel = ref_line.split(" ", 1)[1]  # e.g. refs/heads/main
-                ref_path = Path(repo_dir) / ".git" / rel
+                ref_path = Path(repo_dir, ".git", rel)
                 commit_full = ref_path.read_text().strip() if ref_path.exists() else None
                 branch = Path(rel).name
                 return (commit_full[:7] if commit_full else None), branch
@@ -125,6 +169,37 @@ def _compute_params_hash(generation: Dict[str, Any]) -> str:
 def _emb_store_token(mode):
     return mode if mode in ("inline", "sidecar") else "none"
 
+def get_legacy_last_frame(obs_npz_path: Union[str, Path]) -> Optional[int]:
+    p = Path(obs_npz_path)
+    if not p.exists():
+        return None
+    with np.load(p, allow_pickle=False) as data:
+        arr = data.get("observations")
+        if arr is None or arr.size == 0:
+            return None
+        return int(np.asarray(arr)["f"].max())
+    
+def _src_to_int(src_any) -> int:
+    """
+    Normalize source into an integer code:
+      - int: pass-through (validate range in caller if needed)
+      - Source: convert via .value -> src_to_code
+      - str: convert via src_to_code
+    Raises TypeError on unsupported types.
+    """
+    if isinstance(src_any, int):
+        return int(src_any)
+    if isinstance(src_any, Source):
+        return int(src_to_code(src_any.value))
+    if isinstance(src_any, str):
+        return int(src_to_code(src_any))
+    raise TypeError(f"'src' must be int|str|Source, not {type(src_any).__name__}: {src_any!r}")
+
+def _to_int01(flag) -> int:
+    # normalize truthy → 1, falsy → 0
+    return 1 if bool(flag) else 0
+
+
 ObsRow = np.dtype([
     ("f", np.int32),                 # absolute frame index
     ("shot", np.int32),              # shot number (for grouping)
@@ -132,14 +207,29 @@ ObsRow = np.dtype([
     ("bbox_xyxy", np.float32, (4,)), # x1,y1,x2,y2
     ("src", np.uint8),               # 0=detected,1=tracked,2=flow
     ("conf", np.float32),            # NaN if absent
-    ("emb_idx", np.int32)            # -1 if absent
+    ("emb_idx", np.int32),            # -1 if absent
+    ("has_crop", np.uint8),          # 1 if a 112x112 crop exists on disk, else 0
+    ("crop_ref", "U256"),            # path to aligned crop ("" if none)
 ])
 
 class ObservationsCollector:
     """Collects per-frame observations into a single structured array."""
+    @property
+    def columns(self) -> tuple[str, ...]:
+        # Must match ObsRow exactly
+        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","has_crop")
+    
+    @property
+    def schema(self) -> dict:
+        return {"fields": list(self.columns)}
+    
     def __init__(self) -> None:
         self._rows: List[np.ndarray] = []   # list of (k,) structured arrays
         self._count: int = 0
+
+    def reset(self) -> None:
+        self._rows.clear()
+        self._count = 0
 
     def find_rows(
         self,
@@ -148,7 +238,7 @@ class ObservationsCollector:
         track_id: int,
         frame_last: int | None = None,
         count: int | None = None,
-        # new, optional filters (all backward-compatible)
+        # optional filters (all backward-compatible)
         only_unassigned: bool | None = None,
         only_with_crop: bool | None = None,
         source: int | None = None,
@@ -164,6 +254,11 @@ class ObservationsCollector:
         Ordered from newest to oldest (descending frame index).
         Accepts legacy alias `frame_max` via **kwargs.
         """
+
+        logging.info(f"In find_rows: shot {shot}, track_id{track_id}, frame_last {frame_last}, count {count}, \
+                     only_unassigned {only_unassigned}, only_with_crop {only_with_crop}, source {source} \
+                     rows {self._rows}")
+
         # Back-compat alias: some callers used frame_max
         if frame_last is None and "frame_max" in kwargs and kwargs["frame_max"] is not None:
             frame_last = int(kwargs["frame_max"])
@@ -188,8 +283,14 @@ class ObservationsCollector:
                     continue
                 if source is not None and int(row["src"]) != int(source):
                     continue
-                if only_with_crop and not _bbox_valid(row["bbox_xyxy"]):
-                    continue
+                if only_with_crop:
+                    if "has_crop" in row.dtype.names:
+                        if int(row["has_crop"]) != 1:
+                            continue
+                    else:
+                        # legacy fallback: bbox sanity as proxy
+                        if not _bbox_valid(row["bbox_xyxy"]):
+                            continue
 
                 out.append((b_idx, r_idx))
                 if want is not None and len(out) >= want:
@@ -203,19 +304,65 @@ class ObservationsCollector:
     ) -> int:
         """
         Write the given emb_idx values into the provided (block_idx, row_idx) positions.
-        Returns number of rows updated.
+
+        Contract:
+          - positions: list of (block_idx, row_idx) tuples
+          - emb_indices: 1D sequence of ints (list/tuple/ndarray)
+          - len(positions) == len(emb_indices)
+
+        Returns:
+          Number of rows updated.
         """
-        n = min(len(positions), len(emb_indices))
-        for i in range(n):
-            b_idx, r_idx = positions[i]
-            self._rows[b_idx]["emb_idx"][r_idx] = int(emb_indices[i])
-        return n
+
+        # --- Validate positions ---
+        if not isinstance(positions, list):
+            raise TypeError(
+                f"update_emb_idx: positions must be list[tuple[int,int]], "
+                f"got {type(positions).__name__}"
+            )
+
+        norm_positions: list[tuple[int, int]] = []
+        for pos in positions:
+            if not (isinstance(pos, tuple) and len(pos) == 2):
+                raise TypeError(
+                    f"update_emb_idx: each position must be (block_idx, row_idx), "
+                    f"got {pos!r}"
+                )
+            b_idx, r_idx = pos
+            norm_positions.append((int(b_idx), int(r_idx)))
+
+        # --- Normalize emb_indices to a list[int] ---
+        if isinstance(emb_indices, np.ndarray):
+            if emb_indices.ndim != 1:
+                raise ValueError(
+                    f"update_emb_idx: emb_indices must be 1D, got shape {emb_indices.shape}"
+                )
+            emb_list = [int(x) for x in emb_indices]
+        elif isinstance(emb_indices, (list, tuple)):
+            emb_list = [int(x) for x in emb_indices]
+        else:
+            raise TypeError(
+                f"update_emb_idx: emb_indices must be list/tuple/ndarray of ints, "
+                f"got {type(emb_indices).__name__}"
+            )
+
+        if len(norm_positions) != len(emb_list):
+            raise ValueError(
+                f"update_emb_idx length mismatch: positions={len(norm_positions)}, "
+                f"emb_indices={len(emb_list)}"
+            )
+
+        # --- Apply updates ---
+        for (b_idx, r_idx), emb_idx in zip(norm_positions, emb_list):
+            self._rows[b_idx]["emb_idx"][r_idx] = int(emb_idx)
+
+        return len(norm_positions)
 
     def append_track_obs(
         self,
         obs_items: List[Dict[str, Any]],
         emb_idx_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
-    ) -> Tuple[int, int]:
+        ) -> Tuple[int, int]:
         """
         Append obs for one track; returns (offset, count).
         Accepts dict-like or object-like observations.
@@ -230,9 +377,9 @@ class ObservationsCollector:
         k = len(obs_items)
         block = np.empty(k, dtype=ObsRow)
 
-        def _validate_faceObs_dict(o: dict) -> None:
+        def _validate_faceObs_dict(o: dict):
             if not isinstance(o, dict):
-               raise TypeError("ObservationsCollector.append_track_obs expects normalized dicts.")
+                raise TypeError("ObservationsCollector.append_track_obs expects normalized dicts.")
 
             missing = []
             # use .get to avoid KeyError so we can report everything at once
@@ -241,30 +388,43 @@ class ObservationsCollector:
             if o.get("f") is None:          missing.append("frame_idx")
             if ("bbox_xyxy" not in o) and ("bbox_xywh" not in o):
                 missing.append("bbox")
-            src_name = o.get("src")
-            if src_name is None:
+            if o.get("src") is None:
                 missing.append("source")
+
             if missing:
-                raise ValueError(f"Observation missing required fields: {missing}")
-            if src_name not in VALID_SOURCES:
-                valid_str = ", ".join(sorted(VALID_SOURCES))
-                raise ValueError(
-                    f"Invalid 'src': {src_name!r}; should be one of {valid_str}."
-                )
-       
+                raise ValueError(f"Observation missing required fields: {missing} | row={o!r}")
+
+            # --- normalize src to int code  ---
+            return _src_to_int(o.get("src"))
+        
         for i, o in enumerate(obs_items):
-            oN = o
-            _validate_faceObs_dict(oN)
+            oN = o if isinstance(o, dict) else dict(o)  # ensure dict-like
+            src_any = _validate_faceObs_dict(oN)
 
             f = int(oN["f"])
+            shot = int(oN["shot"])
             if "bbox_xyxy" in oN and oN["bbox_xyxy"] is not None:
                 bb = [float(x) for x in oN["bbox_xyxy"]]
             else:
                 x, y, w, h = oN["bbox_xywh"]
                 bb = [float(x), float(y), float(x + w), float(y + h)]
 
-            src = SRC_TO_CODE[oN["src"]]
-            conf = float(oN["conf"]) if "conf" in oN else np.nan
+            src_code =_src_to_int(src_any)
+            conf = float(oN["conf"]) if ("conf" in oN and oN["conf"] is not None) else np.nan
+
+            # Normalize crop_ref to a string
+            crop_ref = oN.get("crop_ref") or ""
+            crop_ref = str(crop_ref)
+
+            # has_crop: normalize to 0/1; infer from crop_ref when missing
+            has_crop = oN.get("has_crop", None)
+            if has_crop is None:
+                has_crop = 1 if crop_ref else 0
+            has_crop = _to_int01(has_crop)
+
+            if has_crop:
+                crop_ref = oN.get("crop_ref") or ""
+            crop_ref = str(crop_ref)
 
             emb_idx = -1
             if emb_idx_fn is not None:
@@ -273,38 +433,42 @@ class ObservationsCollector:
                 except Exception:
                     emb_idx = -1
 
-            block[i]["shot"] = int(oN["shot"])
-            block[i]["track_id"] = int(oN["track_id"])
             block[i]["f"] = f
+            block[i]["shot"] = shot 
+            block[i]["track_id"] = int(oN["track_id"])
             block[i]["bbox_xyxy"] = bb
-            block[i]["src"] = src
+            block[i]["src"] = src_code
             block[i]["conf"] = conf
             block[i]["emb_idx"] = emb_idx
+            block[i]["has_crop"] = has_crop
+            block[i]["crop_ref"] = crop_ref
 
         offset = self._count
         self._rows.append(block)
         self._count += k
         return (offset, k)
 
-    def finalize_sidecar(self, out_path: Path) -> Dict[str, Any]:
+    def finalize_sidecar(
+        self,
+        out_path: Path,
+        *,
+        min_frame_exclusive: int | None = None,
+    ) -> Dict[str, Any]:
         """
         Atomically write observations to an .npz (key: 'observations').
         Always writes a valid (possibly empty) structured array.
         """
-        import tempfile, os
+
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        if min_frame_exclusive is not None and arr.size:
+            arr = arr[arr["f"] > int(min_frame_exclusive)]
+
         final_path = out_path if out_path.suffix.lower() == ".npz" else out_path.with_suffix(".npz")
 
-        with tempfile.NamedTemporaryFile(dir=final_path.parent, suffix=".tmp", delete=False) as tmp:
-            np.savez(tmp, observations=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_name = tmp.name
-        os.replace(tmp_name, final_path)
-        fsync_parent_dir(final_path)
+        atomic_write_npz(final_path, observations=arr)
 
         return {
             "path": str(final_path),
@@ -317,33 +481,31 @@ class ObservationsCollector:
                 {"name":"bbox_xyxy","type":"f4[4]","desc":"x1,y1,x2,y2"},
                 {"name":"src","type":"u1","desc":"0=detected,1=tracked,2=flow"},
                 {"name":"conf","type":"f4","desc":"NaN if absent"},
-                {"name":"emb_idx","type":"i4","desc":"-1 if absent"}
+                {"name":"emb_idx","type":"i4","desc":"-1 if absent"},
+                {"name":"has_crop","type":"u1","desc":"1 if crop saved"},
+                {"name":"crop_ref","type":"U256","desc":"path to aligned crop or empty"},
             ],
             "count": int(arr.shape[0]),
         }
 
-    def dump_npz(self, out_path: Union[str, Path]) -> str:
-        from pathlib import Path
-        import tempfile, os
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+    def dump_npz(
+        self,
+        out_path: Union[str, Path],
+        *,
+        min_frame_exclusive: int | None = None,
+    ) -> str:
+        final = Path(out_path).with_suffix(".npz")
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
-        with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=".npz", delete=False) as tmp:
-            np.savez(tmp, observations=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        final = out_path.with_suffix(".npz")
-        os.replace(tmp_path, final)
-        fsync_parent_dir(final)
-
+        if min_frame_exclusive is not None and arr.size:
+            arr = arr[arr["f"] > int(min_frame_exclusive)]
+        atomic_write_npz(final, observations=arr)
         return str(final)
 
     def load_npz(self, npz_path: Union[str, Path]) -> int:
         p = Path(npz_path)
         if not p.exists():
             return 0
-        with np.load(p) as data:
+        with np.load(p, allow_pickle=False) as data:
             arr = data.get("observations")
             if arr is None:
                 return 0
@@ -364,7 +526,7 @@ class ObservationsCollector:
         if not self._rows:
             self._count = 0
             return
-        cur = int(np.sum(r.shape[0] for r in self._rows))
+        cur = sum(int(r.shape[0]) for r in self._rows)
         if n >= cur:
             self._count = cur
             return
@@ -379,6 +541,117 @@ class ObservationsCollector:
                 self._rows[-1] = last[:keep].copy()
                 cur = n
         self._count = cur
+
+    def iter_tracks(
+        self,
+        *,
+        frame_max: int | None = None,
+        shot: int | None = None,
+        track_id: int | None = None,
+    ):
+        """
+        Iterate grouped observations as (shot, track_id, rows) triples.
+        - Coalesces across all internal blocks.
+        - Optional filters: frame_max (inclusive), shot, track_id.
+        - rows are dicts with at least: f, bbox_xyxy, src (Source enum), and optional conf.
+        Order: by (shot, track_id), and rows are ascending by frame.
+        """
+        from facekit.common.obs_consts import CODE_TO_SRC  # already present
+        groups: dict[tuple[int,int], list[dict]] = {}
+
+        # gather across blocks
+        for block in self._rows:
+            for row in block:
+                s = int(row["shot"])
+                t = int(row["track_id"])
+                if shot is not None and s != int(shot):
+                    continue
+                if track_id is not None and t != int(track_id):
+                    continue
+                f = int(row["f"])
+                if frame_max is not None and f > int(frame_max):
+                    continue
+
+                d = {
+                    "f": f,
+                    "bbox_xyxy": [
+                        float(row["bbox_xyxy"][0]),
+                        float(row["bbox_xyxy"][1]),
+                        float(row["bbox_xyxy"][2]),
+                        float(row["bbox_xyxy"][3]),
+                    ],
+                    # API/UI boundary: expose enum
+                    "src": CODE_TO_SRC[int(row["src"])],
+                }
+                conf = float(row["conf"])
+                if not np.isnan(conf):
+                    d["conf"] = conf
+
+                if "crop_ref" in row.dtype.names:
+                    val = row["crop_ref"]
+                    # handle possible bytes/unicode
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8", "ignore")
+                    crop_ref = str(val).strip()
+                    if crop_ref:
+                        d["crop_ref"] = crop_ref
+
+                groups.setdefault((s, t), []).append(d)
+
+        # sort rows within each group by frame, then yield once per group
+        for (s, t) in sorted(groups.keys()):
+            rows = groups[(s, t)]
+            rows.sort(key=lambda r: r["f"])
+            yield (s, t, rows)
+
+
+    def to_array(self) -> np.ndarray:
+        """Return a single structured array similar to what finalize_sidecar writes."""
+        return (np.concatenate(self._rows, axis=0)
+                if self._rows else np.empty(0, dtype=ObsRow))
+    
+    def slice_for_track(self, shot: int, track_id: int) -> tuple[int, int]:
+        """
+        Return (offset, count) for all rows in this collector belonging to (shot, track_id).
+        Assumes rows for a (shot,track) are contiguous in append order.
+        """
+        # Reuse your existing row finder:
+        positions = self.find_rows(shot=int(shot), track_id=int(track_id))
+        count = len(positions)
+        if count == 0:
+            return (self._count, 0)  # next write-point as offset, zero count
+
+        # Convert first (block_idx,row_idx) to a global offset.
+        # If you track a running base for each block, use that; otherwise compute:
+        # offset = sum(len(b) for b in self._rows[:first_block_idx]) + first_row_idx
+        first_block_idx, first_row_idx = positions[0]
+        offset = sum(self._rows[i].shape[0] for i in range(first_block_idx)) + first_row_idx
+        return (int(offset), int(count))
+    
+    def frame_at_pos(self, pos: tuple[int,int]) -> int:
+        b_idx, r_idx = pos
+        return int(self._rows[b_idx]["f"][r_idx])
+    
+    def trim_to_frame(self, max_frame_inclusive: int) -> None:
+        maxf = int(max_frame_inclusive)
+        if not self._rows:
+            self._count = 0
+            return
+        kept_blocks = []
+        new_count = 0
+        for block in self._rows:
+            if block.size == 0:
+                continue
+            mask = block["f"] <= maxf
+            if mask.all():
+                kept_blocks.append(block)
+                new_count += int(block.shape[0])
+            elif mask.any():
+                sub = block[mask].copy()
+                kept_blocks.append(sub)
+                new_count += int(sub.shape[0])
+        self._rows = kept_blocks
+        self._count = new_count
 
 
 class EmbeddingCollector:
@@ -395,10 +668,17 @@ class EmbeddingCollector:
           * {"emb_idx": i} for sidecar
           * {} when storage is disabled / vec is None
     """
-    def __init__(self, mode: Literal["inline","sidecar"] | None, dim: int | None = None):
+    def __init__(
+        self,
+        mode: Literal["inline","sidecar"] | None,
+        dim: int | None = None,
+        *,
+        base_offset: int = 0,
+    ):
         self.mode = mode
         self.dim = dim
         self._embs: List[np.ndarray] = []
+        self._base = int(base_offset)
 
     def _validate_vec(self, vec: np.ndarray | None) -> np.ndarray:
         if vec is None:
@@ -429,7 +709,7 @@ class EmbeddingCollector:
         # sidecar
         idx = len(self._embs)
         self._embs.append(v.copy())
-        return int(idx)
+        return int(self._base + idx)
 
     # === JSON/Manifest helper =========================================================
     def fields_for_json(self, vec: np.ndarray | None) -> Dict[str, Any]:
@@ -453,53 +733,32 @@ class EmbeddingCollector:
         idx = self.assign(v)
         return {"emb_idx": int(idx)} if idx >= 0 else {}
 
-    # === Finalization / I/O ===========================================================
     def finalize_sidecar(self, out_path: Path) -> Dict[str, Any]:
         """
         Atomic write of embeddings sidecar.
-        - If out_path has .npy -> write a single ndarray .npy
-        - Otherwise -> write .npz with key 'embeddings'
+        - write .npz with key 'embeddings'
         """
         if self.mode != "sidecar":
             return {}
 
-        import os, tempfile
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build the array to persist (handle empty collector as valid file)
         if self._embs:
             arr = np.vstack(self._embs).astype(np.float32, copy=False)
         else:
-            arr = np.zeros((0, self.dim or 0), dtype=np.float32)
+            arr = np.zeros((0, int(self.dim or 0)), dtype=np.float32)
 
-        want_npy = out_path.suffix.lower() == ".npy"
-        final_path = out_path if want_npy else out_path.with_suffix(".npz")
+        if out_path.suffix.lower() == ".npy":
+            final_path = Path(atomic_write_npy(out_path, arr))
+            fmt = "npy"
+        else:
+            final_path = Path(atomic_write_npz(out_path.with_suffix(".npz"), embeddings=arr))
+            fmt = "npz"
 
-        # Atomic write: write to an OPEN temp file handle in the same directory,
-        # flush + fsync, close, then os.replace.
-        with tempfile.NamedTemporaryFile(
-            dir=final_path.parent,
-            suffix=final_path.suffix,
-            delete=False
-        ) as tmp:
-            if want_npy:
-                np.save(tmp, arr)
-            else:
-                # Write zip stream directly to the open handle to avoid
-                # path-based races/partials.
-                np.savez(tmp, embeddings=arr)
-
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_name = tmp.name  # capture before context exits
-
-        os.replace(tmp_name, final_path)
-        fsync_parent_dir(final_path)
-        
         return {
             "path": str(final_path),
-            "format": "npy" if want_npy else "npz",
+            "format": fmt,                 # <-- keep 'format' for the tests
             "dtype": "float32",
             "dim": int(arr.shape[1]) if arr.ndim == 2 else int(self.dim or 0),
             "count": int(arr.shape[0]),
@@ -510,20 +769,9 @@ class EmbeddingCollector:
 
     def dump_npz(self, out_path: Union[str, Path]) -> str:
         """Atomically write current embeddings as NPZ to out_path and return the final path."""
-        from pathlib import Path
-        import tempfile, os
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        arr = (np.vstack(self._embs).astype(np.float32, copy=False)
-               if self._embs else np.zeros((0, self.dim or 0), dtype=np.float32))
-        with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=".npz", delete=False) as tmp:
-            np.savez(tmp, embeddings=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        final = out_path.with_suffix(".npz")
-        os.replace(tmp_path, final)
-        fsync_parent_dir(final)
+        final = Path(out_path).with_suffix(".npz")
+        arr = self.to_array()
+        atomic_write_npz(final, embeddings=arr)
         return str(final)
 
     def load_npz(self, npz_path: Union[str, Path]) -> int:
@@ -531,8 +779,8 @@ class EmbeddingCollector:
         p = Path(npz_path)
         if not p.exists():
             return 0
-        data = np.load(p)
-        arr = data.get("embeddings")
+        with np.load(p, allow_pickle=False) as data:
+            arr = data.get("embeddings")
         if arr is None:
             return 0
         arr = np.asarray(arr, dtype=np.float32)
@@ -540,8 +788,7 @@ class EmbeddingCollector:
             return 0
         if self.dim is not None and arr.shape[1] != self.dim:
             raise ValueError(f"EmbeddingCollector.load_npz: dim mismatch {arr.shape[1]} != {self.dim}")
-        for row in arr:
-            self._embs.append(row.copy())
+        self._embs.extend(row.copy() for row in arr)
         return int(arr.shape[0])
 
     def trim_to(self, n: int) -> None:
@@ -549,6 +796,18 @@ class EmbeddingCollector:
         if len(self._embs) <= n:
             return
         del self._embs[n:]
+
+    def to_array(self) -> np.ndarray:
+        if not self._embs:
+            return np.zeros((0, int(self.dim or 0)), dtype=np.float32)
+        return np.vstack(self._embs).astype(np.float32, copy=False)
+
+    def get_many(self, indices) -> np.ndarray:
+        idx = [int(i) for i in (indices or []) if int(i) >= 0]
+        if not idx:
+            return np.zeros((0, int(self.dim or 0)), dtype=np.float32)
+        arr = self.to_array()
+        return arr[idx, :] if arr.size else np.zeros((0, int(self.dim or 0)), dtype=np.float32)
 
 def build_generation_from_objects(
     *,
@@ -621,7 +880,7 @@ def build_v2_manifest_from_tracks(
         collector: EmbeddingCollector | None = None, 
 ) -> Dict[str, Any]:
     """
-    returns (manifest, emb_collector).
+    returns manifest.
     - If cfg.emb_store is 'inline', embeddings are embedded into obs.
     - If cfg.emb_store is 'sidecar', obs carry 'emb_idx' and vectors are kept
       in the returned EmbeddingCollector for the caller to materialize.
@@ -664,10 +923,9 @@ def build_v2_manifest_from_tracks(
 
             centers = _track_center_series(t)
             if centers and W and H and np is not None:
-                import numpy as _np
-                cx_series = _np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
-                cy_series = _np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
-                std_c = float((_np.var(cx_series) + _np.var(cy_series)) ** 0.5)
+                cx_series = np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
+                cy_series = np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
+                std_c = float((np.var(cx_series) + np.var(cy_series)) ** 0.5)
             else:
                 std_c = 0.0
             is_static = std_c < cfg.static_stddev_thresh_pct
@@ -675,11 +933,11 @@ def build_v2_manifest_from_tracks(
             # Normalize once and then adapt to v2.0 per-frame JSON shape
             shot_val = int(getattr(t, "shot_id", shot_number))
             track_val = int(getattr(t, "track_id", -1))
-            norm_items = normalize_obs_items_for_track(
+            items_out = normalize_obs_items_for_output(
                 obs, shot_id=shot_val, track_id=track_val, emb_collector=embc
             )
             obs_json: List[Dict[str, Any]] = []
-            for d in norm_items:
+            for d in items_out:
                 j = {
                     "f": d["f"],
                     "bbox_xyxy": d["bbox_xyxy"],
@@ -745,63 +1003,50 @@ def build_v2_manifest_from_tracks(
 
     return manifest
 
-def normalize_obs_items_for_track(
-    obs_list,
+def normalize_obs_items_for_output(
+    items: list[FaceObservation],
     *,
-    shot_id: int,
-    track_id: int,
-    emb_collector: Optional["EmbeddingCollector"] = None,
-):
-    """
-    Normalize observation objects/dicts into dicts. Always returns items with:
-      shot, track_id, f, bbox_xyxy, src in VALID_SOURCES, optional conf,
-      and optional {"embedding": [...]} or {"emb_idx": i} depending on emb_collector.mode.
-    """
-    out = []
-    for o in obs_list:
-        if isinstance(o, dict):
-            f = int(o["f"]) if "f" in o else int(getattr(o, "frame_idx"))
-            bb = o.get("bbox_xyxy")
-            if bb is None and "bbox_xywh" in o:
-                x, y, w, h = o["bbox_xywh"]
-                bb = [float(x), float(y), float(x + w), float(y + h)]
-            src = o.get("src")
-            conf = o.get("conf")
-        else:
-            f = int(getattr(o, "frame_idx"))
-            x1, y1, x2, y2 = getattr(o, "bbox")
-            bb = [float(x1), float(y1), float(x2), float(y2)]
-            src = getattr(o, "source", Source.DETECTED)
-            conf = getattr(o, "confidence", None)
+    shot_id: int | None = None,
+    track_id: int | None = None,
+    emb_collector: EmbeddingCollector | None = None,
+) -> list[dict]:
+    out: list[dict] = []
+    for ob in items:
+        if not isinstance(ob, FaceObservation):
+            raise TypeError(f"normalize_obs_items_for_output expects FaceObservation, got {type(ob).__name__}")
 
-        d = {
-            "shot": int(shot_id),
-            "track_id": int(track_id),
-            "f": f,
-            "bbox_xyxy": [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])],
-            "src": src,
+        if not isinstance(ob.source, Source):
+            raise TypeError(
+                f"Observation.source must be Source enum, got {type(ob.source).__name__}"
+            )
+
+        x1, y1, x2, y2 = map(int, ob.bbox) if ob.bbox is not None else (0, 0, 0, 0)
+        row = {
+            "f": int(ob.frame_idx),
+            "bbox_xyxy": [x1, y1, x2, y2],
+            # JSON schema expects a string ("detected"/"tracked"/"flow"); disk sidecars use int codes.
+            "src": str(ob.source),
         }
-        # optional confidence
-        if conf is not None:
-            d["conf"] = float(conf)
 
-        # optional embedding (inline or sidecar index)
+        if ob.confidence is not None:
+            row["conf"] = float(ob.confidence)
+
+        # If caller supplied track/shot, include them (some exporters like having it)
+        if track_id is not None:
+            row["track_id"] = int(track_id)
+        if shot_id is not None:
+            row["shot"] = int(shot_id)
+
+        # Attach embedding (inline or sidecar index) if requested
         if emb_collector is not None:
-            v = (o.get("embedding") if isinstance(o, dict) else getattr(o, "embedding", None))
-            if v is not None:
-                if hasattr(emb_collector, "fields_for_json"):
-                    # Preferred path: use helper that also satisfies checkpoint API.
-                    d.update(emb_collector.fields_for_json(v))
-                else:
-                    # Back-compat: some collectors return dicts from assign(...),
-                    # while others (checkpoint-facing) return an int index.
-                    res = emb_collector.assign(v)
-                    if isinstance(res, dict):
-                        d.update(res)
-                    elif isinstance(res, int) and res >= 0:
-                        d["emb_idx"] = int(res)
+            # You’ll pass the actual vector in your caller, but if it’s already on the FaceObservation
+            # (e.g., ob.embedding), wire it through; otherwise leave empty.
+            vec = getattr(ob, "embedding", None)
+            fields = emb_collector.fields_for_json(vec)
+            if fields:
+                row.update(fields)
 
-        out.append(d)
+        out.append(row)
     return out
 
 def write_v2_json(path: str, manifest: Dict[str, Any]) -> str:
@@ -851,21 +1096,10 @@ def build_v2_1_manifest_from_tracks(
     if cfg.video_size is not None: video["size"] = [int(cfg.video_size[0]), int(cfg.video_size[1])]
     if cfg.total_frames is not None: video["total_frames"] = int(cfg.total_frames)
 
-    shots_out: list[dict] = []
-
-    # Helper: get emb_idx for an observation
-    def _emb_idx_for_obs(o) -> int:
-        if emb_collector is None:
-            return -1
-        v = getattr(o, "embedding", None)
-        if v is None:
-            return -1
-        # assign returns {"emb_idx": i} or {} (no inline in 2.1)
-        out = emb_collector.assign(v)
-        return int(out.get("emb_idx", -1))
+    shots: list[dict] = []
 
     for shot_number in sorted(shots_map.keys()):
-        t_out: list[dict] = []
+        tracks: list[dict] = []
         for t in shots_map[shot_number]:
             f0, f1 = _track_first_last(t)
 
@@ -885,10 +1119,9 @@ def build_v2_1_manifest_from_tracks(
             # movement heuristic (as in 2.0)
             centers = _track_center_series(t)
             if centers and W and H and np is not None:
-                import numpy as _np
-                cx_series = _np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
-                cy_series = _np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
-                std_c = float((_np.var(cx_series) + _np.var(cy_series)) ** 0.5)
+                cx_series = np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
+                cy_series = np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
+                std_c = float((np.var(cx_series) + np.var(cy_series)) ** 0.5)
             else:
                 std_c = 0.0
             is_static = std_c < cfg.static_stddev_thresh_pct
@@ -899,18 +1132,11 @@ def build_v2_1_manifest_from_tracks(
             else:
                 shot_val = int(getattr(t, "shot_id", shot_number))
                 track_val = int(getattr(t, "track_id", -1))
-                obs_items = normalize_obs_items_for_track(
-                    obs,
-                    shot_id=shot_val,
-                    track_id=track_val,
-                    emb_collector=emb_collector,
+                obs_offset, obs_count = obs_collector.slice_for_track(
+                    shot_val, track_val
                 )
-                obs_offset, obs_count = obs_collector.append_track_obs(
-                    obs_items,
-                    emb_idx_fn=lambda d: int(d.get("emb_idx", -1)),
-                )
- 
-            t_out.append({
+                
+            tracks.append({
                 "first_frame": int(f0),
                 "last_frame": int(f1),
                 "face_label": _track_label(t),
@@ -923,25 +1149,28 @@ def build_v2_1_manifest_from_tracks(
                 "obs_count": int(obs_count),
             })
 
-        if not t_out:
+        if not tracks:
             continue
-        shot_first = min(ft["first_frame"] for ft in t_out)
-        shot_last  = max(ft["last_frame"] for ft in t_out)
-        shots_out.append({
+        shot_first = min(ft["first_frame"] for ft in tracks)
+        shot_last  = max(ft["last_frame"] for ft in tracks)
+        shots.append({
             "shot_number": int(shot_number),
             "first_frame": int(shot_first),
             "last_frame": int(shot_last),
-            "num_tracks": int(len(t_out)),
-            "face_tracks": t_out,
+            "num_tracks": int(len(tracks)),
+            "face_tracks": tracks,
         })
 
     manifest: dict = {
         "schema_version": SCHEMA_VERSION_V2_1,
         "video": video,
-        "shots": shots_out,
+        "shots": shots,
     }
+    # Face metadata: prefer caller; otherwise derive from the observations (canonical)
     if face_metadata is not None:
         manifest["face_metadata"] = face_metadata
+    elif obs_collector is not None:
+        manifest["face_metadata"] = _derive_face_metadata_from_tracks(shots)
 
     if generation:
         base_gen = build_generation({"emb_store": ("sidecar" if emb_collector else "none")})

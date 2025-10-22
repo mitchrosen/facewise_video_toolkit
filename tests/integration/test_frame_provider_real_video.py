@@ -12,7 +12,7 @@ def _resolve_video_path() -> str:
     env = os.environ.get("FACEKIT_TEST_VIDEO")
     if env and Path(env).exists():
         return env
-    candidate = Path(__file__).parents[2] / "tests" / "data" / "interview-sam-altman_5sec_snippet.mp4"
+    candidate = Path(Path(__file__).parents[2], "tests", "data", "interview-sam-altman_5sec_snippet.mp4")
     if candidate.exists():
         return str(candidate)
     pytest.skip("Set FACEKIT_TEST_VIDEO or place the sample video at tests/data/…")

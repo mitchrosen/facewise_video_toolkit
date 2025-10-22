@@ -33,7 +33,7 @@ def test_frame_indices():
 
 def test_add_and_retrieve_bboxes():
     track = FaceTrack(shot_id=0, track_id=1)
-    assert track.last_frame() == -1
+    assert (track.last_frame() is None)
     assert track.get_first_bbox() is None
     assert track.get_last_bbox() is None
 
