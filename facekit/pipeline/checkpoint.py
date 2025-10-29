@@ -13,16 +13,24 @@ import shutil
 import logging
 from facekit.errors import ResumeSafetyError
 from facekit.utils.io import fsync_parent_dir
+from facekit.pipeline.track_order import (
+    track_order_dict_to_list,
+    track_order_list_to_dict,
+    track_order_add,
+    track_order_summary,
+    TrackOrderError,
+)
 
 from facekit.common.obs_consts import Source, SRC_TO_CODE
 
-REQUIRED_SCHEMA_VERSION = "2.1"
+REQUIRED_SCHEMA_VERSION = "2.3"
 
 class TrackingCheckpoint(Protocol):
     # lifecycle/progress
     def on_frame(self, frame_idx: int) -> None: ...
     def on_shot_done(self) -> None: ...
     def on_new_tracks(self, n: int) -> None: ...
+    def get_track_order(self) -> dict[tuple[int, int], int]: ...
 
     # checkpointing
     def checkpoint_now(
@@ -32,14 +40,13 @@ class TrackingCheckpoint(Protocol):
             shot_number: int,
             shot_first_frame: int | None,
             note: str = "checkpoint") -> None: ...
-
+    
     # persistence
     def add_observations(self, shot_number: int, frame_idx: int, observations: List["FaceObservation"]) -> int: ...
     def add_embeddings(self, shot_number: int, track_id: int, frame_idx_last: int, embs: np.ndarray) -> int: ...
 
     # resuming
-    # Return (frame_idx, shot_number, shot_first_frame) or None for fresh run.
-    def get_resume_anchor(self) -> tuple[int, int, int] | None: ...
+    def get_resume_anchor(self) -> tuple[int, int, int] | None: ...     # Return (frame_idx, shot_number, shot_first_frame) or None for fresh run.
 
 _PROTECTED_KEYS = (
     "video_path",
@@ -63,6 +70,7 @@ def _video_parent_dir(default_root: Path, video_path: Path) -> Path:
     return default_root / f"{video_path.stem}__{h}"
 
 def _atomic_write_bytes(dst: Path, data: bytes) -> None:
+    logging.debug("in checkpoint._atomic_write_bytes - about to atomic write")
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=dst.parent, delete=False) as tmp:
@@ -72,9 +80,12 @@ def _atomic_write_bytes(dst: Path, data: bytes) -> None:
         tmp_path = Path(tmp.name)
     os.replace(tmp_path, dst)
     fsync_parent_dir(dst)
+    logging.debug("in checkpoint._atomic_write_bytes - just atomic written")
 
 def _atomic_write_text(dst: Path, text: str) -> None:
+    logging.debug("in checkpoint._atomic_write_text - about to call _atomic_write_bytes()")
     _atomic_write_bytes(dst, text.encode("utf-8"))
+    logging.debug("in checkpoint._atomic_write_text - just to called _atomic_write_bytes()")
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -111,6 +122,8 @@ class CheckpointStatus:
     checkpoint_dir: str
     log_level: str
     log_file: str | None
+    track_order: list[dict] | None = None
+
     # misc
     note: str = ""
 
@@ -156,11 +169,19 @@ class CheckpointManager (TrackingCheckpoint):
 
         # Resume
         self.resume_enabled = bool(resume)
+        self._shot_track_to_order: dict[tuple[int,int], int] = {}
+        self._next_track_order: int = 0
 
         # Counters
         self._frames_done = 0
         self._shots_done = 0
         self._tracks_seen = 0
+
+        # Pre-detection cursor (resume starts *on* this frame)
+        self._pending_det_shot: int | None = None
+        self._pending_det_frame: int | None = None
+        self._pending_det_shot_first: int | None = None
+        self._pending_det_reason: str | None = None
 
         # Detection anchors
         self._last_det_frame: int | None = None
@@ -179,27 +200,101 @@ class CheckpointManager (TrackingCheckpoint):
     # ---------- public API ----------
 
     def start(self,
-              obs_collector,
-              emb_collector,
-              *,
-              tracks_seen: int = 0,
-              shots_done: int = 0,
-              frames_done: int = 0,
-              options_snapshot: dict[str, _t.Any] | None = None) -> None:
+            obs_collector,
+            emb_collector,
+            *,
+            tracks_seen: int = 0,
+            shots_done: int = 0,
+            frames_done: int = 0,
+            options_snapshot: dict[str, _t.Any] | None = None) -> None:
+        """
+        Bind collectors & counters and prepare track-order state.
+
+        Rules:
+        - If resuming and track_order is already in memory (e.g., restored by
+            load_and_anchor_collectors), preserve it and advance _next_track_order.
+        - Else, if resuming, rehydrate track_order from status.json (if present).
+        - Else (fresh run), start with an empty track_order.
+        """
         self._obs = obs_collector
         self._emb = emb_collector
         self._tracks_seen = int(tracks_seen)
         self._shots_done = int(shots_done)
         self._frames_done = int(frames_done)
         self._cfg = dict(options_snapshot or {})
-        self._write_status("checkpointing started")
+
+        if self.resume_enabled:
+            status = self.read_status() or {}
+
+            # ---- Pre-hydrate detection anchors BEFORE the first write ----
+            try:
+                if self._last_det_frame is None:
+                    last_det_frame = status.get("last_detection_frame")
+                    if last_det_frame is not None:
+                        self._last_det_frame = int(last_det_frame)
+                if self._last_det_shot is None:
+                    last_det_shot = status.get("last_detection_shot")
+                    if last_det_shot is not None:
+                        self._last_det_shot = int(last_det_shot)
+                if self._last_det_shot_first_frame is None:
+                    last_det_shot_first_frame = status.get("last_detection_shot_first_frame")
+                    if last_det_shot_first_frame is not None:
+                        self._last_det_shot_first_frame = int(last_det_shot_first_frame)
+                if not self._obs_rows_at_det:
+                    last_det_obs_rows = status.get("obs_rows_at_last_detection")
+                    if last_det_obs_rows is not None:
+                        self._obs_rows_at_det = int(last_det_obs_rows)
+                if not self._emb_rows_at_det:
+                    last_det_emb_rows = status.get("emb_rows_at_last_detection")
+                    if last_det_emb_rows is not None:
+                        self._emb_rows_at_det = int(last_det_emb_rows)
+            except Exception:
+                # Non-fatal: resume can still proceed without these hints.
+                pass
+
+            if self._shot_track_to_order:
+                # Already restored upstream (e.g., load_and_anchor_collectors) -> keep it.
+                self._next_track_order = max(self._shot_track_to_order.values(), default=-1) + 1
+                logging.debug(
+                    "ckpt.start: preserving pre-populated track_order (entries=%d) next=%d",
+                    len(self._shot_track_to_order), self._next_track_order
+                )
+            else:
+                # Resume requested but nothing in memory yet -> rehydrate from status.json.
+                shot_track_order_list = status.get("track_order") or []
+                try:
+                    self._shot_track_to_order, self._next_track_order = track_order_list_to_dict(
+                        shot_track_order_list, strict=True
+                    )
+                    logging.info(
+                        "ckpt.start: rehydrated track_order: %s",
+                        track_order_summary(self._shot_track_to_order),
+                    )
+                except TrackOrderError as e:
+                    logging.warning("ckpt.start: corrupt/legacy track_order; starting empty (%s)", e)
+                    self._shot_track_to_order = {}
+                    self._next_track_order = 0
+        else:
+            # Fresh run.
+            self._shot_track_to_order = {}
+            self._next_track_order = 0
+            logging.debug("ckpt.start: initializing empty track_order (fresh run).")
+
+        # --- Always write an initial status snapshot ---
+        try:
+            logging.debug("ckpt.start: writing initial status.json")
+            self._write_status("checkpointing started")
+        except Exception as e:
+            logging.exception("ckpt.start: initial status write failed: %s", e)
 
     def on_new_tracks(self, n: int) -> None:
         self._tracks_seen += int(n)
 
     def on_shot_done(self) -> None:
         self._shots_done += 1
+        logging.debug("in checkpoint.on_shot_done - about to call _write_status()")
         self._write_status("shot boundary")
+        logging.debug("in checkpoint.on_shot_done - just called _write_status()")
 
     def on_frame(self, frame_idx: int) -> None:
         # Called for every processed frame (0-based)
@@ -213,22 +308,32 @@ class CheckpointManager (TrackingCheckpoint):
         if self._obs is None or not observations:
             return 0
 
+        # Track if we discovered any brand-new (shot, track_id) pairs.
+        track_order_changed = False
+
         # Group by track_id (required by ObservationsCollector)
         by_tid = {}
         for obs in observations:
             if obs.track_id is None:
-                # Skip unassigned (shouldn't happen here, but be defensive)
                 continue
             by_tid.setdefault(int(obs.track_id), []).append(obs)
 
         total = 0
         for tid, obs_list in by_tid.items():
+            key = (int(shot_number), int(tid))
+            # Decide/record persisted order exactly once per (shot, tid).
+            if key not in self._shot_track_to_order:
+                self._next_track_order = track_order_add(
+                    self._shot_track_to_order,
+                    shot=shot_number,
+                    track_id=tid,
+                    next_order=self._next_track_order,
+                )
+                track_order_changed = True
+
             rows = []
             for obs in obs_list:
-                # Use the source from the observation if present; default to DETECTED
-                src_val = getattr(obs, "source", None)
-                src_val = src_val if src_val is not None else Source.DETECTED
-
+                src_val = getattr(obs, "source", None) or Source.DETECTED
                 rows.append({
                     "shot": int(shot_number),
                     "track_id": int(tid),
@@ -237,7 +342,6 @@ class CheckpointManager (TrackingCheckpoint):
                     "src": src_val,
                     **({"conf": float(obs.confidence)} if getattr(obs, "confidence", None) is not None else {}),
                 })
-
 
             # emb_idx is unknown here; set to -1 via emb_idx_fn
             _, k = self._obs.append_track_obs(rows, emb_idx_fn=lambda _o: -1)
@@ -248,6 +352,20 @@ class CheckpointManager (TrackingCheckpoint):
             shot_number, frame_idx, len(by_tid), total
         )
 
+        # *** Dirty-flag: persist updated track_order immediately so resume has it. ***
+        if track_order_changed:
+            try:
+                entries = len(self._shot_track_to_order)
+            except Exception:
+                entries = -1
+            logging.info(
+                "ckpt:track_order persisted: entries=%d (shot=%s, frame=%s)",
+                entries, int(shot_number), int(frame_idx)
+            )
+            logging.debug("in checkpoint.add_observations - about to call _write_status()")
+            self._write_status("track_order updated")
+            logging.debug("in checkpoint.add_observations - just called _write_status()")
+    
         return total
 
     def add_embeddings(self, shot_number: int, track_id: int, frame_idx_last: int, embs: np.ndarray) -> int:
@@ -282,7 +400,7 @@ class CheckpointManager (TrackingCheckpoint):
             )
 
         # Find candidate obs rows to link (ascending by frame)
-        cand_rows = find_rows(
+        candidate_rows = find_rows(
             shot=int(shot_number),
             track_id=int(track_id),
             frame_last=int(frame_idx_last),
@@ -290,17 +408,17 @@ class CheckpointManager (TrackingCheckpoint):
             only_with_crop=True,
             source=SRC_TO_CODE[Source.DETECTED],
         )
-        if not cand_rows:
+        if not candidate_rows:
             raise ResumeSafetyError(
                 f"[ckpt] no candidate observation rows to receive embeddings for shot={shot_number} track={track_id}."
             )
 
         # Map newest K crops (keep order)
-        if len(cand_rows) >= cnt:
-            target_rows = cand_rows[-cnt:]
+        if len(candidate_rows) >= cnt:
+            target_rows = candidate_rows[-cnt:]
         else:
             raise ResumeSafetyError(
-                f"[ckpt] fewer observation rows with crops ({len(cand_rows)}) than embeddings ({cnt}) "
+                f"[ckpt] fewer observation rows with crops ({len(candidate_rows)}) than embeddings ({cnt}) "
                 f"for shot={shot_number} track={track_id}."
             )
 
@@ -324,31 +442,31 @@ class CheckpointManager (TrackingCheckpoint):
         if self._obs is None or self._emb is None:
             return
 
-        # Save collectors as they existed BEFORE this detection.
-        # Always produce files (even if empty) so resume/findability is stable.
-        self._obs.dump_npz(self.obs_path)
         obs_count = self._obs.count()
-        self._emb.dump_npz(self.emb_path)
         emb_count = self._emb.count()
-
+ 
         self._last_det_frame = int(frame_idx)
         self._last_det_shot = int(shot_number)
         self._last_det_shot_first_frame = (int(shot_first_frame) if shot_first_frame is not None else None)
-
         self._obs_rows_at_det = max(0, obs_count)
         self._emb_rows_at_det = max(0, emb_count)
 
+        self._obs.dump_npz(self.obs_path)
+        self._emb.dump_npz(self.emb_path)
+        
         logging.info(
             "ckpt:snapshot frame=%s shot=%s obs_rows=%d emb_rows=%d files=(%s, %s)",
             frame_idx, shot_number, obs_count, emb_count, self.obs_path, self.emb_path
         )
 
+        logging.debug("in checkpoint.checkpoint_now - about to call _write_status()")
         self._write_status(note or "checkpoint")
+        logging.debug("in checkpoint.checkpoint_now - just called _write_status()")
 
     def matches_video(self, video_path: _t.Union[str, Path]) -> bool:
         """Return True if the stored checkpoint was created for this video path."""
-        st = self.read_status()
-        return bool(st and str(st.get("video_path")) == str(video_path))
+        status = self.read_status()
+        return bool(status and str(status.get("video_path")) == str(video_path))
 
     def finalize(self, note: str = "final") -> None:
         # Ensure sidecars exist even if no detection checkpoint happened.
@@ -358,15 +476,70 @@ class CheckpointManager (TrackingCheckpoint):
             self._emb.dump_npz(self.emb_path)
         self._write_status(note)
 
+    def copy_ckpt_sidecars_to_final(
+        self,
+        obs_sidecar_path: str | None = None,
+        emb_sidecar_path: str | None = None,
+    ) -> None:
+        """
+        Export sidecars from the live checkpoint directory to the final locations.
+        Copy the observations NPZ verbatim so the final file contains a single 
+        structured array under the key `'observations'`
+        with fields: f, shot, track_id, bbox_xyxy, src, conf, emb_idx.
+        Embeddings are also copied verbatim.
+        Safe no-ops if a given source file doesn't exist or a target path is None.
+        """
+        try:
+            if obs_sidecar_path:
+                src = self.ckpt_dir / "obs_ckpt.npz"
+                if src.exists():
+                    shutil.copy2(src, obs_sidecar_path)
+                    logging.info("ckpt:export wrote legacy structured obs sidecar -> %s", obs_sidecar_path)
+                else:
+                    logging.info("ckpt:export obs sidecar missing at %s", src)
+
+            if emb_sidecar_path:
+                src = self.ckpt_dir / "emb_ckpt.npz"
+                if src.exists():
+                    shutil.copy2(src, emb_sidecar_path)
+                    logging.info("ckpt:export copied emb sidecar -> %s", emb_sidecar_path)
+                else:
+                    logging.info("ckpt:export emb sidecar missing at %s", src)
+
+        except Exception as e:
+            # Do not crash pipeline completion if export copy fails; just log.
+            logging.error("ckpt:export failed: %s", e)
+
+    def mark_completed(self) -> None:
+        """
+        Mark the run as completed in status.json. This enables 'resume-for-outputs'
+        semantics without adding any special CLI switches.
+        """
+        status = self.read_status()
+        status["completed"] = True
+        status["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        self._write_status(status)
+        logging.info("ckpt:run marked completed")
+
     @staticmethod
     def compute_parent_dir(default_root: Path, video_path: Path) -> Path:
         return _video_parent_dir(default_root=default_root, video_path=video_path)
 
     # ---------- resume helpers ----------
+    def get_track_order(self) -> dict[tuple[int, int], int]:
+        return dict(self._shot_track_to_order)
 
     def get_resume_anchor(self):
+        # If we haven't computed it in this process, try to read from status.json.
         if self._last_det_frame is None:
-            return None
+            status = self.read_status() or {}
+            lf = status.get("last_detection_frame")
+            if lf is None:
+                return None
+            # Fill all three fields so subsequent calls are fast/consistent.
+            self._last_det_frame = int(lf)
+            self._last_det_shot = int(status.get("last_detection_shot", -1))
+            self._last_det_shot_first_frame = int(status.get("last_detection_shot_first_frame", 0))
         return (self._last_det_frame, self._last_det_shot, self._last_det_shot_first_frame)
     
     def resume_available(self) -> bool:
@@ -465,8 +638,16 @@ class CheckpointManager (TrackingCheckpoint):
              obs_rows, emb_rows, self.obs_path, self.emb_path)
         return obs_rows, emb_rows
     
-        # ---------- run-dir factory ----------
-
+    def anchor_frame(self) -> int | None:
+        return self._last_det_frame
+    
+    def anchor_shot(self) -> int | None:
+        return self._last_det_shot
+    
+    def anchor_shot_first_frame(self) -> int | None:
+        return self._last_det_shot_first_frame
+    
+    # ---------- run-dir factory ----------
     @classmethod
     def open(
         cls,
@@ -474,9 +655,9 @@ class CheckpointManager (TrackingCheckpoint):
         parent_dir: Path,
         video_path: Path,
         options_snapshot: dict,
-        resume: bool,                     # load & trim collectors from NPZs in the chosen dir
-        run_id: str | None = None,        # choose this exact run dir
-        resume_latest: bool = False,      # otherwise choose newest existing run dir
+        no_resume: bool,
+        run_id: str | None = None,
+        resume_latest: bool = False,
         force_new_run: bool = False,
     ) -> "CheckpointManager":
         """
@@ -488,20 +669,18 @@ class CheckpointManager (TrackingCheckpoint):
         - Else create a fresh `run-<timestamp>-<hash>` subdirectory.
 
         Modes:
-        - resume=True:
-            Load existing checkpoint artifacts (status.json, ckpt/*.npz) when the selected
-            run directory exists. If the selected directory does not exist (e.g. no
-            previous runs and `resume_latest=True`), this method will *downgrade* to
-            resume=False and log a warning, then proceed with a new run directory.
+        - no_resume
+            When true, forbid the loading of existing checkpoint artifacts (status.json, ckpt/*.npz).
+
         - force_new_run=True:
             Start clean in the selected directory by purging checkpoint artifacts
-            (deletes `ckpt/` and `status.json`). Mutually exclusive with `resume=True`.
+            (deletes `ckpt/` and `status.json`).
 
         Side effects:
         - Ensures `parent_dir` exists.
         - When `force_new_run=True` and the selected directory exists, removes
-            `run_dir/ckpt` and `run_dir/status.json`, then recreates `run_dir/ckpt`.
-        - Writes/updates `status.json` with note "opened".
+        `run_dir/ckpt` and `run_dir/status.json`, then recreates `run_dir/ckpt`.
+        - Writes/updates `status.json` with note "opened" (only for new runs).
 
         Returns:
         CheckpointManager: Instance bound to the chosen `run_dir`. Its `resume_enabled`
@@ -511,53 +690,54 @@ class CheckpointManager (TrackingCheckpoint):
         FileNotFoundError: If `run_id` is specified but the directory does not exist.
         ValueError:
             - If both `run_id` and `resume_latest` are provided.
-            - If both `resume` and `force_new_run` are True.
-            - If an existing run is being targeted (`run_id` or `resume_latest`) but neither
-            `resume` nor `force_new_run` is True.
+            - If an existing run is being targeted (`run_id` or `resume_latest`) but
+            `no_resume` is True.
         """
-         
+        # Ensure parent exists before globbing
+        parent_dir = Path(parent_dir)
+        parent_dir.mkdir(parents=True, exist_ok=True)
+
+        logging.debug(
+            "ckpt.open: args run_id=%r resume_latest=%r force_new_run=%r no_resume=%r parent=%s video=%s",
+            run_id, resume_latest, force_new_run, no_resume, str(parent_dir), str(video_path)
+        )
+
         # Guard contradictions about selected dir
         if run_id and resume_latest:
-            raise ValueError("run_id and resume_latest both set the resume directory, "
-                             "can be contradictory and are mutually exclusive.")
-        
-        # Guard contradictions about behavior
-        if resume and force_new_run:
-            raise ValueError("force_new_run wipes out resume directory, "
-                             "so is mutually exclusive with resume") 
-        
-         # If targeting an existing dir, caller must choose resume or overwrite
-        if (run_id or resume_latest):
-            if not (resume or force_new_run): 
-                raise ValueError(
-                    "When selecting an existing run (run_id or resume_latest), "
-                    "either resume=True or force_new_run=True are required."
-                )            
-        
+            raise ValueError("run_id and resume_latest both select particular previous runs to resume; they are mutually exclusive.")
+
+        # If targeting an existing dir, caller must not choose no_resume
+        if (run_id or resume_latest) and no_resume:
+            raise ValueError(
+                "When selecting an existing run (run_id or resume_latest), no_resume must not also be set."
+            )
+
         # Select run directory
+        do_resume = not (no_resume or force_new_run)
+        selected_dir_exists = False
+
         if run_id:
             run_dir = parent_dir / run_id
             if not run_dir.exists():
                 raise FileNotFoundError(f"checkpoint run not found: {run_dir}")
             selected_dir_exists = True
         elif resume_latest:
-            runs = sorted([d for d in parent_dir.glob("run-*") if d.is_dir()], key=lambda p: p.name)
-            if not runs:
+            prev_runs = sorted([d for d in parent_dir.glob("run-*") if d.is_dir()], key=lambda p: p.name)
+            if prev_runs:
+                run_dir = prev_runs[-1]
+                selected_dir_exists = True
+            else:
                 # no existing; fall back to new
                 run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
-                selected_dir_exists = False
-            else:
-                run_dir = runs[-1]
-                selected_dir_exists = True
+                do_resume = False
         else:
             run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
-            selected_dir_exists = False
+            do_resume = False
 
-        # If caller asked to resume but nothing exists, either error or auto-downgrade
-        if resume and not selected_dir_exists:
-            resume = False
-            logging.warning("resume=True but no existing run directory was found to resume from."
-                           "Continuing with resume=False.")
+        logging.debug(
+            "ckpt.open: selected run_dir=%s selected_dir_exists=%s do_resume=%s",
+            str(run_dir), selected_dir_exists, do_resume
+        )
 
         # Purge directory if overwrite set and directory exists
         if selected_dir_exists and force_new_run:
@@ -565,21 +745,75 @@ class CheckpointManager (TrackingCheckpoint):
             shutil.rmtree(run_dir / "ckpt", ignore_errors=True)
             (run_dir / "ckpt").mkdir(parents=True, exist_ok=True)
             (run_dir / "status.json").unlink(missing_ok=True)
- 
-        mgr = cls(run_dir, video_path=video_path, resume=resume)
+
+        mgr = cls(run_dir, video_path=video_path, resume=do_resume)
         mgr._cfg = dict(options_snapshot or {})
 
-        logging.info(
-            "ckpt: run_dir=%s parent=%s video=%s",
-            mgr.root, parent_dir, video_path
+        # Helpful debug logging for presence/sizes of checkpoint sidecars
+        obs_sidecar_path = mgr.ckpt_dir / "obs_ckpt.npz"
+        emb_sidecar_path = mgr.ckpt_dir / "emb_ckpt.npz"
+        def _sz(p: Path) -> str:
+            try:
+                return f"{p.stat().st_size}B"
+            except Exception:
+                return "NA"
+        logging.debug(
+            "ckpt.open: ckpt files: obs=%s(%s) exists=%s | emb=%s(%s) exists=%s",
+            str(obs_sidecar_path), _sz(obs_sidecar_path), obs_sidecar_path.exists(),
+            str(emb_sidecar_path), _sz(emb_sidecar_path), emb_sidecar_path.exists(),
         )
 
-        # Only write "opened" when we're starting fresh:
-        if not selected_dir_exists or force_new_run:
-            try:
-                mgr._write_status("opened")
-            except Exception:
-                pass
+        # Inspect status
+        if do_resume:
+            status_path = mgr.status_path
+            obs_sidecar_path = mgr.ckpt_dir / "obs_ckpt.npz"
+            emb_sidecar_path = mgr.ckpt_dir / "emb_ckpt.npz"
+
+            if not status_path.exists():
+                raise ResumeSafetyError(
+                    "ckpt.open: resume requested but status.json is missing. "
+                    "Cannot verify anchors or resume-safety. "
+                    "Use --force-new-run or --no-resume to start fresh."
+                )
+
+            status = mgr.read_status() or {}
+            # Extract minimal signals of progress/anchors
+            frames_done = int(status.get("frames_done", 0) or 0)
+            shots_done  = int(status.get("shots_done", 0) or 0)
+            obs_anchor  = int(status.get("obs_rows_at_last_detection", 0) or 0)
+            emb_anchor  = int(status.get("emb_rows_at_last_detection", 0) or 0)
+            track_order = status.get("track_order") if isinstance(status.get("track_order"), list) else []
+            had_progress = any([
+                frames_done > 0, shots_done > 0,
+                obs_anchor > 0, emb_anchor > 0,
+                len(track_order) > 0
+            ])
+
+            mgr._had_prior_progress = bool(had_progress)
+
+            have_obs = obs_sidecar_path.exists()
+            have_emb = emb_sidecar_path.exists()
+
+            if had_progress:
+                # Anchors or track_order imply we should already have sidecars present (possibly empty).
+                # If anchors > 0, the corresponding sidecar MUST exist.
+                if not have_obs:
+                    raise ResumeSafetyError(
+                        f"ckpt.open: inconsistent checkpoint: obs_anchor={obs_anchor} "
+                        f"but {obs_sidecar_path} is missing."
+                    )
+                if not have_emb:
+                    raise ResumeSafetyError(
+                        f"ckpt.open: inconsistent checkpoint: emb_anchor={emb_anchor} "
+                        f"but {emb_sidecar_path} is missing."
+                    )
+            else:
+                # No progress - missing sidecars normal at the very beginning.
+                logging.debug(
+                    "ckpt.open: status present but no prior progress; sidecars present? obs=%s emb=%s",
+                    have_obs, have_emb
+                )
+
 
         return mgr
 
@@ -609,11 +843,11 @@ class CheckpointManager (TrackingCheckpoint):
         Returns a list of (key, was, now) for protected keys that differ.
         Missing status.json yields [].
         """
-        st = self.read_status() or {}
+        status = self.read_status() or {}
         diffs = []
         for k in _PROTECTED_KEYS:
-            if str(st.get(k)) != str(current.get(k)):
-                diffs.append((k, st.get(k), current.get(k)))
+            if str(status.get(k)) != str(current.get(k)):
+                diffs.append((k, status.get(k), current.get(k)))
         return diffs
 
     def validate_resume_or_raise(self, current: dict, *, force: bool) -> bool:
@@ -626,16 +860,16 @@ class CheckpointManager (TrackingCheckpoint):
         if not self.resume_available():
             return False
 
-        st = self.read_status() or {}
+        status = self.read_status() or {}
 
         # hard stop: different video (we’re inside a run for a specific video)
-        if str(st.get("video_path")) != str(current.get("video_path")):
+        if str(status.get("video_path")) != str(current.get("video_path")):
             raise ResumeSafetyError(
-                f"[resume safety] video_path mismatch: was {st.get('video_path')!r}, now {current.get('video_path')!r}"
+                f"[resume safety] video_path mismatch: was {status.get('video_path')!r}, now {current.get('video_path')!r}"
             )
         
-            # Hard stop: schema mismatch
-        sv = str(st.get("schema_version", ""))
+        # Hard stop: schema mismatch
+        sv = str(status.get("schema_version", ""))
         if sv != REQUIRED_SCHEMA_VERSION:
             raise ResumeSafetyError(
                 f"[resume safety] unsupported checkpoint schema: found {sv!r}, "
@@ -651,6 +885,18 @@ class CheckpointManager (TrackingCheckpoint):
 
         return True  # OK to resume
 
+    def _log_track_order_summary(self, where: str) -> None:
+        ko = self._shot_track_to_order
+        shots = sorted({s for (s, _) in ko})
+        total = len(ko)
+        # sample the first few keys deterministically
+        sample = sorted(ko.items(), key=lambda kv: kv[1])[:10]
+        logging.info(
+            "ckpt:track_order %s: entries=%d shots=%s next=%d sample(first10 by order)=%s",
+            where, total, shots, self._next_track_order,
+            [((s,t), ko[(s,t)]) for (s,t), _ in sample]
+        )
+    
     def load_and_anchor_collectors(
         self,
         obs_collector,
@@ -664,81 +910,105 @@ class CheckpointManager (TrackingCheckpoint):
         Returns (loaded_obs_rows, loaded_emb_rows).
         """
         loaded_obs, loaded_emb = self.load_into_collectors(obs_collector, emb_collector)
-        self._validate_collectors_schema(obs_collector, emb_collector) 
+        self._validate_collectors_schema(obs_collector, emb_collector)
 
-        # Capture counts BEFORE any trimming for the log
+        # Counts BEFORE any trimming (for logging)
         pre_obs = getattr(obs_collector, "count", lambda: None)()
         pre_emb = getattr(emb_collector, "count", lambda: None)()
 
-        if trim_to_anchor:
-            st = self.read_status() or {}
+        # Read status ONCE
+        status = self.read_status() or {}
+        shot_track_order_list = status.get("track_order") or []
 
-            # Safe fetch with sane defaults
-            od = int(st.get("obs_rows_at_last_detection", 0) or 0)
-            ed = int(st.get("emb_rows_at_last_detection", 0) or 0)
-            lf = st.get("last_detection_frame")  # may be None
-            ls = st.get("last_detection_shot")   # may be None
-            lfirst = st.get("last_detection_shot_first_frame")
-
-            self._last_det_frame = (int(lf) if lf is not None else None)
-            self._last_det_shot  = (int(ls) if ls is not None else None)
-            self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
-            self._obs_rows_at_det = int(od)
-            self._emb_rows_at_det = int(ed)
-
-            # Nothing to trim to — log and exit
-            if (od == 0 and ed == 0):
-                logging.info(
-                    "ckpt:anchor no anchor present; pre_obs=%s pre_emb=%s loaded_obs=%s loaded_emb=%s",
-                    pre_obs, pre_emb, loaded_obs, loaded_emb
-                )
-                return loaded_obs, loaded_emb
-
-            # If anchor exceeds what we loaded, that indicates corrupted/incomplete NPZ.
-            if (pre_obs is not None and od > pre_obs) or (pre_emb is not None and ed > pre_emb):
-                logging.warning(
-                    "ckpt:anchor anchor beyond loaded rows; "
-                    "anchor_obs=%d anchor_emb=%d pre_obs=%s pre_emb=%s frame=%s shot=%s",
-                    od, ed, pre_obs, pre_emb, lf, ls
-                )
-                # Best-effort clamp to what we have
-                od = min(od, pre_obs or od)
-                ed = min(ed, pre_emb or ed)
-
-            # Do the trimming (guard each independently)
-            try:
-                if od and hasattr(obs_collector, "trim_to"):
-                    obs_collector.trim_to(int(od))
-            except Exception as e:
-                logging.exception("ckpt:anchor obs trim_to(%d) failed: %s", od, e)
-
-            try:
-                if ed and hasattr(emb_collector, "trim_to"):
-                    emb_collector.trim_to(int(ed))
-            except Exception as e:
-                logging.exception("ckpt:anchor emb trim_to(%d) failed: %s", ed, e)
-
-            # Post-trim counts
-            post_obs = getattr(obs_collector, "count", lambda: None)()
-            post_emb = getattr(emb_collector, "count", lambda: None)()
-
-            # Final summary line — this is the one you usually watch
-            logging.info(
-                "ckpt:anchor trimmed obs %s→%s (obs_anchor=%d) emb %s→%s (emb_anchor=%d) @ frame=%s shot=%s",
-                pre_obs, post_obs, od, pre_emb, post_emb, ed, lf, ls
+        # Restore track-order (once, early)
+        try:
+            self._shot_track_to_order, self._next_track_order = track_order_list_to_dict(
+                shot_track_order_list, strict=True
             )
-        else:
+        except TrackOrderError as e:
+            logging.warning("ckpt:track_order invalid; starting empty (%s)", e)
+            self._shot_track_to_order = {}
+            self._next_track_order = 0
+
+        # Summarize what we restored
+        try:
+            shots_present = sorted({s for (s, _) in self._shot_track_to_order})
+        except Exception:
+            shots_present = []
+        logging.info(
+            "ckpt:track_order resumed: %s",
+            track_order_summary(self._shot_track_to_order),
+        )
+
+        if not trim_to_anchor:
             logging.debug(
-                "ckpt:anchor trimming disabled; loaded_obs=%s loaded_emb=%s", loaded_obs, loaded_emb
+                "ckpt:anchor trimming disabled; loaded_obs=%s loaded_emb=%s",
+                loaded_obs, loaded_emb
             )
+            return loaded_obs, loaded_emb
+
+        # ---- Trim to anchor (use the same status dict) ----
+        orig_od = int(status.get("obs_rows_at_last_detection", 0) or 0)
+        orig_ed = int(status.get("emb_rows_at_last_detection", 0) or 0)
+        lf = status.get("last_detection_frame")   # may be None
+        ls = status.get("last_detection_shot")    # may be None
+        lfirst = status.get("last_detection_shot_first_frame")
+
+        self._last_det_frame = (int(lf) if lf is not None else None)
+        self._last_det_shot  = (int(ls) if ls is not None else None)
+        self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
+        self._obs_rows_at_det = int(orig_od)
+        self._emb_rows_at_det = int(orig_ed)
+
+        if orig_od == 0 and orig_ed == 0:
+            logging.info(
+                "ckpt:anchor no anchor present; pre_obs=%s pre_emb=%s loaded_obs=%s loaded_emb=%s",
+                pre_obs, pre_emb, loaded_obs, loaded_emb
+            )
+            return loaded_obs, loaded_emb
+
+        # Clamp if status claims more than we loaded (corrupt/incomplete NPZs)
+        od = min(orig_od, pre_obs or orig_od) if pre_obs is not None else orig_od
+        ed = min(orig_ed, pre_emb or orig_ed) if pre_emb is not None else orig_ed
+        if od != orig_od or ed != orig_ed:
+            logging.warning(
+                "ckpt:anchor requested beyond loaded rows; "
+                "requested(obs=%d, emb=%d) clamped_to(obs=%d, emb=%d) pre_obs=%s pre_emb=%s frame=%s shot=%s",
+                orig_od, orig_ed, od, ed, pre_obs, pre_emb, lf, ls
+            )
+
+        # Do the trimming (each independently)
+        try:
+            if od:
+                obs_collector.trim_to(int(od))
+        except Exception as e:
+            logging.exception("ckpt:anchor obs trim_to(%d) failed: %s", od, e)
+
+        try:
+            if ed:
+                emb_collector.trim_to(int(ed))
+        except Exception as e:
+            logging.exception("ckpt:anchor emb trim_to(%d) failed: %s", ed, e)
+
+        # Post-trim counts
+        post_obs = getattr(obs_collector, "count", lambda: None)()
+        post_emb = getattr(emb_collector, "count", lambda: None)()
+
+        # Final summary
+        logging.info(
+            "ckpt:anchor trimmed obs %s→%s (anchor %d→%d) emb %s→%s (anchor %d→%d) @ frame=%s shot=%s",
+            pre_obs, post_obs, orig_od, od,
+            pre_emb, post_emb, orig_ed, ed,
+            lf, ls
+        )
 
         return loaded_obs, loaded_emb
-
-
+    
     # ---------- internals ----------
-
     def _write_status(self, note: str) -> None:
-        # Safe defaults if start() wasn't called with a snapshot
+        # derive a stable, ordered list from the dict
+        shot_track_order_list = track_order_dict_to_list(self._shot_track_to_order)
+
         snap = {
             "schema_version": REQUIRED_SCHEMA_VERSION,
             "detect_interval": int(self._cfg.get("detect_interval", 30)),
@@ -752,6 +1022,7 @@ class CheckpointManager (TrackingCheckpoint):
             "yolo_config_path": self._cfg.get("yolo_config_path", ""),
             "shot_segmentation_path": self._cfg.get("shot_segmentation_path"),
             "checkpoint_dir": str(self.root),
+            "track_order": shot_track_order_list,
             "log_level": self._cfg.get("log_level", "INFO"),
             "log_file": self._cfg.get("log_file"),
         }
@@ -764,14 +1035,75 @@ class CheckpointManager (TrackingCheckpoint):
             tracks_seen=self._tracks_seen,
             obs_rows=(self._obs.count() if self._obs else 0),
             emb_rows=(self._emb.count() if self._emb else 0),
-
             last_detection_frame=self._last_det_frame,
             last_detection_shot=self._last_det_shot,
-            last_detection_shot_first_frame=self._last_det_shot_first_frame, 
+            last_detection_shot_first_frame=self._last_det_shot_first_frame,
             obs_rows_at_last_detection=self._obs_rows_at_det,
             emb_rows_at_last_detection=self._emb_rows_at_det,
+
             **snap,
             note=note,
         )
         _atomic_write_text(self.status_path, status.to_json())
+        logging.debug("in checkpoint._write_status - just called _atomic_write_text()")
+
+    def _rewrite_obs_npz_to_flat(self, src_path, dst_path) -> bool:
+        """
+        Load an observations NPZ from `src_path` and write a 'flat' NPZ to `dst_path`
+        with one named array per field (e.g., 'frame', 'shot_id', ...).
+        Returns True if a flat file was written, False if we fell back to a raw copy.
+        """
+        try:
+            with np.load(src_path, allow_pickle=True) as npz:
+                # Case 1: already flat (has explicit 'frame' key) -> direct copy
+                if "frame" in npz.files:
+                    shutil.copy2(src_path, dst_path)
+                    return True
+
+                # Case 2: single structured array (common for checkpoint collectors)
+                # e.g., npz.files == ['arr_0'] or ['obs']
+                if len(npz.files) == 1:
+                    key = npz.files[0]
+                    arr = npz[key]
+                    if hasattr(arr, "dtype") and arr.dtype.fields:
+                        # Build flat dict: one named array per field
+                        flat = {name: arr[name] for name in arr.dtype.names}
+                        # Guarantee we at least include 'frame' if present
+                        if "frame" in flat:
+                            np.savez(dst_path, **flat)
+                            return True
+                        # If no 'frame' field exists, still write out all fields
+                        # (the test only requires that 'frame' be present; if it's
+                        # absent in the source, we won't synthesize it.)
+                        np.savez(dst_path, **flat)
+                        return True
+
+                # Case 3: multiple arrays but none named 'frame' -> try to flatten if any is structured
+                made_flat = False
+                out = {}
+                for k in npz.files:
+                    a = npz[k]
+                    if hasattr(a, "dtype") and a.dtype.fields:
+                        for fname in a.dtype.names:
+                            out[fname] = a[fname]
+                        made_flat = True
+                    else:
+                        # keep raw arrays with their existing names
+                        out[k] = a
+                if made_flat:
+                    np.savez(dst_path, **out)
+                    return True
+
+        except Exception as e:
+            logging.error("ckpt:export rewrite failed: %s", e)
+
+        # Fallback to raw copy (may not satisfy callers that expect 'frame')
+        try:
+            shutil.copy2(src_path, dst_path)
+            return False
+        except Exception as e:
+            logging.error("ckpt:export fallback copy failed: %s", e)
+            return False
+
+   
 

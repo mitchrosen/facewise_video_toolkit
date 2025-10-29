@@ -3,15 +3,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Literal, Union, Callable
 from pathlib import Path
 import numpy as np
-import json, os, subprocess, hashlib
+import json
+import os
+import subprocess
+import hashlib
 from datetime import datetime, timezone
 from facekit.common.obs_consts import (
     Source,
     VALID_SOURCES,
     SRC_TO_CODE,
-    CODE_TO_SRC
 )
-from facekit.utils.io import fsync_parent_dir
+from facekit.utils.io import atomic_write_npz, atomic_write_npy
 
 XYXY = Tuple[float, float, float, float]
 
@@ -125,6 +127,7 @@ def _compute_params_hash(generation: Dict[str, Any]) -> str:
 
 def _emb_store_token(mode):
     return mode if mode in ("inline", "sidecar") else "none"
+
 
 ObsRow = np.dtype([
     ("f", np.int32),                 # absolute frame index
@@ -296,20 +299,14 @@ class ObservationsCollector:
         Atomically write observations to an .npz (key: 'observations').
         Always writes a valid (possibly empty) structured array.
         """
-        import tempfile, os
+
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
         final_path = out_path if out_path.suffix.lower() == ".npz" else out_path.with_suffix(".npz")
 
-        with tempfile.NamedTemporaryFile(dir=final_path.parent, suffix=".tmp", delete=False) as tmp:
-            np.savez(tmp, observations=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_name = tmp.name
-        os.replace(tmp_name, final_path)
-        fsync_parent_dir(final_path)
+        atomic_write_npz(final_path, observations=arr)
 
         return {
             "path": str(final_path),
@@ -328,27 +325,16 @@ class ObservationsCollector:
         }
 
     def dump_npz(self, out_path: Union[str, Path]) -> str:
-        from pathlib import Path
-        import tempfile, os
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        final = Path(out_path).with_suffix(".npz")
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
-        with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=".npz", delete=False) as tmp:
-            np.savez(tmp, observations=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        final = out_path.with_suffix(".npz")
-        os.replace(tmp_path, final)
-        fsync_parent_dir(final)
-
+        atomic_write_npz(final, observations=arr)
         return str(final)
 
     def load_npz(self, npz_path: Union[str, Path]) -> int:
         p = Path(npz_path)
         if not p.exists():
             return 0
-        with np.load(p) as data:
+        with np.load(p, allow_pickle=False) as data:
             arr = data.get("observations")
             if arr is None:
                 return 0
@@ -369,7 +355,7 @@ class ObservationsCollector:
         if not self._rows:
             self._count = 0
             return
-        cur = int(np.sum(r.shape[0] for r in self._rows))
+        cur = sum(int(r.shape[0]) for r in self._rows)
         if n >= cur:
             self._count = cur
             return
@@ -384,6 +370,64 @@ class ObservationsCollector:
                 self._rows[-1] = last[:keep].copy()
                 cur = n
         self._count = cur
+
+    def iter_tracks(
+        self,
+        *,
+        frame_max: int | None = None,
+        shot: int | None = None,
+        track_id: int | None = None,
+    ):
+        """
+        Iterate grouped observations as (shot, track_id, rows) triples.
+        - Coalesces across all internal blocks.
+        - Optional filters: frame_max (inclusive), shot, track_id.
+        - rows are dicts with at least: f, bbox_xyxy, src (Source enum), and optional conf.
+        Order: by (shot, track_id), and rows are ascending by frame.
+        """
+        from facekit.common.obs_consts import CODE_TO_SRC  # already present
+        groups: dict[tuple[int,int], list[dict]] = {}
+
+        # gather across blocks
+        for block in self._rows:
+            for row in block:
+                s = int(row["shot"])
+                t = int(row["track_id"])
+                if shot is not None and s != int(shot):
+                    continue
+                if track_id is not None and t != int(track_id):
+                    continue
+                f = int(row["f"])
+                if frame_max is not None and f > int(frame_max):
+                    continue
+
+                d = {
+                    "f": f,
+                    "bbox_xyxy": [
+                        float(row["bbox_xyxy"][0]),
+                        float(row["bbox_xyxy"][1]),
+                        float(row["bbox_xyxy"][2]),
+                        float(row["bbox_xyxy"][3]),
+                    ],
+                    "src": CODE_TO_SRC.get(int(row["src"])),
+                }
+                conf = float(row["conf"])
+                if not np.isnan(conf):
+                    d["conf"] = conf
+
+                groups.setdefault((s, t), []).append(d)
+
+        # sort rows within each group by frame, then yield once per group
+        for (s, t) in sorted(groups.keys()):
+            rows = groups[(s, t)]
+            rows.sort(key=lambda r: r["f"])
+            yield (s, t, rows)
+
+
+    def to_array(self) -> np.ndarray:
+        """Return a single structured array similar to what finalize_sidecar writes."""
+        return (np.concatenate(self._rows, axis=0)
+                if self._rows else np.empty(0, dtype=ObsRow))
 
 
 class EmbeddingCollector:
@@ -458,53 +502,32 @@ class EmbeddingCollector:
         idx = self.assign(v)
         return {"emb_idx": int(idx)} if idx >= 0 else {}
 
-    # === Finalization / I/O ===========================================================
     def finalize_sidecar(self, out_path: Path) -> Dict[str, Any]:
         """
         Atomic write of embeddings sidecar.
-        - If out_path has .npy -> write a single ndarray .npy
-        - Otherwise -> write .npz with key 'embeddings'
+        - write .npz with key 'embeddings'
         """
         if self.mode != "sidecar":
             return {}
 
-        import os, tempfile
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build the array to persist (handle empty collector as valid file)
         if self._embs:
             arr = np.vstack(self._embs).astype(np.float32, copy=False)
         else:
-            arr = np.zeros((0, self.dim or 0), dtype=np.float32)
+            arr = np.zeros((0, int(self.dim or 0)), dtype=np.float32)
 
-        want_npy = out_path.suffix.lower() == ".npy"
-        final_path = out_path if want_npy else out_path.with_suffix(".npz")
+        if out_path.suffix.lower() == ".npy":
+            final_path = Path(atomic_write_npy(out_path, arr))
+            fmt = "npy"
+        else:
+            final_path = Path(atomic_write_npz(out_path.with_suffix(".npz"), embeddings=arr))
+            fmt = "npz"
 
-        # Atomic write: write to an OPEN temp file handle in the same directory,
-        # flush + fsync, close, then os.replace.
-        with tempfile.NamedTemporaryFile(
-            dir=final_path.parent,
-            suffix=final_path.suffix,
-            delete=False
-        ) as tmp:
-            if want_npy:
-                np.save(tmp, arr)
-            else:
-                # Write zip stream directly to the open handle to avoid
-                # path-based races/partials.
-                np.savez(tmp, embeddings=arr)
-
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_name = tmp.name  # capture before context exits
-
-        os.replace(tmp_name, final_path)
-        fsync_parent_dir(final_path)
-        
         return {
             "path": str(final_path),
-            "format": "npy" if want_npy else "npz",
+            "format": fmt,                 # <-- keep 'format' for the tests
             "dtype": "float32",
             "dim": int(arr.shape[1]) if arr.ndim == 2 else int(self.dim or 0),
             "count": int(arr.shape[0]),
@@ -515,20 +538,9 @@ class EmbeddingCollector:
 
     def dump_npz(self, out_path: Union[str, Path]) -> str:
         """Atomically write current embeddings as NPZ to out_path and return the final path."""
-        from pathlib import Path
-        import tempfile, os
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        arr = (np.vstack(self._embs).astype(np.float32, copy=False)
-               if self._embs else np.zeros((0, self.dim or 0), dtype=np.float32))
-        with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=".npz", delete=False) as tmp:
-            np.savez(tmp, embeddings=arr)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        final = out_path.with_suffix(".npz")
-        os.replace(tmp_path, final)
-        fsync_parent_dir(final)
+        final = Path(out_path).with_suffix(".npz")
+        arr = self.to_array()
+        atomic_write_npz(final, embeddings=arr)
         return str(final)
 
     def load_npz(self, npz_path: Union[str, Path]) -> int:
@@ -536,8 +548,8 @@ class EmbeddingCollector:
         p = Path(npz_path)
         if not p.exists():
             return 0
-        data = np.load(p)
-        arr = data.get("embeddings")
+        with np.load(p, allow_pickle=False) as data:
+            arr = data.get("embeddings")
         if arr is None:
             return 0
         arr = np.asarray(arr, dtype=np.float32)
@@ -554,6 +566,18 @@ class EmbeddingCollector:
         if len(self._embs) <= n:
             return
         del self._embs[n:]
+
+    def to_array(self) -> np.ndarray:
+        if not self._embs:
+            return np.zeros((0, int(self.dim or 0)), dtype=np.float32)
+        return np.vstack(self._embs).astype(np.float32, copy=False)
+
+    def get_many(self, indices) -> np.ndarray:
+        idx = [int(i) for i in (indices or []) if int(i) >= 0]
+        if not idx:
+            return np.zeros((0, int(self.dim or 0)), dtype=np.float32)
+        arr = self.to_array()
+        return arr[idx, :] if arr.size else np.zeros((0, int(self.dim or 0)), dtype=np.float32)
 
 def build_generation_from_objects(
     *,
@@ -626,7 +650,7 @@ def build_v2_manifest_from_tracks(
         collector: EmbeddingCollector | None = None, 
 ) -> Dict[str, Any]:
     """
-    returns (manifest, emb_collector).
+    returns manifest.
     - If cfg.emb_store is 'inline', embeddings are embedded into obs.
     - If cfg.emb_store is 'sidecar', obs carry 'emb_idx' and vectors are kept
       in the returned EmbeddingCollector for the caller to materialize.

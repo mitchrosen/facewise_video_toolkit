@@ -1,12 +1,16 @@
 import argparse
 import json
+import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from contextlib import ExitStack
 import torch
-import logging, sys
-from typing import Literal
+import os
+import sys
+from typing import Literal, List, Optional
 from jsonschema import ValidationError
+from dataclasses import dataclass, field
+import logging
 
 from facekit.io.frame_provider import ReaderCoordinator
 from facekit.detection.yolo5face_model import load_yolo5face_model
@@ -14,7 +18,7 @@ from facekit.detection.face_detector import FaceDetector
 from facekit.embedding.embedder import FaceEmbedder
 from facekit.pipeline.draw_tracks import draw_tracks_on_video
 from facekit.pipeline.generate_shot_features import generate_shot_features_json
-from facekit.pipeline.track_across_segments import track_across_segments
+import facekit.pipeline.track_across_segments as track_across_segments
 from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 from facekit.tracking.face_structures import FaceTrack
@@ -30,15 +34,35 @@ from facekit.output.json_v2 import (
 )
 from facekit.errors import ResumeSafetyError
 
-def _fix_shot_coverage(shot_json_path: Path, total_frames: int) -> None:
+@dataclass
+class SimpleObs:
+    frame_idx: int
+    bbox: tuple[float, float, float, float]
+    source: str = "detected"
+    confidence: Optional[float] = None
+
+@dataclass
+class SimpleTrack:
+    shot_id: int
+    track_id: int
+    observations: List[SimpleObs] = field(default_factory=list)
+    segment_id: Optional[int] = None
+    global_id: Optional[int] = None
+    def first_frame(self) -> int:
+        return min(o.frame_idx for o in self.observations) if self.observations else 0
+    def last_frame(self) -> int:
+        return max(o.frame_idx for o in self.observations) if self.observations else -1
+
+def _fix_shot_coverage(shot_json_path: str | Path, total_frames: int) -> None:
+    p = Path(shot_json_path)
     try:
-        data = json.loads(shot_json_path.read_text())
+        data = json.loads(p.read_text())
         shots = data.get("shots", [])
         if shots:
             expected_last = max(0, int(total_frames) - 1)
             if int(shots[-1]["last_frame"]) != expected_last:
                 shots[-1]["last_frame"] = expected_last
-                shot_json_path.write_text(json.dumps(data, indent=2))
+                p.write_text(json.dumps(data, indent=2))
                 logging.info(f"[fix] Extended final shot to last_frame={expected_last} for full coverage.")
     except Exception as e:
         logging.warning(f"[warn] Could not adjust shot coverage: {e!r}")
@@ -50,6 +74,11 @@ def _device(arg_device: str) -> str:
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
 
+def _atomic_copy(src: Path, dst: Path) -> None:
+    dst = Path(dst)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
 
 def _validate_manifest_dict(
         manifest: dict, 
@@ -99,7 +128,7 @@ def run_pipeline(args):
 
         # Shots (if not provided, build to a temp file then read back)
         if args.shot_segmentation:
-            shot_json_path = str(Path(args.shot_segmentation))
+            shot_json_path = Path(args.shot_segmentation)
         else:
             with NamedTemporaryFile("w+", suffix=".json", delete=False) as tmp:
                 tmp_path = Path(tmp.name)
@@ -155,38 +184,57 @@ def run_pipeline(args):
             parent_dir=parent_ckpt_dir,
             video_path=video_path,
             options_snapshot=options_snapshot,
-            resume=(not args.no_resume),
+            no_resume=args.no_resume,
             force_new_run=bool(args.new_run),
             run_id=args.checkpoint_run_id,
             resume_latest=bool(args.resume_latest),
         )
 
+        status = ckpt.read_status() or {}
+        logging.info("status.json: last_detection_frame=%s last_detection_shot=%s",
+                    status.get("last_detection_frame"), status.get("last_detection_shot"))
         logging.info(
             "Checkpoint run selected: dir=%s | resume_enabled=%s | run_id=%s | resume_latest=%s | new_run=%s",
             ckpt.root, ckpt.resume_enabled, args.checkpoint_run_id or "-", bool(args.resume_latest), bool(args.new_run)
         )
 
         # If resume is possible, load status and *enforce* immutable params unless --force
+
+        status = ckpt.read_status() or {}
+        logging.info("resume safety: checkpoint video=%r current video=%r",
+                    status.get("video_path"), options_snapshot.get("video_path"))
+        logging.info(f"args.no_resume: {args.no_resume}, args.force={args.force}")
+
         if not args.no_resume:
             ckpt.validate_resume_or_raise(
                 options_snapshot,
                 force=args.force,
             )          
 
-        if not args.no_resume:
-            # Hydrate & anchor the SAME collectors used for the rest of the run.
-            ckpt.load_and_anchor_collectors(obs_collector, emb_collector)
-
         ckpt.start(
             obs_collector,
-           emb_collector, 
+            emb_collector, 
             frames_done=0, 
             shots_done=0, 
             tracks_seen=0,
             options_snapshot=options_snapshot)
+        
+        # Hydrate + anchor (no-op if there is nothing to resume)
+        if not args.no_resume:
+            loaded_obs, loaded_emb = ckpt.load_and_anchor_collectors(
+                obs_collector, emb_collector
+            )
+            ckpt.obs_collector = obs_collector
+            ckpt.emb_collector = emb_collector
+
+            anchor = ckpt.get_resume_anchor() 
+            logging.info(
+                "resume: hydrated collectors (obs=%d, emb=%d); anchor=%r",
+                loaded_obs, loaded_emb, anchor,
+            )
 
         # ---- tracking with progress hooks --------------------------------
-        tracks = track_across_segments(
+        tracks = track_across_segments.track_across_segments(
             frame_source=fp,
             shot_json_path=str(shot_json_path),
             detector=detector,
@@ -194,6 +242,7 @@ def run_pipeline(args):
             detect_interval=int(args.detect_interval),
             embedding_batch_size_max=int(args.embedding_batch_size_max),
             checkpoint=ckpt,
+            resume_enabled=not args.no_resume,
         )
 
         GlobalIdentityResolver().resolve_global_ids(tracks)
@@ -259,6 +308,15 @@ def run_pipeline(args):
         face_meta = derive_face_metadata(tracks)
 
         if args.schema_version == "2.0":
+            writer_collector: EmbeddingCollector | None = None
+            if emb_store == "inline":
+                writer_collector = EmbeddingCollector(mode="inline", dim=512)
+            elif emb_store == "sidecar":
+                # Reuse the runtime one so indices match what you already assigned during tracking
+                writer_collector = emb_collector
+            else:  # none
+                writer_collector = None
+
             manifest = build_v2_manifest_from_tracks(
                 tracks,
                 cfg,
@@ -268,7 +326,7 @@ def run_pipeline(args):
                 embedder=embedder,
                 tracking_params={"detect_interval": int(args.detect_interval)},
                 validator=None,
-                collector=(emb_collector if emb_store == "sidecar" else None),
+                collector=writer_collector,
             )
 
         else:  # 2.1
@@ -289,6 +347,20 @@ def run_pipeline(args):
             # finalize observations sidecar
             manifest["observations_sidecar"] = obs_collector.finalize_sidecar(obs_path)
 
+            # Ensure manifest has at least one shot, even if no faces/tracks were found.
+            shots = manifest.get("shots")
+            if not shots:
+                # Fallback: single shot covering the whole video.
+                # If total_frames is unknown/0, clamp to [0, 0].
+                last = max(total_frames - 1, 0)
+                manifest["shots"] = [{
+                    "shot_number": 1,
+                    "first_frame": 0,
+                    "last_frame": last,
+                    "num_tracks": 0,
+                    "face_tracks": []
+                }]        
+
         # ---- finalize embedding sidecar  ---------------------
         if emb_store == "sidecar":
             epath = cfg.emb_sidecar_path or video_path.with_suffix(".embeddings.npz")
@@ -305,6 +377,16 @@ def run_pipeline(args):
         logging.info(f"Wrote V2 JSON to {out_glob}")
         if "embedding_sidecar" in manifest:
             logging.info(f"Wrote embedding sidecar to {manifest['embedding_sidecar']['path']}")
+        
+        if ckpt is not None:
+            # Copy the live checkpoint sidecars to the user-requested paths.
+            obs_out = getattr(args, "obs_sidecar_path", None)
+            # Leave here for future support of embedding sidecar
+            emb_out = None
+
+            ckpt.copy_ckpt_sidecars_to_final(obs_sidecar_path=obs_out,
+                                            emb_sidecar_path=emb_out)
+            ckpt.mark_completed()
 
 def main() -> None:
     parser = argparse.ArgumentParser(

@@ -76,6 +76,9 @@ def test_callbacks_invoked(monkeypatch):
                 self.obs_calls.append((int(shot_number), int(frame_idx), len(det_obs)))
             def add_embeddings(self, shot_number, track_id, frame_idx, embs) -> None:
                 self.emb_calls.append((int(shot_number), int(track_id), int(getattr(embs, "shape", (0,0))[0])))
+            def get_pending_detection_cursor(self):
+                # (shot_number, frame_idx, shot_first_frame, reason)
+                return (None, None, None, None)
 
     # a minimal shot json file
     import json, tempfile, pathlib

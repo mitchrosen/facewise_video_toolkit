@@ -93,7 +93,11 @@ def test_load_into_collectors_roundtrip(tmp_path):
 def test_open_creates_run_dir(tmp_path):
     parent = tmp_path / "ckpts"
     snap = {"video_path": str((tmp_path/"vid.mp4").resolve())}
-    cm = CheckpointManager.open(parent_dir=parent, video_path=tmp_path/"vid.mp4", options_snapshot=snap, resume=True)
+    cm = CheckpointManager.open(
+        parent_dir=parent, 
+        video_path=tmp_path/"vid.mp4", 
+        options_snapshot=snap, 
+        no_resume=False)
     assert cm.root.parent == parent
     assert cm.root.name.startswith("run-")
     assert (parent / "current").exists() or True  # symlink is best-effort
@@ -103,7 +107,11 @@ def test_validate_resume_video_path_mismatch(tmp_path):
     v1 = tmp_path/"a.mp4"; v1.write_bytes(b"")
     v2 = tmp_path/"b.mp4"; v2.write_bytes(b"")
     snap = {"video_path": str(v1.resolve()), "detect_interval": 10}
-    cm = CheckpointManager.open(parent_dir=parent, video_path=v1, options_snapshot=snap, resume=True)
+    cm = CheckpointManager.open(
+        parent_dir=parent, 
+        video_path=v1, 
+        options_snapshot=snap, 
+        no_resume=False)
     # prime status
     cm.start(obs_collector=DummyObs(), emb_collector=DummyEmb(), options_snapshot=snap)
     cm.finalize()
@@ -114,7 +122,11 @@ def test_validate_resume_diffs_require_force(tmp_path):
     parent = tmp_path / "ck"
     v = tmp_path/"a.mp4"; v.write_bytes(b"")
     snap = {"video_path": str(v.resolve()), "detect_interval": 10}
-    cm = CheckpointManager.open(parent_dir=parent, video_path=v, options_snapshot=snap, resume=True)
+    cm = CheckpointManager.open(
+        parent_dir=parent, 
+        video_path=v, 
+        options_snapshot=snap, 
+        no_resume=False)
     cm.start(DummyObs(), DummyEmb(), options_snapshot=snap)
     cm.finalize()
     # detect_interval changed
@@ -124,7 +136,11 @@ def test_validate_resume_diffs_require_force(tmp_path):
 
 def test_status_lifecycle(tmp_path):
     v = tmp_path/"v.mp4"; v.write_bytes(b"")
-    cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v, options_snapshot={"video_path": str(v.resolve())}, resume=True)
+    cm = CheckpointManager.open(
+        parent_dir=tmp_path, 
+        video_path=v, 
+        options_snapshot={"video_path": str(v.resolve())}, 
+        no_resume=False)
     obs, emb = DummyObs(), DummyEmb()
     cm.start(obs, emb, options_snapshot={"video_path": str(v.resolve())})
     cm.on_frame(0)
@@ -140,7 +156,8 @@ def test_status_lifecycle(tmp_path):
 def test_load_and_anchor_trims_to_pre_detection(tmp_path):
     v = tmp_path/"v.mp4"; v.write_bytes(b"")
     cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v,
-                             options_snapshot={"video_path": str(v.resolve())}, resume=True)
+                             options_snapshot={"video_path": str(v.resolve())}, 
+                             no_resume=False)
     obs, emb = FileBackedObs(), FileBackedEmb()
     cm.start(obs, emb, options_snapshot={"video_path": str(v.resolve())})
 
@@ -152,12 +169,17 @@ def test_load_and_anchor_trims_to_pre_detection(tmp_path):
     obs.rows = 12; emb.rows = 9
     cm.finalize()  # writes latest rows to the npz files
 
+    st = cm.read_status()
+    st = st or {}
+    st["track_order"] = [{"shot": 1, "track_id": 0, "order": 0}]
+    cm.status_path.write_text(json.dumps(st, indent=2))
+
     # New “process”: re-open the manager pointing at the existing run dir
     cm2 = CheckpointManager.open(
       parent_dir=tmp_path,
       video_path=v,
       options_snapshot={"video_path": str(v.resolve())},
-      resume=True,
+      no_resume=False,
       run_id=cm.run_id,           # <<< ensure we point at the same run
     )
     obs2, emb2 = FileBackedObs(), FileBackedEmb()
@@ -171,14 +193,18 @@ def test_load_and_anchor_trims_to_pre_detection(tmp_path):
 
 def test_resume_available(tmp_path):
     v = (tmp_path/"v.mp4"); v.write_bytes(b"")
-    cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v, options_snapshot={"video_path": str(v.resolve())}, resume=True)
+    cm = CheckpointManager.open(
+        parent_dir=tmp_path, 
+        video_path=v, 
+        options_snapshot={"video_path": str(v.resolve())}, 
+        no_resume=False)
     cm.start(DummyObs(), DummyEmb(), options_snapshot={"video_path": str(v.resolve())})
     cm.checkpoint_now(frame_idx=0, shot_number=1)
     assert cm.resume_available()
 
 def test_atomic_sidecars_exist_even_empty(tmp_path):
     v = tmp_path/"v.mp4"; v.write_bytes(b"")
-    cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v, options_snapshot={"video_path": str(v.resolve())}, resume=True)
+    cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v, options_snapshot={"video_path": str(v.resolve())}, no_resume=True)
     cm.start(DummyObs(), DummyEmb(), options_snapshot={"video_path": str(v.resolve())})
     cm.finalize()
     assert (cm.root/"ckpt"/"obs_ckpt.npz").exists()

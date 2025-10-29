@@ -1,6 +1,6 @@
 from pathlib import Path
 import json
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Optional, Any
 import numpy as np
 from contextlib import ExitStack
 from bisect import bisect_left
@@ -8,14 +8,16 @@ import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
-from facekit.embedding.embedder import FaceEmbedder
-from facekit.detection.face_detector import FaceDetector
 from facekit.tracking.face_tracker import FaceTracker
-from facekit.embedding.alignment import align_face_for_arcface
-from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.tracking.tracker_validator import TrackerValidator, ValidatorParams
+from facekit.embedding.embedder import FaceEmbedder
+from facekit.embedding.alignment import align_face_for_arcface
+from facekit.detection.face_detector import FaceDetector
+from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 from facekit.common.obs_consts import Source
+from facekit.pipeline.resume_rehydrate import rehydrate_tracks_from_observations
+from facekit.errors import ResumeSafetyError
 
 
 def _shot_idx_by_shotnum(shots, target_shot_num: int) -> int:
@@ -50,12 +52,15 @@ def track_across_segments(
     embedding_batch_size_max: int = 32,
     *,
     checkpoint: TrackingCheckpoint | None = None,
+    resume_enabled: bool = True,
 ) -> List[FaceTrack]:
     """
     Track faces across precomputed shot segments, attach embeddings, and return per-shot tracks.
 
     This function is the main, **shot-aware** tracker. For each shot [first_frame..last_frame]:
       1) **Streams frames sequentially** via a `FrameProvider` (`ReaderCoordinator` by default).
+         We jump directly to the desired starting frame with `reset_to_frame(start_at)` and
+         then consume frames with `next()`.
       2) Performs **periodic face detection** every `detect_interval` frames (and always on the first frame
          of the shot or after tracker resets). Detection observations are handed to the per-shot
          `ShotFaceTrackAggregator`, which assigns/continues **shot-local segment IDs**.
@@ -91,7 +96,16 @@ def track_across_segments(
         Run the detector every `detect_interval` frames (and on the first frame of a shot or after tracker reset).
     embedding_batch_size_max : int, default 32
         Maximum batch size for `embedder.get_embedding_batch`.
-    checkpoint: provides callbacks for checkpointing
+    checkpoint : TrackingCheckpoint | None, optional
+        Checkpoint interface used for sidecar persistence (observations/embeddings),
+        status.json updates, and rehydration of prior observations/tracks.
+    resume_enabled : bool, default True
+        When True, this function resolves a resume anchor from the `checkpoint`
+        (preferring `get_resume_anchor()`, then `last_detection_frame` from status,
+        then the maximum observed frame in the observations collector). The tracker
+        will start at `max(anchor, shot_first)` within the containing shot and will
+        rehydrate prior observations strictly *before* the anchor. When False,
+        the function ignores any resume state and starts from the first shot frame.
 
     Returns
     -------
@@ -105,8 +119,8 @@ def track_across_segments(
     -----
     - **Detector scheduling:** Frames with detections produce aligned crops; tracking-only frames intentionally **do not**
       create embeddings to keep the hot path fast. (A later second-pass can compute extra embeddings if needed.)
-    - **Lifecycle:** When `frame_provider` is supplied, this function does not close it. When omitted, the internally
-      constructed provider is closed automatically via `ExitStack()`.
+    - **Lifecycle:** When a `FrameProvider` is supplied, this function does not close it. When a path is supplied,
+      the internally constructed provider is closed automatically via `ExitStack()`.
     - **Performance knobs:** `detect_interval` trades accuracy for speed; increasing it reduces detector calls.
       `embedding_batch_size_max` controls memory/throughput on the embedder.
     """
@@ -120,45 +134,114 @@ def track_across_segments(
         if isinstance(frame_source, (str, Path)):
             frame_provider = stack.enter_context(ReaderCoordinator(str(frame_source)))
         else:
-            # Accept real FrameProvider or duck-typed providers (fps/size/total_frames/get)
-            _ok = isinstance(frame_source, FrameProvider) or all(
-                hasattr(frame_source, m) for m in ("fps", "size", "total_frames", "get")
-            )
+            # Require the canonical FrameProvider interface:
+            # props: fps, size, total_frames; methods: reset_to_frame(i), next()
+            has_core = all(hasattr(frame_source, m) for m in ("fps", "size", "total_frames"))
+            has_iter = hasattr(frame_source, "reset_to_frame") and hasattr(frame_source, "next")
+            _ok = isinstance(frame_source, FrameProvider) or (has_core and has_iter)
             if not _ok:
                 raise TypeError(
-                    f"frame_source must be a str/Path (video path) or a FrameProvider-like object; "
-                    f"got {type(frame_source)!r}"
+                    "frame_source must be a str/Path or a FrameProvider-like object with "
+                    "fps, size, total_frames, reset_to_frame(i), and next(). "
+                    f"Got {type(frame_source)!r}"
                 )
             frame_provider = frame_source
 
         all_tracks: List[FaceTrack] = []
 
-        resume = False
-        if checkpoint:
-            resume_anchor = checkpoint.get_resume_anchor()
-            if resume_anchor:
-                resume_abs_frame, resume_shot, resume_shot_first_frame = resume_anchor        
-                start_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame)
-                shots = shots[start_shot_idx:]
-                logging.info(
-                    "resume: anchor frame=%d shot=%d (shot_first=%s) -> starting at shot index %d",
-                    resume_abs_frame, resume_shot, resume_shot_first_frame, start_shot_idx
-                )
-                resume = True
+        # ---------- Single, explicit resume arbiter ----------
+        def _resolve_anchor() -> int:
+            if not (resume_enabled and checkpoint):
+                logging.info("resume: disabled or no checkpoint -> anchor=0")
+                return 0
+            # (1) explicit tuple from get_resume_anchor()
+            try:
+                anchors = checkpoint.get_resume_anchor()
+                if anchors is not None and len(anchors) >= 1:
+                    logging.info("resume: using get_resume_anchor() -> %r", anchors)
+                    return int(anchors[0])
+            except Exception:
+                pass
+            # (2) prefer read_status() → status.json
+            try:
+                rs = getattr(checkpoint, "read_status", None)
+                if callable(rs):
+                    status = rs() or {}
+                    val = status.get("last_detection_frame")
+                    if val is not None:
+                        logging.info("resume: using read_status()['last_detection_frame'] -> %r", val)
+                        return int(val)
+            except Exception:
+                pass
+            # (3) direct status.json path if exposed
+            try:
+                status_path = getattr(checkpoint, "status_path", None)
+                if status_path:
+                    import os, json
+                    if os.path.exists(status_path):
+                        with open(status_path, "r") as f:
+                            status = json.load(f) or {}
+                        val = status.get("last_detection_frame")
+                        if val is not None:
+                            logging.info("resume: using status.json file -> %r", val)
+                            return int(val)
+            except Exception:
+                pass
+            # (4) legacy callable/attr last_detection_frame
+            try:
+                candidate = getattr(checkpoint, "last_detection_frame", None)
+                val = candidate() if callable(candidate) else candidate
+                if val is not None:
+                    logging.info("resume: using legacy last_detection_frame -> %r", val)
+                    return int(val)
+            except Exception:
+                pass
+            # (5) max observed frame from the obs collector
+            try:
+                collector = getattr(checkpoint, "obs_collector", None)
+                if collector is not None and hasattr(collector, "get_all_frame_indices"):
+                    frames_seen = collector.get_all_frame_indices()
+                    if frames_seen is not None and len(frames_seen) > 0:
+                        max_frame = int(np.max(frames_seen))
+                        logging.info("resume: using obs_collector max frame -> %d", max_frame)
+                        return max_frame
+            except Exception:
+                pass
+            logging.info("resume: no anchor inputs -> anchor=0")
+            return 0
 
-        for shot in shots:
+        resume_abs_frame: int = _resolve_anchor()
+
+        # Rehydrate strictly BEFORE the anchor (if any)
+        if checkpoint and resume_abs_frame > 0:
+            prior_tracks = rehydrate_tracks_from_observations(
+                checkpoint.obs_collector,
+                frame_max=resume_abs_frame - 1,
+                track_order=(checkpoint.get_track_order() or {}),
+            )
+            all_tracks.extend(prior_tracks)
+
+        # Trim shots so the first processed shot is the one containing the anchor (always)
+        start_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame)
+        if start_shot_idx >= len(shots):
+            raise ResumeSafetyError("resume anchor beyond last shot; aborting for safety.")
+        shots = shots[start_shot_idx:]
+
+        logging.info(
+            "resume: anchor=%d -> start at shot_index=%d (first_shot=[%d..%d])",
+            resume_abs_frame, start_shot_idx, shots[0]["first_frame"], shots[0]["last_frame"]
+        )
+
+        for shot_idx, shot in enumerate(shots):
             shot_number = shot["shot_number"]
-            first, last = shot["first_frame"], shot["last_frame"]
-
-            # If resuming and this is the anchor shot, 
-            # it is possible that the checkpoint was captured in the middle of the shot - start from that frame
-            if resume and (shot_number == resume_shot):
-                start_at = max(first, resume_abs_frame) 
+            first = shot["first_frame"]
+            last = shot["last_frame"]
+            # If resuming, start from the anchor frame inside the first shot; otherwise from shot start.
+ 
+            if shot_idx == 0:
+                start_at = max(first, resume_abs_frame)
             else:
                 start_at = first
-
-            if start_at > last:
-                continue  # nothing to do in this shot
 
             aggregator = ShotFaceTrackAggregator(
                 shot_number=shot_number,
@@ -181,6 +264,10 @@ def track_across_segments(
                 frame = frame_provider.next()
                 if frame is None:
                     break
+
+                # Guardrail: never emit pre-anchor frames
+                if resume_abs_frame and frame_idx < resume_abs_frame:
+                    raise ResumeSafetyError(f"Illegal rewind: got frame_idx={frame_idx} < anchor={resume_abs_frame}")
 
                 shot_frames.append(frame)
                 observations: List[FaceObservation] = []

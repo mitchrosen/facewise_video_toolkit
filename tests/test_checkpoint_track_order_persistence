@@ -1,0 +1,137 @@
+from pathlib import Path
+import json
+import numpy as np
+
+from facekit.pipeline.checkpoint import CheckpointManager
+from facekit.output.json_v2 import ObservationsCollector, EmbeddingCollector
+from facekit.tracking.face_structures import FaceObservation
+from facekit.common.obs_consts import Source
+from facekit.pipeline.resume_rehydrate import rehydrate_tracks_from_observations
+
+
+
+def _opts(shot_json_path: Path, video_path: Path) -> dict:
+    # Minimal set matching the protected/snapshotted keys your manager expects
+    return {
+        "schema_version": "2.1",
+        "video_path": str(video_path),
+        "detect_interval": 10,
+        "embedding_batch_size_max": 32,
+        "device": "cpu",
+        "emb_store": "sidecar",
+        "emb_sidecar_path": None,
+        "obs_sidecar_path": None,
+        "detector_model_path": "x",
+        "embedding_model_path": "y",
+        "yolo_config_path": "z",
+        "shot_segmentation_path": str(shot_json_path),
+        "log_level": "INFO",
+        "log_file": None,
+    }
+
+
+def test_track_order_persisted_without_checkpoint(tmp_path):
+    """
+    Create a run (resume=False), append observations for two tracks (ids appear in 5, then 3 order),
+    do NOT call checkpoint_now/finalize, and ensure a fresh manager (resume=True) loads track_order
+    from status.json (written by add_observations) even though no NPZs were produced.
+    """
+    parent = tmp_path / "ck"
+    parent.mkdir()
+    video = tmp_path / "vid.mp4"
+    video.write_text("placeholder")
+    shots = tmp_path / "shots.json"
+    shots.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 59}]}))
+
+    opts = _opts(shots, video)
+
+    # First run: create manager, start collectors, add observations (no checkpoint/finalize)
+    oc = ObservationsCollector()
+    ec = EmbeddingCollector(mode="sidecar", dim=512)
+
+    mgr = CheckpointManager.open(
+        parent_dir=parent, video_path=video, options_snapshot=opts,
+        no_resume=True, force_new_run=False
+    )
+    mgr.start(oc, ec, options_snapshot=opts)
+
+    # Two FaceObservations: track_id 5 appears before 3, so order must be {(1,5):0,(1,3):1}
+    row_5 = FaceObservation(
+        frame_idx=10, bbox=(0, 0, 10, 10),
+        embedding=None, confidence=None, aligned_face=None,
+        source=Source.DETECTED, track_id=5
+    )
+    row_3 = FaceObservation(
+        frame_idx=11, bbox=(1, 1, 11, 11),
+        embedding=None, confidence=None, aligned_face=None,
+        source=Source.DETECTED, track_id=3
+    )
+    # Same frame index is fine; persist order is first-seen-by-(shot,track)
+    mgr.add_observations(shot_number=1, frame_idx=10, observations=[row_5])
+    mgr.add_observations(shot_number=1, frame_idx=11, observations=[row_3])
+
+    # New manager that "resumes" this run, but note: no npz files exist.
+    mgr2 = CheckpointManager.open(
+        parent_dir=parent, video_path=video, options_snapshot=opts,
+        no_resume=False, resume_latest=True, force_new_run=False
+    )
+    # Just load/anchor collectors to trigger status hydration of track_order
+    oc2 = ObservationsCollector()
+    ec2 = EmbeddingCollector(mode="sidecar", dim=512)
+    mgr2.load_and_anchor_collectors(oc2, ec2, trim_to_anchor=False)
+
+    to = mgr2.get_track_order()
+    assert to == {(1, 5): 0, (1, 3): 1}, f"unexpected track_order: {to}"
+
+
+def test_rehydrate_uses_persisted_track_order(tmp_path):
+    """
+    Build an ObservationsCollector with two tracks (5, then 3), build a manager that
+    persists track_order via add_observations, then rehydrate and ensure the returned
+    FaceTracks are in that persisted order.
+    """
+    parent = tmp_path / "ck"
+    parent.mkdir()
+    video = tmp_path / "vid.mp4"; video.write_text("placeholder")
+    shots = tmp_path / "shots.json"; shots.write_text(json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":59}]}))
+    opts = _opts(shots, video)
+
+    # Create a collector with rows for track 5 and track 3 (ordering in file shouldn't matter;
+    # rehydrate should be driven by persisted 'track_order').
+    oc = ObservationsCollector()
+    oc.append_track_obs([
+        {"shot": 1, "track_id": 5, "f": 10, "bbox_xyxy": [0, 0, 10, 10], "src": "detected"},
+        {"shot": 1, "track_id": 5, "f": 11, "bbox_xyxy": [1, 1, 11, 11], "src": "tracked"},
+    ], emb_idx_fn=lambda _: -1)
+    oc.append_track_obs([
+        {"shot": 1, "track_id": 3, "f": 12, "bbox_xyxy": [2, 2, 12, 12], "src": "detected"},
+        {"shot": 1, "track_id": 3, "f": 13, "bbox_xyxy": [3, 3, 13, 13], "src": "tracked"},
+    ], emb_idx_fn=lambda _: -1)
+
+    # Persist the intended order via the manager by adding any observations for those tracks.
+    mgr = CheckpointManager.open(
+        parent_dir=parent, video_path=video, options_snapshot=opts,
+        no_resume=True, force_new_run=False
+    )
+    ec = EmbeddingCollector(mode="sidecar", dim=512)
+    mgr.start(oc, ec, options_snapshot=opts)
+
+    # First-seen: (1,5) then (1,3) -> order {(1,5):0,(1,3):1}
+    mgr.add_observations(
+        shot_number=1, frame_idx=10,
+        observations=[FaceObservation(10,(0,0,10,10),None,None,None,Source.DETECTED,track_id=5)]
+    )
+    mgr.add_observations(
+        shot_number=1, frame_idx=12,
+        observations=[FaceObservation(12,(2,2,12,12),None,None,None,Source.DETECTED,track_id=3)]
+    )
+
+    track_order = mgr.get_track_order()
+    assert track_order == {(1, 5): 0, (1, 3): 1}
+
+    # Now rehydrate with that order and ensure the resulting tracks are ordered accordingly.
+    tracks = rehydrate_tracks_from_observations(
+        oc, frame_max=100, track_order=track_order
+    )
+    pairs = [(t.shot_id, t.track_id) for t in tracks]
+    assert pairs == [(1, 5), (1, 3)], f"rehydrated order incorrect: {pairs}"

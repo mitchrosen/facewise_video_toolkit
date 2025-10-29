@@ -2,6 +2,7 @@ import pytest
 import sys
 from pathlib import Path
 import json
+import types
 from facekit.cli import resolve_face_ids_v2_cli as cli
 from facekit.common.obs_consts import Source
 
@@ -48,7 +49,7 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
             json.dumps({"shots":[{"shot_number":1,"first_frame":0,"last_frame":1}]})
         )
 
-    monkeypatch.setattr(cli, "track_across_segments", fake_track_across_segments)
+    monkeypatch.setattr(cli, "track_across_segments", types.SimpleNamespace(track_across_segments=fake_track_across_segments),)
     monkeypatch.setattr(cli, "generate_shot_features_json", fake_generate_shot_features_json)
     monkeypatch.setattr(cli, "ReaderCoordinator", lambda p: DummyFP())
     monkeypatch.setattr(cli, "load_yolo5face_model", fake_load_model)
