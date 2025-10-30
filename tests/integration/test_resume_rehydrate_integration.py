@@ -5,7 +5,6 @@ import numpy as np
 from facekit.pipeline.track_across_segments import track_across_segments
 from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.output.json_v2 import ObservationsCollector
-from facekit.pipeline.resume_rehydrate import rehydrate_tracks_from_observations
 
 class DummyDetector:
     def detect_faces_in_frame(self, frame): return None
@@ -82,9 +81,10 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
 
     # ensure pipeline uses our fake
     monkeypatch.setattr(
-        "facekit.pipeline.track_across_segments.rehydrate_tracks_from_observations",
+        "facekit.pipeline.track_across_segments.rehydrate_tracks",
         fake_rehydrate
     )
+
     # provide non-empty track_order (we didn't really persist one)
     monkeypatch.setattr(ckpt, "get_track_order", lambda: {(1, 1): 0})
 

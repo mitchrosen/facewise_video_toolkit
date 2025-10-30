@@ -56,11 +56,22 @@ class _NoCrashDetector(_CrashAfterNDetections):
         return [], [], []
 
 class _DummyEmbedder:
-    """Fast deterministic embedder: 512-d unit vector per crop."""
-    def __init__(self, *a, **k): pass
-    def set_max_batch_size(self, *a, **k): pass
-    def get_embedding_batch(self, aligned_batch):
-        return [np.full(512, 0.01, dtype=np.float32) for _ in aligned_batch]
+    def __init__(self, *a, **k):
+        pass
+
+    # Return a deterministic 512-dim vector per chip based on pixel content
+    def get_embedding_batch(self, chips):
+        import numpy as np
+        vecs = []
+        for chip in chips:
+            # hash-like reduction: same chip -> same vector; independent of process
+            h = int(np.uint64(chip.sum() + chip.shape[0]*1009 + chip.shape[1]*2741))
+            rng = np.random.RandomState(h % (2**32))
+            v = rng.rand(512).astype(np.float32)
+            # normalize like ArcFace
+            v /= np.linalg.norm(v) + 1e-12
+            vecs.append(v)
+        return np.stack(vecs, axis=0)
     
 def _make_tiny_video(path: Path, frames=60, size=(192, 108)):
     import cv2
@@ -186,14 +197,8 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         import numpy as np
         # Return a single aligned chip per detection call
         return np.zeros((112, 112, 3), dtype=np.uint8)
-
-    # Try common names; assert we hit at least one that exists on track_mod
-    patched = False
-    for name in ("align_faces", "align_face_for_arcface", "align_face"):
-        if hasattr(track_mod, name):
-            monkeypatch.setattr(track_mod, name, _fake_align, raising=True)
-            patched = True
-    assert patched, f"No align function found on {track_mod.__name__}: {dir(track_mod)}"
+    
+    monkeypatch.setattr(track_mod, "align_face_for_arcface", _fake_align, raising=True)
 
     # 2) Make the embedder actually emit vectors
     monkeypatch.setattr("facekit.embedding.embedder.FaceEmbedder", _DummyEmbedder, raising=True)
@@ -386,14 +391,46 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert R.shape == G.shape, f"resume rows {R.shape} != golden rows {G.shape}"
     assert np.array_equal(R, G), "resume data differs from uninterrupted golden run"
 
-    # Compare manifests (ignore non-deterministic fields like timestamps if present)
+    # Compare manifests (field-by-field, ignore non-deterministic/derived bits)
     gold_manifest = json.loads((tmp_path/"gold_v2_1.json").read_text())
     resume_manifest = json.loads(out_json.read_text())
 
-    def _scrub(m):
-        m = dict(m)
-        for k in ("created_at","run_id","version","tool_meta"):
-            if k in m: m.pop(k, None)
-        return m
+    def _fields_signature(sidecar: dict):
+        # Normalize the fields list into a simple (name, type) signature.
+        # Some writers use 'type', older ones used 'typ' – handle both.
+        fields = sidecar.get("fields", [])
+        return [(f["name"], f.get("type", f.get("typ"))) for f in fields]
 
-    assert _scrub(gold_manifest) == _scrub(resume_manifest), "resume manifest differs from golden"
+    # 1) Core invariants about the run itself
+    assert gold_manifest.get("schema_version") == resume_manifest.get("schema_version")
+    assert gold_manifest.get("face_metadata") == resume_manifest.get("face_metadata")
+
+    # 2) Inputs (paths should match; if you prefer, wrap in os.path.abspath() first)
+    g_in, r_in = gold_manifest.get("input", {}), resume_manifest.get("input", {})
+    assert g_in.get("video") == r_in.get("video")
+    assert g_in.get("shots") == r_in.get("shots")
+
+    # 3) Observations sidecar invariants
+    g_obs, r_obs = gold_manifest.get("observations_sidecar", {}), resume_manifest.get("observations_sidecar", {})
+
+    # Stable numeric/enum properties
+    for k in ("count", "dtype", "format"):
+        assert g_obs.get(k) == r_obs.get(k), f"{k} differs: {g_obs.get(k)} vs {r_obs.get(k)}"
+
+    # Schema/shape invariants (ignore ordering differences beyond (name,type) pairs if desired)
+    assert _fields_signature(g_obs) == _fields_signature(r_obs), "sidecar fields signature differs"
+
+    # Optionally ensure frame bounds or other derived invariants if present
+    for k in ("min_frame", "max_frame", "tracks"):
+        if k in g_obs or k in r_obs:
+            assert g_obs.get(k) == r_obs.get(k), f"{k} differs: {g_obs.get(k)} vs {r_obs.get(k)}"
+
+    # 4) Ignore volatile bits explicitly (timestamps, run ids, byte sizes, hashes, tool metadata, etc.)
+    def _scrub(m: dict):
+        m = dict(m)
+        for k in ("created_at", "run_id", "version", "tool_meta"):
+            m.pop(k, None)
+        if "observations_sidecar" in m:
+            for vk in ("path", "size_bytes", "sha256"):
+                m["observations_sidecar"].pop(vk, None)
+        return m

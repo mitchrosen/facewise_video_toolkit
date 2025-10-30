@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from facekit.output.json_v2 import ObservationsCollector
 from facekit.common.obs_consts import Source
-from facekit.pipeline.resume_rehydrate import rehydrate_tracks_from_observations
+from facekit.pipeline.resume_rehydrate import rehydrate_observation_tracks
 
 
 def _rows(*items):
@@ -21,7 +21,7 @@ def test_rehydrate_sanitizes_and_filters_bad_rows():
         {"shot":1,"track_id":7,"f":8,"bbox_xyxy":[5.0,5.0,5.0,10.0],"src":Source.TRACKED},
     ), emb_idx_fn=lambda _: -1)
 
-    tracks = rehydrate_tracks_from_observations(
+    tracks = rehydrate_observation_tracks(
         oc, frame_max=100, track_order={(1, 7): 0}
     )
     assert len(tracks) == 1

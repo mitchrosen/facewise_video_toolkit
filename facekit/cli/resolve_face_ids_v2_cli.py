@@ -97,6 +97,13 @@ def run_pipeline(args):
     if args.schema_version == "2.1" and args.emb_store == "inline":
         raise ResumeSafetyError("Schema 2.1 does not support inline embeddings. Use --emb-store sidecar or none.")
 
+    # ---- resume flag sanity -------------------------------------------------------
+    # Disallow obviously conflicting flags early (clear user signal => clear behavior).
+    if args.no_resume and (args.resume_latest or args.checkpoint_run_id):
+        raise ResumeSafetyError("--no-resume cannot be combined with --resume-latest/--checkpoint-run-id")
+    if args.new_run and (args.resume_latest or args.checkpoint_run_id):
+        raise ResumeSafetyError("--new-run cannot be combined with --resume-latest/--checkpoint-run-id")
+
     # ---- logging setup -------------------------------------------------------------
     # normalize level (accepts "info", "INFO", etc.)
     lvl = logging._nameToLevel.get(str(getattr(args, "log", "INFO")).upper(), logging.INFO)
@@ -148,8 +155,6 @@ def run_pipeline(args):
         if hasattr(embedder, "set_max_batch_size"):
             embedder.set_max_batch_size(int(args.embedding_batch_size_max))
 
-
-
         # ---- Checkpointing setup -----------------------------------------------
         # pick parent dir (stable for a video)
         parent_ckpt_dir = (
@@ -161,7 +166,7 @@ def run_pipeline(args):
         # Single source of truth for the whole run (fresh or resume):
         # These are used by checkpointing during the run AND by the final writers.
         obs_collector = ObservationsCollector()
-        emb_collector = EmbeddingCollector(mode="sidecar", dim=512)
+        emb_collector = EmbeddingCollector(mode="sidecar", dim=512, base_offset=0)
 
         options_snapshot = {
             "schema_version": args.schema_version,
@@ -190,20 +195,16 @@ def run_pipeline(args):
             resume_latest=bool(args.resume_latest),
         )
 
+        # Summarize selected run + resume intent
         status = ckpt.read_status() or {}
-        logging.info("status.json: last_detection_frame=%s last_detection_shot=%s",
-                    status.get("last_detection_frame"), status.get("last_detection_shot"))
         logging.info(
-            "Checkpoint run selected: dir=%s | resume_enabled=%s | run_id=%s | resume_latest=%s | new_run=%s",
-            ckpt.root, ckpt.resume_enabled, args.checkpoint_run_id or "-", bool(args.resume_latest), bool(args.new_run)
+            "Checkpoint selection: dir=%s | resume_enabled=%s | run_id=%s | resume_latest=%s | new_run=%s",
+            ckpt.root, bool(ckpt.resume_enabled), args.checkpoint_run_id or "-", bool(args.resume_latest), bool(args.new_run)
         )
+        logging.info("status.json: last_detection_frame=%s last_detection_shot=%s",
+                     status.get("last_detection_frame"), status.get("last_detection_shot"))
 
         # If resume is possible, load status and *enforce* immutable params unless --force
-
-        status = ckpt.read_status() or {}
-        logging.info("resume safety: checkpoint video=%r current video=%r",
-                    status.get("video_path"), options_snapshot.get("video_path"))
-        logging.info(f"args.no_resume: {args.no_resume}, args.force={args.force}")
 
         if not args.no_resume:
             ckpt.validate_resume_or_raise(
@@ -219,21 +220,27 @@ def run_pipeline(args):
             tracks_seen=0,
             options_snapshot=options_snapshot)
         
-        # Hydrate + anchor (no-op if there is nothing to resume)
-        if not args.no_resume:
-            loaded_obs, loaded_emb = ckpt.load_and_anchor_collectors(
-                obs_collector, emb_collector
-            )
-            ckpt.obs_collector = obs_collector
-            ckpt.emb_collector = emb_collector
-
-            anchor = ckpt.get_resume_anchor() 
-            logging.info(
-                "resume: hydrated collectors (obs=%d, emb=%d); anchor=%r",
-                loaded_obs, loaded_emb, anchor,
-            )
-
+        # Hydrate + anchor only on a true resume (manager says resume is enabled AND anchor available)
+        anchor_summary = None
+        resume_anchor_f: Optional[int] = None
+        if (not args.no_resume) and bool(ckpt.resume_enabled):
+            anchor_summary = ckpt.rehydrate_runtime(obs_collector, emb_collector, trim_to_anchor=True)
+            af = anchor_summary.get("anchor_frame")
+            ashot = anchor_summary.get("anchor_shot")
+            ashot_first = anchor_summary.get("anchor_shot_first_frame")
+            resume_anchor_f = af if isinstance(af, int) else None
+            logging.info("resume: hydrated collectors; anchor_frame=%r anchor_shot=%r anchor_shot_first=%r",
+                         af, ashot, ashot_first)
+            logging.info("resume: stable segment labeling enabled (track_order entries=%d)",
+                         int(anchor_summary.get("track_order_entries", 0)))
+        else:
+            logging.info("resume: disabled or no prior state; starting cold.")
+    
         # ---- tracking with progress hooks --------------------------------
+        _resume_enabled = (not args.no_resume) and bool(ckpt.resume_enabled)
+        logging.info("tracker: resume_enabled=%s (no_resume=%s, ckpt.resume_enabled=%s)",
+                     _resume_enabled, bool(args.no_resume), bool(ckpt.resume_enabled))
+        
         tracks = track_across_segments.track_across_segments(
             frame_source=fp,
             shot_json_path=str(shot_json_path),
@@ -242,7 +249,7 @@ def run_pipeline(args):
             detect_interval=int(args.detect_interval),
             embedding_batch_size_max=int(args.embedding_batch_size_max),
             checkpoint=ckpt,
-            resume_enabled=not args.no_resume,
+            resume_enabled=_resume_enabled,
         )
 
         GlobalIdentityResolver().resolve_global_ids(tracks)
@@ -344,8 +351,13 @@ def run_pipeline(args):
                 emb_collector=(emb_collector if emb_store == "sidecar" else None),
                 obs_collector=obs_collector, 
             )
+
             # finalize observations sidecar
-            manifest["observations_sidecar"] = obs_collector.finalize_sidecar(obs_path)
+            manifest["observations_sidecar"] = obs_collector.finalize_sidecar(
+                obs_path,
+                # If we resumed, only persist rows strictly after the anchor frame.
+                min_frame_exclusive=resume_anchor_f if resume_anchor_f is not None else None,
+            )
 
             # Ensure manifest has at least one shot, even if no faces/tracks were found.
             shots = manifest.get("shots")
@@ -384,9 +396,12 @@ def run_pipeline(args):
             # Leave here for future support of embedding sidecar
             emb_out = None
 
-            ckpt.copy_ckpt_sidecars_to_final(obs_sidecar_path=obs_out,
-                                            emb_sidecar_path=emb_out)
-            ckpt.mark_completed()
+            if ckpt is not None:
+                ckpt.copy_ckpt_sidecars_to_final(
+                    obs_sidecar_path=None,   # <-- prevent overwrite
+                    emb_sidecar_path=None
+                )
+                ckpt.mark_completed()
 
 def main() -> None:
     parser = argparse.ArgumentParser(

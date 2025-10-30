@@ -1,6 +1,8 @@
 from typing import List, Dict, Tuple, Optional
 import numpy as np
+from dataclasses import is_dataclass
 import logging
+
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
 from facekit.utils.geometry import compute_iou
 from facekit.common.obs_consts import Source
@@ -16,13 +18,120 @@ class ShotFaceTrackAggregator:
         - Persistent identity mapping with segment IDs
     """
 
-    def __init__(self, shot_number: int, iou_threshold: float = 0.5, embedding_threshold: float = 0.7):
+    def __init__(
+        self,
+        shot_number: int,
+        iou_threshold: float = 0.5,
+        embedding_threshold: float = 0.7,
+        *,
+        prior_tracks: Optional[List[FaceTrack]] = None,
+        resume_abs_frame: Optional[int] = None,
+        next_tid_seed: Optional[int] = None,
+    ):
         self.shot_number = shot_number
         self.iou_threshold = iou_threshold
         self.embedding_threshold = embedding_threshold
         self.tracks: List[FaceTrack] = []
         self.next_track_id = 0
         self._by_frame: dict[int, list[FaceObservation]] = {}
+
+        # ---- Warm-start seed handling ---------------------------------------------------------
+        if prior_tracks:
+            # Only keep tracks that belong to this shot
+            seeds = [t for t in prior_tracks if int(getattr(t, "shot_id", -1)) == int(shot_number)]
+
+            # --- Determine resume frame ---
+            if resume_abs_frame is None:
+                last_det = -1
+                last_any = -1
+                for tr in seeds:
+                    for o in getattr(tr, "observations", []) or []:
+                        last_any = max(last_any, int(o.frame_idx))
+                        if o.source == Source.DETECTED:
+                            last_det = max(last_det, int(o.frame_idx))
+                base = last_det if last_det >= 0 else last_any
+                resume_abs_frame = int(base + 1) if base >= 0 else 0
+
+            # --- Determine ID seed ---
+            if next_tid_seed is None:
+                max_tid = max(int(getattr(t, "track_id", -1)) for t in seeds) if seeds else -1
+                next_tid_seed = max_tid + 1
+
+            # --- Install tracks with proper open/closed state and proper frame indexing ---
+            for tr in seeds:
+                tr.shot_id = self.shot_number
+                assert tr.track_id >= 0
+
+                # Mark seeded tracks OPEN iff last obs < resume_abs_frame
+                last_frame = tr.last_frame() if hasattr(tr, "last_frame") else None
+                still_open = (last_frame is not None) and (int(last_frame) < int(resume_abs_frame))
+                # prefer explicit API if available
+                if still_open and hasattr(tr, "mark_open") and callable(getattr(tr, "mark_open")):
+                    tr.mark_open()
+                else:
+                    # fallbacks that keep prior tracks usable
+                    if hasattr(tr, "is_closed") and tr.is_closed():
+                        # last resort; avoid mutating public API outside tests
+                        if hasattr(tr, "_closed"):
+                            tr._closed = False
+                # Make sure helper flags exist in case downstream logic reads them
+                if not hasattr(tr, "is_active"):
+                    tr.is_active = False
+                self.tracks.append(tr)
+
+                # Find the last observation for this track
+                last_obs = max(
+                    (o for o in tr.observations if o.frame_idx < resume_abs_frame),
+                    key=lambda o: o.frame_idx,
+                    default=None,
+                )
+
+                if last_obs is not None:
+                    # Re-index the last obs as the "current frame" state
+                    # (IoU uses the last bbox from this state)
+                    self._index_obs(last_obs)
+
+                    # Make the track appear OPEN + ACTIVE as of last seen frame
+                    if hasattr(tr, "mark_open"):
+                        tr.mark_open()
+                    if hasattr(tr, "_closed"):
+                        tr._closed = False
+
+                    # Track was active most recently
+                    tr.is_active = True
+
+                else:
+                    # No obs before resume frame (edge case)
+                    if hasattr(tr, "mark_open"):
+                        tr.mark_open()
+                    if hasattr(tr, "_closed"):
+                        tr._closed = False
+                    tr.is_active = False  # cautious default
+
+            logging.info(
+                "warmstart: shot=%d seeded_tracks=%d resume_abs_frame=%d next_tid_seed=%d",
+                int(self.shot_number), len(seeds), int(resume_abs_frame), int(self.next_track_id)
+            )
+
+            logging.info("warmstart: shot=%d seeded=%d resume_abs=%d next_tid=%d",
+             self.shot_number, len(self.tracks), resume_abs_frame, self.next_track_id)
+            
+            for tr in self.tracks:
+                last_bbox = tr.get_last_bbox()
+                logging.info(
+                    "seeded: tid=%d open=%s first=%s last=%s last_bbox=%s det_last=%s",
+                    tr.track_id,
+                    (not tr.is_closed()),
+                    getattr(tr, "first_frame", lambda: None)(),
+                    getattr(tr, "last_frame",  lambda: None)(),
+                    tuple(map(int, last_bbox)) if last_bbox else None,
+                    # last DET frame for this track:
+                    max((o.frame_idx for o in tr.observations if o.source.name=='DETECTED'), default=None),
+                )
+            # prove frame-index bookkeeping exists for IoU on resume-1
+            pre_anchor = resume_abs_frame - 1
+            logging.info("seeded: frames at (anchor-1)=%s", [o.track_id for o in self._by_frame.get(pre_anchor, [])])
+
 
     # -------------------
     # Internal Utilities
@@ -94,6 +203,16 @@ class ShotFaceTrackAggregator:
         assigned_tracks: set[int] = set()
         unmatched_obs: list[FaceObservation] = []
 
+        logging.info("pre-match: open_tracks=%d ids=%s",
+                    sum(1 for t in self.tracks if not t.is_closed()),
+                    [t.track_id for t in self.tracks if not t.is_closed()])
+        for tr in self.tracks:
+            logging.info("pre-match: tid=%d last_bbox=%s last_frame=%s closed=%s",
+                        tr.track_id,
+                        tr.get_last_bbox(),
+                        tr.last_frame(),
+                        tr.is_closed())
+
         # Greedy IoU assignment: each detection → at most one track; each track ← at most one detection.
         for obs in observations:
             best_track = None
@@ -147,6 +266,13 @@ class ShotFaceTrackAggregator:
         # On a detection frame, any not-matched open tracks are closed.
         for track in self.tracks:
             if not track.is_active and not track.is_closed():
+                # Verbose reason: show last bbox and that it missed IoU threshold
+                last_bbox = track.get_last_bbox()
+                logging.info(
+                    "CLOSE (unmatched on DET frame) shot=%d track_id=%d last_bbox=%s",
+                    int(self.shot_number), int(track.track_id),
+                    (tuple(int(v) for v in last_bbox) if last_bbox else None)
+                )
                 track.mark_closed()
 
         return num_created

@@ -128,6 +128,16 @@ def _compute_params_hash(generation: Dict[str, Any]) -> str:
 def _emb_store_token(mode):
     return mode if mode in ("inline", "sidecar") else "none"
 
+def get_legacy_last_frame(obs_npz_path: Union[str, Path]) -> Optional[int]:
+    p = Path(obs_npz_path)
+    if not p.exists():
+        return None
+    with np.load(p, allow_pickle=False) as data:
+        arr = data.get("observations")
+        if arr is None or arr.size == 0:
+            return None
+        return int(np.asarray(arr)["f"].max())
+
 
 ObsRow = np.dtype([
     ("f", np.int32),                 # absolute frame index
@@ -294,7 +304,12 @@ class ObservationsCollector:
         self._count += k
         return (offset, k)
 
-    def finalize_sidecar(self, out_path: Path) -> Dict[str, Any]:
+    def finalize_sidecar(
+        self,
+        out_path: Path,
+        *,
+        min_frame_exclusive: int | None = None,
+    ) -> Dict[str, Any]:
         """
         Atomically write observations to an .npz (key: 'observations').
         Always writes a valid (possibly empty) structured array.
@@ -304,6 +319,9 @@ class ObservationsCollector:
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        if min_frame_exclusive is not None and arr.size:
+            arr = arr[arr["f"] > int(min_frame_exclusive)]
+
         final_path = out_path if out_path.suffix.lower() == ".npz" else out_path.with_suffix(".npz")
 
         atomic_write_npz(final_path, observations=arr)
@@ -324,9 +342,16 @@ class ObservationsCollector:
             "count": int(arr.shape[0]),
         }
 
-    def dump_npz(self, out_path: Union[str, Path]) -> str:
+    def dump_npz(
+        self,
+        out_path: Union[str, Path],
+        *,
+        min_frame_exclusive: int | None = None,
+    ) -> str:
         final = Path(out_path).with_suffix(".npz")
         arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        if min_frame_exclusive is not None and arr.size:
+            arr = arr[arr["f"] > int(min_frame_exclusive)]
         atomic_write_npz(final, observations=arr)
         return str(final)
 
@@ -444,10 +469,17 @@ class EmbeddingCollector:
           * {"emb_idx": i} for sidecar
           * {} when storage is disabled / vec is None
     """
-    def __init__(self, mode: Literal["inline","sidecar"] | None, dim: int | None = None):
+    def __init__(
+        self,
+        mode: Literal["inline","sidecar"] | None,
+        dim: int | None = None,
+        *,
+        base_offset: int = 0,
+    ):
         self.mode = mode
         self.dim = dim
         self._embs: List[np.ndarray] = []
+        self._base = int(base_offset)
 
     def _validate_vec(self, vec: np.ndarray | None) -> np.ndarray:
         if vec is None:
@@ -478,7 +510,7 @@ class EmbeddingCollector:
         # sidecar
         idx = len(self._embs)
         self._embs.append(v.copy())
-        return int(idx)
+        return int(self._base + idx)
 
     # === JSON/Manifest helper =========================================================
     def fields_for_json(self, vec: np.ndarray | None) -> Dict[str, Any]:
@@ -559,7 +591,9 @@ class EmbeddingCollector:
             raise ValueError(f"EmbeddingCollector.load_npz: dim mismatch {arr.shape[1]} != {self.dim}")
         for row in arr:
             self._embs.append(row.copy())
-        return int(arr.shape[0])
+        n = int(arr.shape[0])
+        self._base += n
+        return n
 
     def trim_to(self, n: int) -> None:
         n = max(0, int(n))

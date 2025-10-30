@@ -1,6 +1,6 @@
 from pathlib import Path
 import json
-from typing import List, Tuple, Dict, Union, Optional, Any
+from typing import List, Tuple, Dict, Union, Optional, Iterable
 import numpy as np
 from contextlib import ExitStack
 from bisect import bisect_left
@@ -16,30 +16,84 @@ from facekit.detection.face_detector import FaceDetector
 from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 from facekit.common.obs_consts import Source
-from facekit.pipeline.resume_rehydrate import rehydrate_tracks_from_observations
+from facekit.pipeline.resume_rehydrate import rehydrate_tracks
+from facekit.utils.geometry import compute_iou
 from facekit.errors import ResumeSafetyError
 
+# --- Logging helpers (diagnostics only) ---------------------------------------
 
-def _shot_idx_by_shotnum(shots, target_shot_num: int) -> int:
-    """
-    Return the index of the shot whose `shot_number` == target shot number.
-    If `shot_number` isn't present, returns the insertion point (may be len(shots)).
-    Assumes shots are sorted by ascending consecutive `shot_number`.
-    """
-    # Assumes ascending, consecutive shot_number
-    shot_nums = [s["shot_number"] for s in shots]
-    return bisect_left(shot_nums, target_shot_num)
+def _last_det_bbox_and_frame(tr: FaceTrack) -> tuple[Optional[tuple[int,int,int,int]], int]:
+    last_det_frame = -1
+    last_det_bbox = None
+    for o in getattr(tr, "observations", []) or []:
+        if getattr(o, "source", None) == Source.DETECTED and o.bbox is not None:
+            if o.frame_idx > last_det_frame:
+                last_det_frame = int(o.frame_idx)
+                last_det_bbox = tuple(int(v) for v in o.bbox[:4])
+    return last_det_bbox, last_det_frame
+
+def _track_summary(tr: FaceTrack) -> dict:
+    dets = [o for o in (tr.observations or []) if getattr(o, "source", None) == Source.DETECTED]
+    trks = [o for o in (tr.observations or []) if getattr(o, "source", None) == Source.TRACKED]
+    last_det_bbox, last_det_frame = _last_det_bbox_and_frame(tr)
+    return {
+        "shot_id":        int(getattr(tr, "shot_id", -1)),
+        "track_id":       int(getattr(tr, "track_id", -1)),
+        "segment_id":     int(getattr(tr, "segment_id", -1)) if getattr(tr, "segment_id", None) is not None else None,
+        "open":           (not tr.is_closed()),
+        "frames":         tr.get_frame_indices() if hasattr(tr, "get_frame_indices") else [],
+        "first_frame":    tr.first_frame() if hasattr(tr, "first_frame") else None,
+        "last_frame":     tr.last_frame() if hasattr(tr, "last_frame") else None,
+        "len_obs":        len(getattr(tr, "observations", []) or []),
+        "len_det":        len(dets),
+        "len_trk":        len(trks),
+        "has_embedding":  bool(getattr(tr, "has_embedding", lambda: False)()),
+        "avg_emb_norm":   float(np.linalg.norm(tr.compute_average_embedding())) if getattr(tr, "has_embedding", lambda: False)() else None,
+        "last_det_bbox":  last_det_bbox,
+        "last_det_frame": last_det_frame,
+    }
+
+def _log_tracks_state(msg: str, tracks: Iterable[FaceTrack], level: int=logging.INFO) -> None:
+    logging.log(level, "%s (count=%d)", msg, sum(1 for _ in tracks))
+    for tr in tracks:
+        logging.log(level, "  track: %s", _track_summary(tr))
+
 
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     """
-    Return the index of the first shot whose `last_frame` >= abs_frame_idx.
-    If abs_frame_idx is beyond all shots, returns len(shots).
-    If `frame_idx` falls before the shot's `first_frame`, the first frame index (0) is returned.
-    Assumes shots are sorted, non-overlapping, ascending by frame range.
+    Return the **shot index** i such that shots[i]["last_frame"] >= abs_frame_idx,
+    choosing the leftmost such i. If no such shot exists (abs_frame_idx is after
+    all shots), return len(shots).
+
+    Notes:
+    - Shots must be sorted, non-overlapping, ascending by frame range.
+    - If abs_frame_idx < shots[0]["first_frame"], this returns 0. The caller
+      could clamp the starting frame i.e:
+          start_at = max(shots[i]["first_frame"], abs_frame_idx)
     """
     # First shot whose last_frame >= resume_abs_frame
     last_frames = [s["last_frame"] for s in shots]
     return bisect_left(last_frames, abs_frame_idx)
+
+def _assign_segment_ids_for_rehydrated(prior_tracks, track_order: dict[tuple[int,int], int]) -> dict[int, int]:
+    """
+    Deterministically assign segment_id to already rehydrated tracks per shot using persisted track_order.
+    Returns: {shot_number: next_segment_seed} where the seed equals the count of assigned segments in that shot.
+    """
+    by_shot: dict[int, list] = {}
+    for t in prior_tracks or []:
+        s = int(getattr(t, "shot_id", 0))
+        by_shot.setdefault(s, []).append(t)
+
+    seeds: dict[int, int] = {}
+    for s, tracks in by_shot.items():
+        # Sort tracks by the persisted first-seen order
+        tracks.sort(key=lambda tr: track_order.get((s, int(getattr(tr, "track_id", -1))), 1 << 30))
+        # Assign deterministic segment ids
+        for idx, tr in enumerate(tracks):
+            setattr(tr, "segment_id", idx)
+        seeds[s] = len(tracks)
+    return seeds
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -123,6 +177,15 @@ def track_across_segments(
       the internally constructed provider is closed automatically via `ExitStack()`.
     - **Performance knobs:** `detect_interval` trades accuracy for speed; increasing it reduces detector calls.
       `embedding_batch_size_max` controls memory/throughput on the embedder.
+
+    Resume semantics & label continuity
+    -----------------------------------
+    When resuming, we rehydrate prior tracks (up to the resume anchor) from the persisted
+    observations sidecar. We then assign stable per-shot `segment_id`s **immediately** to the
+    rehydrated tracks using the checkpoint's `track_order` mapping, so labels match the
+    pre-interruption numbering. For the active shot (and any subsequent shots), we seed the
+    segment-id counter with the number of already-assigned tracks for that shot so new tracks
+    continue numbering where the previous run left off (no gaps or renumbering).
     """
 
     shot_json_path = Path(shot_json_path)
@@ -148,6 +211,13 @@ def track_across_segments(
             frame_provider = frame_source
 
         all_tracks: List[FaceTrack] = []
+        segment_id_seed_by_shot: Dict[int, int] = {}
+        trackid_seed_by_shot: Dict[int, int] = {}
+        prior_tracks: List[FaceTrack] = []
+        # For exact resume parity: reuse the last pre-anchor track id on the
+        # first detection inside the anchor-containing shot.
+        reuse_tid_for_first_shot: Optional[int] = None
+        reuse_binding_used: bool = False
 
         # ---------- Single, explicit resume arbiter ----------
         def _resolve_anchor() -> int:
@@ -212,14 +282,117 @@ def track_across_segments(
 
         resume_abs_frame: int = _resolve_anchor()
 
-        # Rehydrate strictly BEFORE the anchor (if any)
+        # Identify anchor-containing shot BEFORE any trimming (used for logging)
+        anchor_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame) if resume_abs_frame > 0 else None
+        anchor_shot_num = (
+            shots[anchor_shot_idx]["shot_number"]
+            if (anchor_shot_idx is not None and anchor_shot_idx < len(shots))
+            else None
+        )
+
+        # Compute completed shots (fully before anchor) BEFORE trimming
+        completed_shot_nums = {
+            s["shot_number"] for s in shots
+        } if resume_abs_frame == 0 else {
+            s["shot_number"] for s in shots if s["last_frame"] < resume_abs_frame
+        }
+
+        # Rehydrate BEFORE the anchor (if any)
         if checkpoint and resume_abs_frame > 0:
-            prior_tracks = rehydrate_tracks_from_observations(
+            def _emb_lookup(shot: int, tid: int):
+                # Preferred: return (frame_indices, embs)
+                if hasattr(checkpoint, "emb_collector") and hasattr(checkpoint.emb_collector, "get_embeddings"):
+                    return checkpoint.emb_collector.get_embeddings(shot, tid)  # -> (frames, np.ndarray) or None
+                if hasattr(checkpoint, "obs_collector") and hasattr(checkpoint.obs_collector, "get_embeddings"):
+                    return checkpoint.obs_collector.get_embeddings(shot, tid)
+                return None
+
+            def _emb_array_lookup(shot: int, tid: int):
+                # Fallback: return np.ndarray or None
+                if hasattr(checkpoint, "get_embeddings"):
+                    return checkpoint.get_embeddings(shot, tid)
+                if hasattr(checkpoint, "emb_collector") and hasattr(checkpoint.emb_collector, "get_embeddings_array"):
+                    return checkpoint.emb_collector.get_embeddings_array(shot, tid)
+                return None
+
+            prior_tracks = rehydrate_tracks(
                 checkpoint.obs_collector,
                 frame_max=resume_abs_frame - 1,
                 track_order=(checkpoint.get_track_order() or {}),
+                emb_lookup=_emb_lookup,
+                emb_array_lookup=_emb_array_lookup,
             )
+
+            _log_tracks_state("resume: rehydrated tracks (pre-anchor)", prior_tracks, level=logging.INFO)
+
+            # Also log by-shot counts & seeds we computed
+            try:
+                by_shot_counts = {}
+                for tr in prior_tracks:
+                    s = int(getattr(tr, "shot_id", -1))
+                    by_shot_counts[s] = by_shot_counts.get(s, 0) + 1
+                logging.info("resume: rehydrated counts by shot: %r", by_shot_counts)
+                logging.info("resume: segment_id_seed_by_shot: %r", {int(k): int(v) for k,v in (segment_id_seed_by_shot or {}).items()})
+                logging.info("resume: trackid_seed_by_shot: %r", {int(k): int(v) for k,v in (trackid_seed_by_shot or {}).items()})
+            except Exception:
+                logging.exception("resume: failed summarizing seeds")
+
+            # Assign stable segment_ids to the rehydrated tracks and compute per-shot seeds
+            try:
+                track_order_map = checkpoint.get_track_order() if hasattr(checkpoint, "get_track_order") else {}
+                segment_id_seed_by_shot = _assign_segment_ids_for_rehydrated(prior_tracks, track_order_map or {})
+                # Compute next track_id seed per shot = max(track_id)+1 seen in that shot
+                tmp: Dict[int, int] = {}
+                # Also compute, per shot, the *last* observed track (by last frame) so we
+                # can reuse that exact track_id on the first post-resume detection.
+                last_tid_by_shot: Dict[int, int] = {}
+                last_frame_by_shot_tid: Dict[Tuple[int, int], int] = {}
+
+                for tr in prior_tracks:
+                    s = int(getattr(tr, "shot_id", 0))
+                    tid = int(getattr(tr, "track_id", -1))
+                    if tid >= 0:
+                        tmp[s] = max(tmp.get(s, -1), tid)
+                        # Track the last frame seen for (shot, tid) and pick the tid with the max last frame.
+                        if getattr(tr, "observations", None):
+                            lf = max(o.frame_idx for o in tr.observations)
+                            key = (s, tid)
+                            if key not in last_frame_by_shot_tid or lf > last_frame_by_shot_tid[key]:
+                                last_frame_by_shot_tid[key] = lf
+                trackid_seed_by_shot = {s: (mx + 1) for s, mx in tmp.items()}
+                # Reduce last_frame_by_shot_tid -> last_tid_by_shot (argmax over tid per shot)
+                for (s, tid), lf in last_frame_by_shot_tid.items():
+                    if (s not in last_tid_by_shot) or lf > last_frame_by_shot_tid.get((s, last_tid_by_shot[s]), -1):
+                        last_tid_by_shot[s] = tid                
+                logging.info("resume: assigned segment_ids to %d rehydrated tracks; seeds=%s",
+                             len(prior_tracks), {k: int(v) for k, v in segment_id_seed_by_shot.items()})
+            except Exception:
+                logging.exception("resume: failed to assign segment_ids to rehydrated tracks; continuing with empty seeds")
+                segment_id_seed_by_shot = {}
+                trackid_seed_by_shot = {}
+
+            # --- Resume integrity checks (for shots before anchor_shot_frame_idx embeddings must be finite) ---
+            missing_by_shot: dict[int, int] = {}
+            for tr in prior_tracks or []:
+                shot_num = int(getattr(tr, "shot_id", -1))
+                if shot_num in completed_shot_nums: 
+                    for obs in getattr(tr, "observations", []) or []:
+                        if obs.source == Source.DETECTED:
+                            ok = (obs.embedding is not None) and np.isfinite(obs.embedding).all()
+                            if not ok:
+                                missing_by_shot[shot_num] = missing_by_shot.get(shot_num, 0) + 1
+            if missing_by_shot:
+                raise ResumeSafetyError(
+                    f"rehydrate: missing DET embeddings in completed shots before anchor_shot_num: {missing_by_shot}"
+                )
+                
+            logging.info("resume: prior_tracks strictness OK (anchor_shot_num=%s); %d tracks rehydrated",
+                anchor_shot_num, len(prior_tracks or []))
+
             all_tracks.extend(prior_tracks)
+        else:
+            segment_id_seed_by_shot = {}
+            trackid_seed_by_shot = {}
 
         # Trim shots so the first processed shot is the one containing the anchor (always)
         start_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame)
@@ -227,15 +400,30 @@ def track_across_segments(
             raise ResumeSafetyError("resume anchor beyond last shot; aborting for safety.")
         shots = shots[start_shot_idx:]
 
-        logging.info(
-            "resume: anchor=%d -> start at shot_index=%d (first_shot=[%d..%d])",
-            resume_abs_frame, start_shot_idx, shots[0]["first_frame"], shots[0]["last_frame"]
-        )
+        # Track whether this invocation is a true resume (anchor > shot_first)
+        _is_resume = bool(resume_abs_frame > 0)
 
-        for shot_idx, shot in enumerate(shots):
-            shot_number = shot["shot_number"]
-            first = shot["first_frame"]
-            last = shot["last_frame"]
+        # Determine which shot contains the anchor and pre-compute its reuse tid.
+        first_processed_shot_number = shots[0]["shot_number"]
+        if checkpoint and resume_abs_frame > 0:
+            try:
+                # Prefer the tid whose last observation is closest to the anchor (already computed above).
+                reuse_tid_for_first_shot = last_tid_by_shot.get(int(first_processed_shot_number))  # type: ignore[name-defined]
+                if reuse_tid_for_first_shot is not None:
+                    logging.info("resume: will reuse tid=%d for first detection in shot=%d",
+                                 int(reuse_tid_for_first_shot), int(first_processed_shot_number))
+            except Exception:
+                reuse_tid_for_first_shot = None
+
+            logging.info(
+                "resume: anchor=%d anchor_shot_num=%s first_processed_shot_number=%s reuse_tid_for_first_shot=%s",
+                resume_abs_frame, anchor_shot_num, first_processed_shot_number, reuse_tid_for_first_shot
+            )
+
+        for shot_idx, shot_num in enumerate(shots):
+            shot_number = shot_num["shot_number"]
+            first = shot_num["first_frame"]
+            last = shot_num["last_frame"]
             # If resuming, start from the anchor frame inside the first shot; otherwise from shot start.
  
             if shot_idx == 0:
@@ -243,11 +431,76 @@ def track_across_segments(
             else:
                 start_at = first
 
-            aggregator = ShotFaceTrackAggregator(
-                shot_number=shot_number,
-                iou_threshold=iou_thresh,
-                embedding_threshold=embedding_thresh,
+            if shot_idx == 0:
+                logging.info("resume: first_new_frame=%d (shot=[%d..%d]) detect_interval=%d mod=%d",
+                    start_at, first, last, detect_interval, (start_at % detect_interval))
+
+            # Determine seeded prior tracks only when resuming and 
+            # for the first processed shot (anchor-containing shot)
+            seeded_tracks = None
+            if (shot_idx == 0) and (resume_abs_frame > 0) and prior_tracks:
+                seeded_tracks = [
+                    t for t in prior_tracks
+                    if int(getattr(t, "shot_id", -1)) == int(shot_number)
+                ]
+
+            # Readable two-branch constructor
+            if seeded_tracks:
+                aggregator = ShotFaceTrackAggregator(
+                    shot_number=shot_number,
+                    iou_threshold=iou_thresh,
+                    embedding_threshold=embedding_thresh,
+                    prior_tracks=seeded_tracks,
+                    resume_abs_frame=start_at,
+                    next_tid_seed=int(trackid_seed_by_shot.get(int(shot_number), 0)),
+                )
+            else:
+                aggregator = ShotFaceTrackAggregator(
+                    shot_number=shot_number,
+                    iou_threshold=iou_thresh,
+                    embedding_threshold=embedding_thresh,
+                )
+
+            if seeded_tracks:
+                logging.info("RESUME: aggregator seeded with %d tracks", len(aggregator.tracks))
+                for tr in aggregator.tracks:
+                    last_bbox = getattr(tr, "get_last_bbox", lambda: None)()
+                    logging.info(
+                        "RESUME TRACK: tid=%s closed=%s last_frame=%s last_bbox=%s",
+                        tr.track_id,
+                        tr.is_closed() if hasattr(tr, "is_closed") else None,
+                        tr.last_frame() if hasattr(tr, "last_frame") else None,
+                        last_bbox
+        )
+
+            seed_tid = int(trackid_seed_by_shot.get(int(shot_number), 0))
+            seg_seed = int(segment_id_seed_by_shot.get(int(shot_number), 0)) if segment_id_seed_by_shot else 0
+
+            logging.info(
+                "shot=%d init: aggregator.next_track_id=%d, seed_tid=%d, seg_seed=%d",
+                int(shot_number),
+                int(getattr(aggregator, "next_track_id", -1)),
+                seed_tid,
+                seg_seed,
             )
+
+            # If this is the first processed shot, dump prior_tracks *for that shot* so we know the reference
+            if shot_idx == 0:
+                prior_for_shot = [tr for tr in prior_tracks if int(getattr(tr, "shot_id", -1)) == int(shot_number)]
+                _log_tracks_state(f"shot={shot_number}: prior_tracks for this shot (pre-anchor)", prior_for_shot, level=logging.INFO)
+
+            # With warmstart, aggregator may already contain seeded tracks
+            logging.info("shot=%d init: aggregator has %d tracks (0 when cold, >0 when warmstart)",
+                        int(shot_number), len(aggregator.tracks))
+
+            # Seed the aggregator’s next track_id only if we did not already pass next_tid_seed.
+            if not seeded_tracks and seed_tid > 0:
+                if hasattr(aggregator, "set_track_id_seed") and callable(getattr(aggregator, "set_track_id_seed")):
+                    aggregator.set_track_id_seed(seed_tid)
+                elif hasattr(aggregator, "next_track_id"):
+                    setattr(aggregator, "next_track_id", seed_tid)
+                elif hasattr(aggregator, "_next_track_id"):
+                    setattr(aggregator, "_next_track_id", seed_tid)
 
             face_tracker = FaceTracker(tracker_type="CSRT")
             tracker_active = False
@@ -345,11 +598,129 @@ def track_across_segments(
                             ))
                     else:
                         # no faces this frame; close shot-local tracks
-                        aggregator.finalize_tracks()
-                    
+                        aggregator.finalize_tracks()          
+
+                # If this is the anchor-containing shot, and we haven't yet bound the
+                # first post-resume detection, temporarily override the allocator so the
+                # very first created track reuses the pre-anchor tid (exact parity).
+                if (
+                    need_detect
+                    and not reuse_binding_used
+                    and reuse_tid_for_first_shot is not None
+                    and int(shot_number) == int(first_processed_shot_number)
+                    and observations  # only if we actually detected faces
+                ):
+                    try:
+                        # Force the next allocated id to be the reused tid.
+                        if hasattr(aggregator, "set_track_id_seed") and callable(getattr(aggregator, "set_track_id_seed")):
+                            aggregator.set_track_id_seed(int(reuse_tid_for_first_shot))
+                        elif hasattr(aggregator, "next_track_id"):
+                            setattr(aggregator, "next_track_id", int(reuse_tid_for_first_shot))
+                        elif hasattr(aggregator, "_next_track_id"):
+                            setattr(aggregator, "_next_track_id", int(reuse_tid_for_first_shot))
+                        logging.info("resume: temporarily overriding next_track_id -> %d (shot=%d)",
+                                     int(reuse_tid_for_first_shot), int(shot_number))
+                    except Exception:
+                        logging.exception("resume: failed to set temporary allocator for reuse tid; continuing without binding")
+
+                if observations and observations[0].source == Source.DETECTED:
+                    # Expand detection list for logging
+                    dets = []
+                    for ob in observations:
+                        x1, y1, x2, y2 = [int(v) for v in ob.bbox[:4]]
+                        dets.append({
+                            "bbox": (x1, y1, x2, y2),
+                            "conf": float(ob.confidence) if ob.confidence is not None else None
+                        })
+
+                    logging.info(
+                        "DETECTION frame=%d shot=%d count=%d dets=%s",
+                        frame_idx, int(shot_number), len(dets), dets
+                    )
+
+                    # For each detection, compute IoU vs every current aggregator track and log the best
+                    for idx, ob in enumerate(observations):
+                        best_tid = None
+                        best_iou = -1.0
+                        best_last_bbox = None
+                        reasons = []
+                        for tr in aggregator.tracks:
+                            if tr.is_closed():
+                                reasons.append(f"skip track_id={tr.track_id} (closed)")
+                                continue
+                            last_bbox = tr.get_last_bbox()
+                            if last_bbox is None:
+                                reasons.append(f"skip track_id={tr.track_id} (no last_bbox)")
+                                continue
+                            iou = float(compute_iou(last_bbox, ob.bbox))
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_tid = tr.track_id
+                                best_last_bbox = last_bbox
+
+                        # Decision log relative to threshold
+                        iou_thresh_eff = float(getattr(aggregator, "iou_threshold", 0.5))
+                        can_bind = best_iou >= iou_thresh_eff if best_iou >= 0 else False
+
+                        logging.info(
+                            "MATCH frame=%d det_idx=%d det_bbox=%s best_tid=%s best_iou=%.4f (thresh=%.3f) can_bind=%s best_last_bbox=%s",
+                            frame_idx, idx, tuple(int(v) for v in ob.bbox[:4]),
+                            (int(best_tid) if best_tid is not None else None),
+                            best_iou, iou_thresh_eff, bool(can_bind),
+                            (tuple(int(v) for v in best_last_bbox) if best_last_bbox else None)
+                        )
+
+                        if reasons:
+                            logging.debug("  skipped tracks: %s", reasons)
+
+                    # Snapshot aggregator state *before* the assignment happens
+                    _log_tracks_state(
+                        f"PRE-ASSIGN state at frame={frame_idx} shot={shot_number}",
+                        aggregator.tracks, level=logging.INFO
+                    )
 
                 # Add current frame observations to aggregator
                 created_count = aggregator.update_tracks_with_frame(frame_idx, observations)
+ 
+                if _is_resume and shot_idx == 0 and need_detect:
+                    # On the very first DET frame after resume, verify whether we extended or created.
+                    if created_count == 0:
+                        logging.info("RESUME OK: first DET after anchor extended an existing track (no new track created).")
+                    else:
+                        logging.warning("RESUME NOTE: first DET after anchor created %d new track(s). "
+                                        "This is expected only if IoU<threshold or geometry changed.", created_count)
+
+                # POST-ASSIGN diagnostics (created_count now defined)
+                logging.info(
+                    "POST-ASSIGN frame=%d shot=%d created=%d open_now=%d total=%d",
+                    frame_idx, int(shot_number), int(created_count),
+                    sum(1 for t in aggregator.tracks if not t.is_closed()),
+                    len(aggregator.tracks)
+                )
+
+                # Log exactly which tracks received a DET observation at this frame
+                agg_det_now = aggregator.observations_at(frame_idx, source=Source.DETECTED, require_track_id=True)
+                if agg_det_now:
+                    logging.info(
+                        "ASSIGNED-DETS frame=%d: %s",
+                        frame_idx,
+                        [{"tid": int(o.track_id), "bbox": tuple(int(v) for v in o.bbox[:4])} for o in agg_det_now]
+                    )
+                else:
+                    logging.info("ASSIGNED-DETS frame=%d: none", frame_idx)
+
+
+                # Mark binding as used exactly once on the first detection frame where it applied.
+                if (
+                    need_detect
+                    and not reuse_binding_used
+                    and reuse_tid_for_first_shot is not None
+                    and int(shot_number) == int(first_processed_shot_number)
+                    and created_count > 0
+                ):
+                    reuse_binding_used = True
+                    logging.info("resume: reuse binding applied (shot=%d, reused tid=%d).",
+                                 int(shot_number), int(reuse_tid_for_first_shot))
 
                 agg_det = aggregator.observations_at(frame_idx, source=Source.DETECTED, require_track_id=True)
                 agg_trk = aggregator.observations_at(frame_idx, source=Source.TRACKED,  require_track_id=True)
@@ -409,9 +780,43 @@ def track_across_segments(
 
             aggregator.finalize_tracks()
 
-            # Assign segment_id per shot
-            _ = aggregator.resolve_segment_ids(segment_id_counter=0, embedding_threshold=embedding_thresh)
+            # Assign segment_id per shot, seeded to continue numbering after any rehydrated tracks
+            seed = int(segment_id_seed_by_shot.get(int(shot_number), 0))
+            try:
+                _ = aggregator.resolve_segment_ids(
+                    segment_id_counter=seed,
+                    embedding_threshold=embedding_thresh
+                )
+            except RuntimeError as e:
+                logging.error("segment-id resolution skipped for shot=%d due to missing embeddings: %s",
+                              int(shot_number), e)
+
             all_tracks.extend(aggregator.tracks)
+
+            ####################-------------######################
+            # Safety: this check only applies on true resume (anchor > 0)
+            if _is_resume and shot_idx == 0:
+                # Build a consolidated key list only for the anchor-containing shot,
+                # legacy (prior_tracks) must come entirely before the new shot part.
+                def _keys_for_shot(tracks, shot_num):
+                    out = []
+                    for tr in tracks or []:
+                        if int(getattr(tr, "shot_id", -1)) != int(shot_num):
+                            continue
+                        for o in getattr(tr, "observations", []) or []:
+                            out.append((int(o.frame_idx), int(tr.track_id)))
+                    return sorted(out)
+
+                legacy_keys = _keys_for_shot(prior_tracks, shot_number)
+                new_keys    = _keys_for_shot(aggregator.tracks, shot_number)
+                if legacy_keys and new_keys and legacy_keys[-1][0] >= new_keys[0][0]:
+                    raise ResumeSafetyError(f"non-monotone concat at shot={shot_number}: "
+                                            f"legacy_last={legacy_keys[-1][0]} new_first={new_keys[0][0]}")
+                logging.info("resume: legacy/new concat OK for shot=%d (legacy_last=%s new_first=%s)",
+                            shot_number,
+                            legacy_keys[-1][0] if legacy_keys else None,
+                            new_keys[0][0] if new_keys else None)
+            ######################--------------###################
 
             if checkpoint:
                 checkpoint.on_shot_done()

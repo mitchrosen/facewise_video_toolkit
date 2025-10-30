@@ -30,9 +30,12 @@ class TrackingCheckpoint(Protocol):
     def on_frame(self, frame_idx: int) -> None: ...
     def on_shot_done(self) -> None: ...
     def on_new_tracks(self, n: int) -> None: ...
+    
+    # Stable, persisted order for (shot_number, track_id) -> order_index.
+    # Used to deterministically assign segment_ids to rehydrated tracks.
     def get_track_order(self) -> dict[tuple[int, int], int]: ...
 
-    # checkpointing
+    # Pre-detect checkpoint: anchor==this frame; resume rehydrates <anchor and starts at anchor
     def checkpoint_now(
             self, 
             *,
@@ -86,6 +89,43 @@ def _atomic_write_text(dst: Path, text: str) -> None:
     logging.debug("in checkpoint._atomic_write_text - about to call _atomic_write_bytes()")
     _atomic_write_bytes(dst, text.encode("utf-8"))
     logging.debug("in checkpoint._atomic_write_text - just to called _atomic_write_bytes()")
+
+def _dump_npz_atomic(collector, final_path: Path) -> None:
+    """
+    Ask a collector to dump to a temporary NPZ file and atomically swap it in.
+    We fsync the temp file and the parent directory to make the checkpoint durable.
+    NOTE: numpy.savez appends '.npz' if the provided filename does not end with '.npz'.
+    Therefore our temp path MUST itself end with '.npz', or we'll miss the file we just wrote.
+    """
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Ensure tmp name ends with '.npz' to avoid NumPy appending another '.npz'
+    # Example: 'obs_ckpt.npz' -> 'obs_ckpt.tmp.npz'
+    tmp = final_path.with_name(final_path.stem + ".tmp.npz")
+
+    # Let the collector write its NPZ to the temp path.
+    collector.dump_npz(tmp)
+
+    # Robustness: if the collector (or numpy) appended '.npz' again for some reason,
+    # fall back to that file name. (Expected path is '...tmp.npz'; fallback is '...tmp.npz.npz')
+    actual_tmp = Path(tmp)
+    if not actual_tmp.exists():
+        fallback = Path(str(tmp) + ".npz")
+        if fallback.exists():
+            actual_tmp = fallback
+        else:
+            raise FileNotFoundError(f"Checkpoint temp not written by collector: expected '{tmp}'")
+
+    # Best-effort fsync of the tmp file (collector may have closed it).
+    try:
+        with open(actual_tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+    except Exception:
+        pass
+
+    os.replace(actual_tmp, final_path)
+    fsync_parent_dir(final_path)
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -296,6 +336,12 @@ class CheckpointManager (TrackingCheckpoint):
         self._write_status("shot boundary")
         logging.debug("in checkpoint.on_shot_done - just called _write_status()")
 
+    def get_track_order(self) -> dict[tuple[int,int], int]:
+        """
+        Return the persisted (shot, track_id) -> first-seen order mapping used to stabilize segment labels.
+        """
+        return dict(self._shot_track_to_order) if hasattr(self, "_shot_track_to_order") else {}
+
     def on_frame(self, frame_idx: int) -> None:
         # Called for every processed frame (0-based)
         self._frames_done = int(frame_idx) + 1
@@ -451,8 +497,15 @@ class CheckpointManager (TrackingCheckpoint):
         self._obs_rows_at_det = max(0, obs_count)
         self._emb_rows_at_det = max(0, emb_count)
 
-        self._obs.dump_npz(self.obs_path)
-        self._emb.dump_npz(self.emb_path)
+        logging.info(
+            "ckpt:anchor set @ frame=%d shot=%d shot_first=%s "
+            "obs_rows_at_det=%d emb_rows_at_det=%d (pre-write)",
+            self._last_det_frame, self._last_det_shot, self._last_det_shot_first_frame,
+            self._obs_rows_at_det, self._emb_rows_at_det
+        )
+
+        _dump_npz_atomic(self._obs, self.obs_path)
+        _dump_npz_atomic(self._emb, self.emb_path)
         
         logging.info(
             "ckpt:snapshot frame=%s shot=%s obs_rows=%d emb_rows=%d files=(%s, %s)",
@@ -471,9 +524,9 @@ class CheckpointManager (TrackingCheckpoint):
     def finalize(self, note: str = "final") -> None:
         # Ensure sidecars exist even if no detection checkpoint happened.
         if self._obs is not None:
-            self._obs.dump_npz(self.obs_path)
+            _dump_npz_atomic(self._obs, self.obs_path)
         if self._emb is not None:
-            self._emb.dump_npz(self.emb_path)
+             _dump_npz_atomic(self._emb, self.emb_path)
         self._write_status(note)
 
     def copy_ckpt_sidecars_to_final(
@@ -534,12 +587,14 @@ class CheckpointManager (TrackingCheckpoint):
         if self._last_det_frame is None:
             status = self.read_status() or {}
             lf = status.get("last_detection_frame")
+            ls = status.get("last_detection_shot")
+            lfirst = status.get("last_detection_shot_first_frame")
             if lf is None:
                 return None
             # Fill all three fields so subsequent calls are fast/consistent.
             self._last_det_frame = int(lf)
-            self._last_det_shot = int(status.get("last_detection_shot", -1))
-            self._last_det_shot_first_frame = int(status.get("last_detection_shot_first_frame", 0))
+            self._last_det_shot = (int(ls) if ls is not None else None)
+            self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
         return (self._last_det_frame, self._last_det_shot, self._last_det_shot_first_frame)
     
     def resume_available(self) -> bool:
@@ -918,6 +973,7 @@ class CheckpointManager (TrackingCheckpoint):
 
         # Read status ONCE
         status = self.read_status() or {}
+
         shot_track_order_list = status.get("track_order") or []
 
         # Restore track-order (once, early)
@@ -990,6 +1046,12 @@ class CheckpointManager (TrackingCheckpoint):
         except Exception as e:
             logging.exception("ckpt:anchor emb trim_to(%d) failed: %s", ed, e)
 
+        logging.info(
+            "ckpt:anchor post-trim obs.count=%s emb.count=%s (clamped from obs=%d emb=%d)",
+            getattr(obs_collector, "count", lambda: None)(),
+            getattr(emb_collector, "count", lambda: None)(), orig_od, orig_ed
+        )
+
         # Post-trim counts
         post_obs = getattr(obs_collector, "count", lambda: None)()
         post_emb = getattr(emb_collector, "count", lambda: None)()
@@ -1003,6 +1065,78 @@ class CheckpointManager (TrackingCheckpoint):
         )
 
         return loaded_obs, loaded_emb
+    
+    def rehydrate_runtime(
+        self,
+        obs_collector,
+        emb_collector,
+        *,
+        trim_to_anchor: bool = True,
+    ) -> dict:
+        """
+        One-shot rehydration used by the pipeline:
+        - Load obs/emb NPZ sidecars (if present).
+        - Validate collector schemas.
+        - Restore stable track_order.
+        - Restore detection anchors and trim collectors back to the last detect frame (optional).
+        - Set in-memory pointers so downstream code (e.g. resume-time rehydration of tracks)
+            can read from `self.obs_collector` / `self.emb_collector`.
+        - Update simple counters to reflect the checkpointed position (frames/shots/tracks).
+        Returns a dict summary with anchor & row counts for logging/tests.
+        """
+        loaded_obs, loaded_emb = self.load_and_anchor_collectors(
+            obs_collector, emb_collector, trim_to_anchor=trim_to_anchor
+        )
+
+        # Expose collectors for downstream rehydration helpers
+        self.obs_collector = obs_collector
+        self.emb_collector = emb_collector
+
+        status = self.read_status() or {}
+
+        # Restore minimal counters (best-effort; these are for status/telemetry, not logic)
+        try:
+            self._frames_done = int(status.get("frames_done", 0) or 0)
+            self._shots_done  = int(status.get("shots_done", 0) or 0)
+            self._tracks_seen = int(status.get("tracks_seen", 0) or 0)
+        except Exception:
+            pass
+
+        # If counters are behind the anchor, bump frames_done to at least the anchor frame.
+        if self._last_det_frame is not None:
+            self._frames_done = max(int(self._frames_done or 0), int(self._last_det_frame) + 1)
+
+        # Sanity: ensure the collectors reflect the anchor row counts (already trimmed)
+        cur_obs = getattr(obs_collector, "count", lambda: None)() or 0
+        cur_emb = getattr(emb_collector, "count", lambda: None)() or 0
+        if (self._obs_rows_at_det and cur_obs < self._obs_rows_at_det) or \
+        (self._emb_rows_at_det and cur_emb < self._emb_rows_at_det):
+            raise ResumeSafetyError(
+                "rehydrate: collectors row counts are below anchor after trimming: "
+                f"obs={cur_obs} (anchor={self._obs_rows_at_det}) emb={cur_emb} (anchor={self._emb_rows_at_det})"
+            )
+
+        # Log a compact track_order summary (determinism of segment IDs)
+        try:
+            self._log_track_order_summary("rehydrated")
+        except Exception:
+            pass
+
+        summary = {
+            "anchor_frame": self._last_det_frame,
+            "anchor_shot": self._last_det_shot,
+            "anchor_shot_first_frame": self._last_det_shot_first_frame,
+            "obs_rows": cur_obs,
+            "emb_rows": cur_emb,
+            "track_order_entries": len(self._shot_track_to_order or {}),
+        }
+        logging.info(
+            "rehydrate: anchor=%r shot=%r shot_first=%r rows(obs=%d,emb=%d) track_order=%d",
+            summary["anchor_frame"], summary["anchor_shot"], summary["anchor_shot_first_frame"],
+            summary["obs_rows"], summary["emb_rows"], summary["track_order_entries"]
+        )
+        return summary
+
     
     # ---------- internals ----------
     def _write_status(self, note: str) -> None:

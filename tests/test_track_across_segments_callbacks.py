@@ -79,6 +79,8 @@ def test_callbacks_invoked(monkeypatch):
             def get_pending_detection_cursor(self):
                 # (shot_number, frame_idx, shot_first_frame, reason)
                 return (None, None, None, None)
+            def get_track_order(self) -> dict[tuple[int, int], int]:
+                return getattr(self, "_track_order", {})  
 
     # a minimal shot json file
     import json, tempfile, pathlib
