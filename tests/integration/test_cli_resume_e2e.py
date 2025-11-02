@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import logging
 
 
 # ------------------------- tiny helpers & dummies -------------------------
@@ -188,6 +189,9 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         - pre-anchor observations are preserved exactly
         - global frame order is non-decreasing
     """
+    
+    pytest.skip("test replaced.")
+
     # Import after collection for monkeypatching
     from facekit.cli import resolve_face_ids_v2_cli as cli_mod
     from facekit.pipeline import track_across_segments as track_mod
@@ -229,6 +233,8 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(track_mod, "track_across_segments", _wrapped_track)
 
     # ------------------------------ RUN 1 (crash) ------------------------------
+    print("Woo-hoo: RUN 1")
+    
     replacement["det"] = _EmitOneThenCrash(crash_at=22)  # ensures obs_rows > 0 before the crash
     argv1 = [
         "prog",
@@ -250,10 +256,10 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     # --- Inspect checkpoint (robust: derive run root from obs_ckpt)
     obs_ckpt_path = _latest_in(ckpt_parent, "run-*/ckpt/obs_ckpt.npz")
     run_root = obs_ckpt_path.parent.parent  # .../run-.../ckpt -> .../run-...
-    status_path = run_root / "status.json"
+    status_path = Path(run_root, "status.json")
     if not status_path.exists():
         # fallback for any legacy layout
-        maybe = run_root / "ckpt" / "status.json"
+        maybe = Path(run_root, "ckpt", "status.json")
         assert maybe.exists(), f"status.json not found under {run_root}"
         status_path = maybe
 
@@ -273,6 +279,7 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert 0 <= anchor_frame < total_frames, f"bad anchor_frame={anchor_frame} total={total_frames}"
     pre_anchor_rows = int((frames_pre < anchor_frame).sum()) if frames_pre.size else 0
    # ------------------------------ RUN 2 (resume) -----------------------------
+    print("Woo-hoo: RUN 2")
     replacement["det"] = _EmitOneNoCrash()  # same emission pattern, no crash
     argv2 = [
         "prog",
@@ -296,7 +303,22 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     obs_ckpt_latest = _latest_in(ckpt_parent, "run-*/ckpt/obs_ckpt.npz")
     obs2 = np.load(obs_ckpt_latest)
     frames2 = _load_frames_v21(obs_ckpt_latest)
-    
+
+    ###########--------###########
+    # debugging multiples in sidecar
+    ckpt_npz = _latest_in(ckpt_parent, "run-*/ckpt/obs_ckpt.npz")
+    final_npz = obs_sidecar
+
+    F_ckpt = _load_frames_v21(ckpt_npz)
+    F_final = _load_frames_v21(final_npz)
+
+    print("ckpt pre:", (F_ckpt < 21).sum(), "post:", (F_ckpt >= 21).sum())
+    print("final pre:", (F_final < 21).sum(), "post:", (F_final >= 21).sum())
+
+    u, c = np.unique(F_final, return_counts=True)
+    print("any duplicates in final by frame?", (c > 1).any())
+    ##########-----------#############
+        
     assert frames2.size > 0, "no observations after resume"
 
     # Pre-anchor rows should be preserved exactly; no new rows < anchor_frame.
@@ -336,6 +358,10 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     # (1) Pre-anchor observations preserved exactly — only if any existed pre-crash
     if pre_anchor_rows > 0:
         assert final_frames.size >= pre_anchor_rows, "lost rows after resume"
+
+        logging.info("Wah-Wah:")
+        for frame_idx in final_frames:
+            logging.info(f"frame_idx: {frame_idx}, frame_idx < anchor_frame: {frame_idx < anchor_frame}")
         assert int((final_frames < anchor_frame).sum()) == pre_anchor_rows, \
             "pre-anchor observations not preserved exactly"
     
@@ -353,6 +379,8 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         assert (diffs >= 0).all(), f"frames out of order; first negative @ {np.where(diffs < 0)[0][:5]}"
 
     # ------------------------------ RUN 3 (golden, no crash) ------------------------------
+    print("Woo-hoo: RUN 3")
+
     replacement["det"] = _EmitOneNoCrash()  # must match RUN 2 so sidecars are byte-for-byte comparable
     gold_ckpt = tmp_path / "gold_ckpt"
     gold_ckpt.mkdir()

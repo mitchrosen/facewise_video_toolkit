@@ -75,7 +75,15 @@ class FaceTrack:
     last_landmarks: Optional[np.ndarray] = None     # shape (5,2), float32
     last_bbox: Optional[Tuple[int,int,int,int]] = None
     last_gray_roi: Optional[np.ndarray] = None      # previous ROI gray for LK
-    last_det_frame_idx: Optional[int] = None        # when we last had “real” landmarks
+
+    last_frame_idx = -1
+    last_det_frame_idx = -1
+    last_bbox = (0, 0, 0, 0)
+
+    #   Authoritative cached DET frame index (kept in sync on every DET add)
+    _last_det_frame_idx: int | None = -1
+
+    closed = False
     
     def __post_init__(self):
         self._frame_index_map = {}
@@ -96,10 +104,11 @@ class FaceTrack:
             ValueError: If an observation already exists for the frame index and force is False.
         """
 
-        self.observations.append(obs)
-
         if not self.is_open:
             raise RuntimeError("Cannot add observation to a closed track")
+        
+        # Append after the closed check so we don't mutate on error
+        self.observations.append(obs)
 
         existing = self._frame_index_map.get(obs.frame_idx)
         if existing and not force:
@@ -118,10 +127,21 @@ class FaceTrack:
             self.embeddings.append(obs.embedding)
  
         # For tracking continuity: store landmarks if this was a detection
-        if obs.source == "detection" and obs.landmarks is not None:
+        if obs.source == Source.DETECTED and obs.landmarks is not None:
             # prepare for optical flow
-            self.last_known_landmarks = obs.landmarks  
+            self.last_known_landmarks = obs.landmarks
 
+        # Update last_bbox helper
+        if obs.bbox is not None:
+            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
+        
+        # Keep the DET cache authoritative
+        if getattr(obs, "source", None) == Source.DETECTED:
+            self._last_det_frame_idx = int(obs.frame_idx)
+      
+        # Update last_bbox helper
+        if obs.bbox is not None:
+            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
 
     def reset_for_frame(self):
         self.is_active = False
@@ -130,6 +150,10 @@ class FaceTrack:
         """Mark this track as permanently closed (no more updates)."""
     
         self.is_open = False
+
+    def mark_open(self):
+        """Re-open this track (used during resume hydration)."""
+        self.is_open = True
         
     def is_closed(self) -> bool:
         """Return True if this track has been permanently closed."""
@@ -157,14 +181,30 @@ class FaceTrack:
         return obs.bbox if obs else None
 
     def get_last_bbox(self):
-        return self.observations[-1].bbox if self.observations else None
+        if not self.observations:
+            return None
+        return tuple(int(v) for v in self.observations[-1].bbox[:4])
 
     def get_first_bbox(self):
         return self.observations[0].bbox if self.observations else None
 
-    def last_frame(self) -> int:
-        return self.observations[-1].frame_idx if self.observations else -1
-    
+    def last_frame(self) -> Optional[int]:
+        return int(self.observations[-1].frame_idx) if self.observations else None
+
+    def last_det_frame(self) -> Optional[int]:
+        """
+        Authoritative 'last frame with a DETECTED observation'.
+        Uses cached value; falls back to scan only if cache is missing
+        (e.g., legacy/constructed objects).
+        """
+        if self._last_det_frame_idx is not None:
+            return int(self._last_det_frame_idx)
+        for o in reversed(self.observations or []):
+            if getattr(o, "source", None) == Source.DETECTED:
+                self._last_det_frame_idx = int(o.frame_idx)
+                return self._last_det_frame_idx
+        return None
+
     def first_frame(self):
         return self.observations[0].frame_idx if self.observations else float("inf")
 
@@ -214,3 +254,10 @@ class FaceTrack:
 
     def count_embeddings(self):
         return len(self.embeddings)
+
+    def last_det_bbox(self) -> Optional[tuple[int,int,int,int]]:
+        for o in reversed(self.observations or []):
+            if getattr(o, "source", None) == Source.DETECTED and o.bbox is not None:
+                x1,y1,x2,y2 = map(int, o.bbox[:4])
+                return (x1,y1,x2,y2)
+        return None

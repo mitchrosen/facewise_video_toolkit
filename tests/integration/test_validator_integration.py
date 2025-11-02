@@ -46,7 +46,7 @@ def _video_path() -> str:
     env_p = os.environ.get("TEST_VIDEO")
     if env_p and Path(env_p).exists():
         return env_p
-    candidate = Path(__file__).parents[2] / "tests" / "data" / "interview-sam-altman_5sec_snippet.mp4"
+    candidate = Path(Path(__file__).parents[2], "tests", "data", "interview-sam-altman_5sec_snippet.mp4")
     if candidate.exists():
         return str(candidate)
 

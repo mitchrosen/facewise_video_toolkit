@@ -86,6 +86,51 @@ def derive_face_metadata(tracks: List[Any]) -> List[Dict[str, Any]]:
         counts[label] = counts.get(label, 0) + int(n)
     return [{"face_label": k, "occurance_count": v} for k, v in sorted(counts.items())]
 
+def derive_face_metadata_from_observations(
+    obs_collector: "ObservationsCollector",
+    tracks: List[Any],
+) -> List[Dict[str, Any]]:
+    """
+    Compute face_metadata by counting rows in the *observations* source of truth.
+    This is deterministic across resume and golden runs.
+    """
+    # Build a stable map (shot_id, track_id) -> face_label from tracks
+    id_to_label: Dict[Tuple[int, int], str] = {}
+    for t in tracks:
+        shot_id = int(getattr(t, "shot_id", 1))
+        track_id = int(getattr(t, "track_id", -1))
+        id_to_label[(shot_id, track_id)] = _track_label(t)
+
+    counts: Dict[str, int] = {}
+    # Iterate obs grouped by (shot, track_id); rows is ascending by frame
+    for s, tid, rows in obs_collector.iter_tracks():
+        label = id_to_label.get((int(s), int(tid)))
+        if not label:
+            # If a (shot,track) has no label mapping (should be rare), skip it
+            # rather than inventing a transient label that would harm determinism.
+            continue
+        counts[label] = counts.get(label, 0) + int(len(rows))
+
+    return [{"face_label": k, "occurance_count": int(v)} for k, v in sorted(counts.items())]
+
+
+def _derive_face_metadata_from_tracks(shots_out: list[dict]) -> list[dict]:
+    """
+    Derive metadata straight from the *manifest's* tracks (v2.1):
+    sum obs_count per face_label across all shots.
+    This avoids any dependence on in-memory, pre-merge tracks and is resume-stable.
+    """
+    counts: dict[str, int] = {}
+    for shot in shots_out or []:
+        for t in shot.get("face_tracks", []):
+            lbl = t.get("face_label")
+            cnt = int(t.get("obs_count", 0))
+            if not lbl:
+                continue
+            counts[lbl] = counts.get(lbl, 0) + cnt
+    return [{"face_label": k, "occurance_count": int(v)} for k, v in sorted(counts.items())]
+
+
 def _git_info(repo_dir: str | Path = ".") -> tuple[Optional[str], Optional[str]]:
     # Try git CLI
     try:
@@ -102,12 +147,12 @@ def _git_info(repo_dir: str | Path = ".") -> tuple[Optional[str], Optional[str]]
 
     # Parse .git/HEAD best-effort
     try:
-        head = Path(repo_dir) / ".git" / "HEAD"
+        head = Path(repo_dir, ".git", "HEAD")
         if head.exists():
             ref_line = head.read_text().strip()
             if ref_line.startswith("ref:"):
                 rel = ref_line.split(" ", 1)[1]  # e.g. refs/heads/main
-                ref_path = Path(repo_dir) / ".git" / rel
+                ref_path = Path(repo_dir, ".git", rel)
                 commit_full = ref_path.read_text().strip() if ref_path.exists() else None
                 branch = Path(rel).name
                 return (commit_full[:7] if commit_full else None), branch
@@ -453,6 +498,24 @@ class ObservationsCollector:
         """Return a single structured array similar to what finalize_sidecar writes."""
         return (np.concatenate(self._rows, axis=0)
                 if self._rows else np.empty(0, dtype=ObsRow))
+    
+    def slice_for_track(self, shot: int, track_id: int) -> tuple[int, int]:
+        """
+        Return (offset, count) for all rows in this collector belonging to (shot, track_id).
+        Assumes rows for a (shot,track) are contiguous in append order.
+        """
+        # Reuse your existing row finder:
+        positions = self.find_rows(shot=int(shot), track_id=int(track_id))
+        count = len(positions)
+        if count == 0:
+            return (self._count, 0)  # next write-point as offset, zero count
+
+        # Convert first (block_idx,row_idx) to a global offset.
+        # If you track a running base for each block, use that; otherwise compute:
+        # offset = sum(len(b) for b in self._rows[:first_block_idx]) + first_row_idx
+        first_block_idx, first_row_idx = positions[0]
+        offset = sum(self._rows[i].shape[0] for i in range(first_block_idx)) + first_row_idx
+        return (int(offset), int(count))
 
 
 class EmbeddingCollector:
@@ -727,10 +790,9 @@ def build_v2_manifest_from_tracks(
 
             centers = _track_center_series(t)
             if centers and W and H and np is not None:
-                import numpy as _np
-                cx_series = _np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
-                cy_series = _np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
-                std_c = float((_np.var(cx_series) + _np.var(cy_series)) ** 0.5)
+                cx_series = np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
+                cy_series = np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
+                std_c = float((np.var(cx_series) + np.var(cy_series)) ** 0.5)
             else:
                 std_c = 0.0
             is_static = std_c < cfg.static_stddev_thresh_pct
@@ -914,10 +976,10 @@ def build_v2_1_manifest_from_tracks(
     if cfg.video_size is not None: video["size"] = [int(cfg.video_size[0]), int(cfg.video_size[1])]
     if cfg.total_frames is not None: video["total_frames"] = int(cfg.total_frames)
 
-    shots_out: list[dict] = []
+    shots: list[dict] = []
 
     for shot_number in sorted(shots_map.keys()):
-        t_out: list[dict] = []
+        tracks: list[dict] = []
         for t in shots_map[shot_number]:
             f0, f1 = _track_first_last(t)
 
@@ -937,10 +999,9 @@ def build_v2_1_manifest_from_tracks(
             # movement heuristic (as in 2.0)
             centers = _track_center_series(t)
             if centers and W and H and np is not None:
-                import numpy as _np
-                cx_series = _np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
-                cy_series = _np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
-                std_c = float((_np.var(cx_series) + _np.var(cy_series)) ** 0.5)
+                cx_series = np.array([c[0] * (100.0/W if cfg.normalize_to_percent else 1.0/W) for c in centers], dtype=float)
+                cy_series = np.array([c[1] * (100.0/H if cfg.normalize_to_percent else 1.0/H) for c in centers], dtype=float)
+                std_c = float((np.var(cx_series) + np.var(cy_series)) ** 0.5)
             else:
                 std_c = 0.0
             is_static = std_c < cfg.static_stddev_thresh_pct
@@ -951,18 +1012,11 @@ def build_v2_1_manifest_from_tracks(
             else:
                 shot_val = int(getattr(t, "shot_id", shot_number))
                 track_val = int(getattr(t, "track_id", -1))
-                obs_items = normalize_obs_items_for_track(
-                    obs,
-                    shot_id=shot_val,
-                    track_id=track_val,
-                    emb_collector=emb_collector,
+                obs_offset, obs_count = obs_collector.slice_for_track(
+                    shot_val, track_val
                 )
-                obs_offset, obs_count = obs_collector.append_track_obs(
-                    obs_items,
-                    emb_idx_fn=lambda d: int(d.get("emb_idx", -1)),
-                )
- 
-            t_out.append({
+                
+            tracks.append({
                 "first_frame": int(f0),
                 "last_frame": int(f1),
                 "face_label": _track_label(t),
@@ -975,25 +1029,28 @@ def build_v2_1_manifest_from_tracks(
                 "obs_count": int(obs_count),
             })
 
-        if not t_out:
+        if not tracks:
             continue
-        shot_first = min(ft["first_frame"] for ft in t_out)
-        shot_last  = max(ft["last_frame"] for ft in t_out)
-        shots_out.append({
+        shot_first = min(ft["first_frame"] for ft in tracks)
+        shot_last  = max(ft["last_frame"] for ft in tracks)
+        shots.append({
             "shot_number": int(shot_number),
             "first_frame": int(shot_first),
             "last_frame": int(shot_last),
-            "num_tracks": int(len(t_out)),
-            "face_tracks": t_out,
+            "num_tracks": int(len(tracks)),
+            "face_tracks": tracks,
         })
 
     manifest: dict = {
         "schema_version": SCHEMA_VERSION_V2_1,
         "video": video,
-        "shots": shots_out,
+        "shots": shots,
     }
+    # Face metadata: prefer caller; otherwise derive from the observations (canonical)
     if face_metadata is not None:
         manifest["face_metadata"] = face_metadata
+    elif obs_collector is not None:
+        manifest["face_metadata"] = _derive_face_metadata_from_tracks(shots)
 
     if generation:
         base_gen = build_generation({"emb_store": ("sidecar" if emb_collector else "none")})

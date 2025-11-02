@@ -56,7 +56,7 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
     monkeypatch.setattr(cli, "FaceDetector", lambda m: _FD())
     monkeypatch.setattr(cli, "FaceEmbedder", lambda *a,**k: _Emb())
     monkeypatch.setattr(cli, "_validate_manifest_dict",
-                    lambda manifest, schema_version, total_frame_count: [])
+                    lambda manifest, schema_version, total_frame_count, schema_dir: [])
 
     argv = [
         "prog", "--input", str(tmp_path/"in.mp4"),

@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict, Union, Optional, Iterable
 import numpy as np
 from contextlib import ExitStack
 from bisect import bisect_left
+import copy
 import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
@@ -94,6 +95,31 @@ def _assign_segment_ids_for_rehydrated(prior_tracks, track_order: dict[tuple[int
             setattr(tr, "segment_id", idx)
         seeds[s] = len(tracks)
     return seeds
+
+def _validate_shots_are_absolute_and_increasing(shots):
+    if not shots:
+        return
+    # Absolute: shot 0 must start at 0 (or ≥ 0) and later shots must NOT restart at 0
+    later_all_zero = len(shots) > 1 and all(s.get("first_frame", None) == 0 for s in shots[1:])
+    # Strictly increasing windows
+    strictly_increasing = all(
+        int(shots[i]["first_frame"]) > int(shots[i-1]["last_frame"])
+        for i in range(1, len(shots))
+    )
+
+    if later_all_zero or not strictly_increasing:
+        # Build a short diagnostic of the first few shots
+        diag = ", ".join(
+            f'#{i}[{int(s["first_frame"])},{int(s["last_frame"])}]'
+            for i, s in enumerate(shots[:5])
+        )
+        raise ResumeSafetyError(
+            "Shots must be in ABSOLUTE frame space and strictly increasing. "
+            "Detected per-shot relative indexing and/or non-monotone ranges. "
+            f"Example windows: {diag}. "
+            "Ensure the shot detector writes global first_frame/last_frame (no reset to 0 between shots)."
+        )
+
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -192,6 +218,8 @@ def track_across_segments(
     with open(shot_json_path, "r") as f:
         _shot_data = json.load(f)
     shots = _shot_data["shots"]
+
+    _validate_shots_are_absolute_and_increasing(shots)
 
     with ExitStack() as stack:
         if isinstance(frame_source, (str, Path)):
@@ -325,12 +353,12 @@ def track_across_segments(
 
             _log_tracks_state("resume: rehydrated tracks (pre-anchor)", prior_tracks, level=logging.INFO)
 
-            # Also log by-shot counts & seeds we computed
+            # Log by-shot counts & seeds we computed
             try:
                 by_shot_counts = {}
-                for tr in prior_tracks:
-                    s = int(getattr(tr, "shot_id", -1))
-                    by_shot_counts[s] = by_shot_counts.get(s, 0) + 1
+                for track in prior_tracks:
+                    shot = int(getattr(track, "shot_id", -1))
+                    by_shot_counts[shot] = by_shot_counts.get(shot, 0) + 1
                 logging.info("resume: rehydrated counts by shot: %r", by_shot_counts)
                 logging.info("resume: segment_id_seed_by_shot: %r", {int(k): int(v) for k,v in (segment_id_seed_by_shot or {}).items()})
                 logging.info("resume: trackid_seed_by_shot: %r", {int(k): int(v) for k,v in (trackid_seed_by_shot or {}).items()})
@@ -348,22 +376,22 @@ def track_across_segments(
                 last_tid_by_shot: Dict[int, int] = {}
                 last_frame_by_shot_tid: Dict[Tuple[int, int], int] = {}
 
-                for tr in prior_tracks:
-                    s = int(getattr(tr, "shot_id", 0))
-                    tid = int(getattr(tr, "track_id", -1))
+                for track in prior_tracks:
+                    shot = int(getattr(track, "shot_id", 0))
+                    tid = int(getattr(track, "track_id", -1))
                     if tid >= 0:
-                        tmp[s] = max(tmp.get(s, -1), tid)
+                        tmp[shot] = max(tmp.get(shot, -1), tid)
                         # Track the last frame seen for (shot, tid) and pick the tid with the max last frame.
-                        if getattr(tr, "observations", None):
-                            lf = max(o.frame_idx for o in tr.observations)
-                            key = (s, tid)
-                            if key not in last_frame_by_shot_tid or lf > last_frame_by_shot_tid[key]:
-                                last_frame_by_shot_tid[key] = lf
-                trackid_seed_by_shot = {s: (mx + 1) for s, mx in tmp.items()}
+                        if getattr(track, "observations", None):
+                            last_frame = max(o.frame_idx for o in track.observations)
+                            key = (shot, tid)
+                            if key not in last_frame_by_shot_tid or last_frame > last_frame_by_shot_tid[key]:
+                                last_frame_by_shot_tid[key] = last_frame
+                trackid_seed_by_shot = {shot: (max_tid + 1) for shot, max_tid in tmp.items()}
                 # Reduce last_frame_by_shot_tid -> last_tid_by_shot (argmax over tid per shot)
-                for (s, tid), lf in last_frame_by_shot_tid.items():
-                    if (s not in last_tid_by_shot) or lf > last_frame_by_shot_tid.get((s, last_tid_by_shot[s]), -1):
-                        last_tid_by_shot[s] = tid                
+                for (shot, tid), last_frame in last_frame_by_shot_tid.items():
+                    if (shot not in last_tid_by_shot) or last_frame > last_frame_by_shot_tid.get((shot, last_tid_by_shot[shot]), -1):
+                        last_tid_by_shot[shot] = tid                
                 logging.info("resume: assigned segment_ids to %d rehydrated tracks; seeds=%s",
                              len(prior_tracks), {k: int(v) for k, v in segment_id_seed_by_shot.items()})
             except Exception:
@@ -373,10 +401,10 @@ def track_across_segments(
 
             # --- Resume integrity checks (for shots before anchor_shot_frame_idx embeddings must be finite) ---
             missing_by_shot: dict[int, int] = {}
-            for tr in prior_tracks or []:
-                shot_num = int(getattr(tr, "shot_id", -1))
+            for track in prior_tracks or []:
+                shot_num = int(getattr(track, "shot_id", -1))
                 if shot_num in completed_shot_nums: 
-                    for obs in getattr(tr, "observations", []) or []:
+                    for obs in getattr(track, "observations", []) or []:
                         if obs.source == Source.DETECTED:
                             ok = (obs.embedding is not None) and np.isfinite(obs.embedding).all()
                             if not ok:
@@ -440,11 +468,10 @@ def track_across_segments(
             seeded_tracks = None
             if (shot_idx == 0) and (resume_abs_frame > 0) and prior_tracks:
                 seeded_tracks = [
-                    t for t in prior_tracks
-                    if int(getattr(t, "shot_id", -1)) == int(shot_number)
+                    copy.deepcopy(t) for t in prior_tracks
+                        if int(getattr(t, "shot_id", -1)) == int(shot_number)
                 ]
 
-            # Readable two-branch constructor
             if seeded_tracks:
                 aggregator = ShotFaceTrackAggregator(
                     shot_number=shot_number,
@@ -454,6 +481,7 @@ def track_across_segments(
                     resume_abs_frame=start_at,
                     next_tid_seed=int(trackid_seed_by_shot.get(int(shot_number), 0)),
                 )
+                checkpoint.hydrate_open_tracks_into(aggregator)
             else:
                 aggregator = ShotFaceTrackAggregator(
                     shot_number=shot_number,
@@ -461,17 +489,25 @@ def track_across_segments(
                     embedding_threshold=embedding_thresh,
                 )
 
+            if (shot_idx == 0) and (resume_abs_frame > 0) and (reuse_tid_for_first_shot is not None):
+                try:
+                    aggregator.set_resume_force_tid(int(reuse_tid_for_first_shot))
+                    logging.info("resume: aggregator will force tid=%d on the next created track in shot=%d",
+                                int(reuse_tid_for_first_shot), int(shot_number))
+                except Exception:
+                    logging.exception("resume: failed to set forced tid on aggregator")
+
             if seeded_tracks:
                 logging.info("RESUME: aggregator seeded with %d tracks", len(aggregator.tracks))
-                for tr in aggregator.tracks:
-                    last_bbox = getattr(tr, "get_last_bbox", lambda: None)()
+                for track in aggregator.tracks:
+                    last_bbox = getattr(track, "get_last_bbox", lambda: None)()
                     logging.info(
                         "RESUME TRACK: tid=%s closed=%s last_frame=%s last_bbox=%s",
-                        tr.track_id,
-                        tr.is_closed() if hasattr(tr, "is_closed") else None,
-                        tr.last_frame() if hasattr(tr, "last_frame") else None,
+                        track.track_id,
+                        track.is_closed() if hasattr(track, "is_closed") else None,
+                        track.last_frame() if hasattr(track, "last_frame") else None,
                         last_bbox
-        )
+                    )
 
             seed_tid = int(trackid_seed_by_shot.get(int(shot_number), 0))
             seg_seed = int(segment_id_seed_by_shot.get(int(shot_number), 0)) if segment_id_seed_by_shot else 0
@@ -512,7 +548,7 @@ def track_across_segments(
                 params=ValidatorParams(iou_thresh=iou_thresh))
 
             frame_provider.reset_to_frame(start_at)
-
+    
             for frame_idx in range(start_at, last + 1):
                 frame = frame_provider.next()
                 if frame is None:
@@ -575,11 +611,53 @@ def track_across_segments(
                         "shot=%d first=%d frame=%d (mod=%d) tracker_active=%s, detect_interval=%d",
                         shot_number, first, frame_idx, (frame_idx % detect_interval), tracker_active, detect_interval
                     )
+
+                    #############-------------DEBUG (guarded)------------##############
+                    def _debug_dump_collector(collector, tag):
+                        try:
+                            if collector is None:
+                                logging.debug("COLLECTOR-DUMP [%s]: <none>", tag)
+                                return
+                            # Keep the dump lightweight & resilient across stub impls.
+                            summary = getattr(collector, "summary", None)
+                            if callable(summary):
+                                logging.info("COLLECTOR-DUMP [%s]: %s", tag, summary(max_items=20))
+                                return
+                            # Fallback: try a very generic size/count probe
+                            get_count = getattr(collector, "count_rows", None)
+                            if callable(get_count):
+                                logging.info("COLLECTOR-DUMP [%s]: rows=%s", tag, get_count())
+                            else:
+                                logging.info("COLLECTOR-DUMP [%s]: (no summary/count API)", tag)
+                        except Exception as e:
+                            logging.debug("COLLECTOR-DUMP [%s] failed: %s", tag, e)
+
+                    if frame_idx == 21 and checkpoint is not None:
+                        # Support both public attrs and optional accessors without
+                        # tightening the TrackingCheckpoint protocol.
+                        oc = None
+                        ec = None
+                        getter = getattr(checkpoint, "get_obs_collector", None)
+                        if callable(getter):
+                            oc = getter()
+                        if oc is None:
+                            oc = getattr(checkpoint, "obs_collector", None)
+                        getter = getattr(checkpoint, "get_emb_collector", None)
+                        if callable(getter):
+                            ec = getter()
+                        if ec is None:
+                            ec = getattr(checkpoint, "emb_collector", None)
+                        _debug_dump_collector(oc, "obs_collector: pre frame 21 detect")
+                        _debug_dump_collector(ec, "emb_collector: pre frame 21 detect")
+                    #############-------------END DEBUG------------######
+
                     if checkpoint:
                         checkpoint.checkpoint_now(
                             frame_idx=frame_idx, 
                             shot_number=shot_number,
-                            shot_first_frame=first)
+                            aggregator=aggregator,
+                            shot_first_frame=first,
+                        )
                     
                     detections = detector.detect_faces_in_frame(frame)
                     
@@ -644,18 +722,18 @@ def track_across_segments(
                         best_iou = -1.0
                         best_last_bbox = None
                         reasons = []
-                        for tr in aggregator.tracks:
-                            if tr.is_closed():
-                                reasons.append(f"skip track_id={tr.track_id} (closed)")
+                        for track in aggregator.tracks:
+                            if track.is_closed():
+                                reasons.append(f"skip track_id={track.track_id} (closed)")
                                 continue
-                            last_bbox = tr.get_last_bbox()
+                            last_bbox = track.get_last_bbox()
                             if last_bbox is None:
-                                reasons.append(f"skip track_id={tr.track_id} (no last_bbox)")
+                                reasons.append(f"skip track_id={track.track_id} (no last_bbox)")
                                 continue
                             iou = float(compute_iou(last_bbox, ob.bbox))
                             if iou > best_iou:
                                 best_iou = iou
-                                best_tid = tr.track_id
+                                best_tid = track.track_id
                                 best_last_bbox = last_bbox
 
                         # Decision log relative to threshold
@@ -796,8 +874,6 @@ def track_across_segments(
             ####################-------------######################
             # Safety: this check only applies on true resume (anchor > 0)
             if _is_resume and shot_idx == 0:
-                # Build a consolidated key list only for the anchor-containing shot,
-                # legacy (prior_tracks) must come entirely before the new shot part.
                 def _keys_for_shot(tracks, shot_num):
                     out = []
                     for tr in tracks or []:
@@ -807,15 +883,56 @@ def track_across_segments(
                             out.append((int(o.frame_idx), int(tr.track_id)))
                     return sorted(out)
 
+                # Legacy = rehydrated pre-anchor tracks only
                 legacy_keys = _keys_for_shot(prior_tracks, shot_number)
-                new_keys    = _keys_for_shot(aggregator.tracks, shot_number)
-                if legacy_keys and new_keys and legacy_keys[-1][0] >= new_keys[0][0]:
-                    raise ResumeSafetyError(f"non-monotone concat at shot={shot_number}: "
-                                            f"legacy_last={legacy_keys[-1][0]} new_first={new_keys[0][0]}")
-                logging.info("resume: legacy/new concat OK for shot=%d (legacy_last=%s new_first=%s)",
-                            shot_number,
-                            legacy_keys[-1][0] if legacy_keys else None,
-                            new_keys[0][0] if new_keys else None)
+                legacy_last = legacy_keys[-1][0] if legacy_keys else -1
+                legacy_set  = set(legacy_keys)
+
+                # "New" = only those keys strictly after the last legacy frame
+                all_keys_now = _keys_for_shot(aggregator.tracks, shot_number)
+                new_only_keys = [k for k in all_keys_now if k[0] > legacy_last]
+
+                # ---- Invariants ----
+
+                # (A) No overlap/duplicates between legacy and new portions
+                assert not any(k in legacy_set for k in new_only_keys), \
+                    "rehydrate safety: duplicate (shot,track,frame) across legacy and new portions"
+
+                # (B) New portion itself must be non-decreasing
+                assert all(new_only_keys[i-1][0] <= new_only_keys[i][0] for i in range(1, len(new_only_keys))), \
+                    "rehydrate safety: new portion frames not non-decreasing"
+
+                # (C) Per-(track) monotonicity when concatenating legacy + new
+                from collections import defaultdict
+                by_track_legacy = defaultdict(list)
+                by_track_new    = defaultdict(list)
+                for f, tid in legacy_keys:
+                    by_track_legacy[tid].append(f)
+                for f, tid in new_only_keys:
+                    by_track_new[tid].append(f)
+
+                for tid in set(by_track_legacy) | set(by_track_new):
+                    L = by_track_legacy.get(tid, [])
+                    N = by_track_new.get(tid, [])
+                    if L and N:
+                        assert L[-1] <= N[0], \
+                            f"rehydrate safety: non-monotone concat for track={tid} (legacy_last={L[-1]} > new_first={N[0]})"
+                    # New per-track must be non-decreasing on its own
+                    assert all(N[i-1] <= N[i] for i in range(1, len(N))), \
+                        f"rehydrate safety: new portion frames not non-decreasing for track={tid}"
+
+                # (D) Optional: ensure resume starts at/after anchor frame (if you want this explicit)
+                if resume_abs_frame is not None and new_only_keys:
+                    assert new_only_keys[0][0] >= int(resume_abs_frame), \
+                        f"rehydrate safety: first new frame {new_only_keys[0][0]} < anchor {resume_abs_frame}"
+
+                logging.info(
+                    "resume safety OK: shot=%d legacy_last=%s first_new=%s new_count=%d",
+                    shot_number,
+                    (legacy_last if legacy_keys else None),
+                    (new_only_keys[0][0] if new_only_keys else None),
+                    len(new_only_keys),
+                )
             ######################--------------###################
 
             if checkpoint:

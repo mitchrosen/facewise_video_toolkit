@@ -20,12 +20,11 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
     # --- minimal frame provider to avoid real I/O ---
     class DummyFP:
         def __init__(self, total=60, w=192, h=108, fps=30.0):
-            import numpy as _np
             self._total = total
             self._w, self._h = w, h
             self._fps = fps
             self._idx = 0
-            self._blank = _np.zeros((h, w, 3), dtype=_np.uint8)
+            self._blank = np.zeros((h, w, 3), dtype=np.uint8)
         @property
         def fps(self): return self._fps
         @property
@@ -98,7 +97,7 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
     )
 
     # --- assertions ---
-    assert "args" in called
+    assert "args" in called, "rehydrate_tracks should be called when anchor > 0"
     _, fm, to = called["args"]
     assert fm == 29                      # anchor - 1
     assert isinstance(to, dict) and to   # non-empty track_order

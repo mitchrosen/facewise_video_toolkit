@@ -4,15 +4,15 @@ from pathlib import Path
 from datetime import datetime, timezone
 import json
 import os
+import time
 import tempfile
 import typing as _t
 import hashlib
-from typing import Protocol, List
+from typing import Protocol, List, Optional, Any, Dict, Tuple
 import numpy as np
 import shutil
 import logging
 from facekit.errors import ResumeSafetyError
-from facekit.utils.io import fsync_parent_dir
 from facekit.pipeline.track_order import (
     track_order_dict_to_list,
     track_order_list_to_dict,
@@ -20,6 +20,9 @@ from facekit.pipeline.track_order import (
     track_order_summary,
     TrackOrderError,
 )
+from facekit.utils.io import fsync_parent_dir
+from facekit.utils.io import atomic_write_npz
+from facekit.tracking.aggregator import ShotFaceTrackAggregatorProtocol
 
 from facekit.common.obs_consts import Source, SRC_TO_CODE
 
@@ -41,6 +44,7 @@ class TrackingCheckpoint(Protocol):
             *,
             frame_idx: int, 
             shot_number: int,
+            aggregator: ShotFaceTrackAggregatorProtocol,
             shot_first_frame: int | None,
             note: str = "checkpoint") -> None: ...
     
@@ -130,6 +134,16 @@ def _dump_npz_atomic(collector, final_path: Path) -> None:
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def _sha256_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    except Exception:
+        return None
+
 @dataclass
 class CheckpointStatus:
     """Small, human-readable status snapshot you can tail while jobs run."""
@@ -163,6 +177,7 @@ class CheckpointStatus:
     log_level: str
     log_file: str | None
     track_order: list[dict] | None = None
+    open_tracks: list | None = None
 
     # misc
     note: str = ""
@@ -198,13 +213,13 @@ class CheckpointManager (TrackingCheckpoint):
         
         # Paths
         self.root = Path(root_dir)
-        self.ckpt_dir  = self.root / "ckpt"
+        self.ckpt_dir  = Path(self.root, "ckpt")
         self.video_path = str(Path(video_path).resolve())
-        self.status_path = self.root / "status.json"
-        self.obs_path    = self.ckpt_dir / "obs_ckpt.npz"
-        self.emb_path    = self.ckpt_dir / "emb_ckpt.npz"
+        self.status_path = Path(self.root, "status.json")
+        self.obs_path    = Path(self.ckpt_dir, "obs_ckpt.npz")
+        self.emb_path    = Path(self.ckpt_dir, "emb_ckpt.npz")
 
-        # Create checkpoint dir, if needed
+        # Create dirs when missing
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # Resume
@@ -233,6 +248,9 @@ class CheckpointManager (TrackingCheckpoint):
         # Collector pointers (set via `start`)
         self._obs = None  # ObservationsCollector
         self._emb = None  # EmbeddingCollector
+
+        # Inline, JSON representation of open tracks at the anchor.
+        self._open_tracks_inline: list[dict] | None = None
 
         # Snapshot of CLI/options for safe resume (populated in start())
         self._cfg: dict[str, _t.Any] = {}
@@ -290,6 +308,13 @@ class CheckpointManager (TrackingCheckpoint):
                         self._emb_rows_at_det = int(last_det_emb_rows)
             except Exception:
                 # Non-fatal: resume can still proceed without these hints.
+                pass
+
+            try:
+                prev_open_tracks = status.get("open_tracks")
+                if isinstance(prev_open_tracks, list) and self._open_tracks_inline is None:
+                    self._open_tracks_inline = prev_open_tracks
+            except Exception:
                 pass
 
             if self._shot_track_to_order:
@@ -385,7 +410,8 @@ class CheckpointManager (TrackingCheckpoint):
                     "track_id": int(tid),
                     "f": int(obs.frame_idx),
                     "bbox_xyxy": [float(v) for v in obs.bbox],
-                    "src": src_val,
+                    "src": src_val.lower(),
+                    "has_crop": int(getattr(obs, "aligned_face", None) is not None),
                     **({"conf": float(obs.confidence)} if getattr(obs, "confidence", None) is not None else {}),
                 })
 
@@ -476,14 +502,15 @@ class CheckpointManager (TrackingCheckpoint):
             self, 
             *, 
             frame_idx: int, 
-            shot_number: int, 
+            shot_number: int,
+            aggregator: ShotFaceTrackAggregatorProtocol,
             shot_first_frame: int | None = None,
             note: str = "checkpoint") -> None:
         """
-        Persist a restartable checkpoint at the current processing boundary.
-        Call this right before you perform a potentially state-changing step,
-        so a resume can re-execute that step deterministically.
-        The provided frame/shot are recorded as the anchor point.
+        Persist a point-in-time snapshot that allows a safe resume:
+        - Write obs_ckpt-<frame>.npz under <run_root>/ckpt atomically.
+        - (Optionally) write emb_ckpt-<frame>.npz if an API is available.
+        - Update status.json with last_detection_frame/shot metadata.
         """
         if self._obs is None or self._emb is None:
             return
@@ -506,15 +533,9 @@ class CheckpointManager (TrackingCheckpoint):
 
         _dump_npz_atomic(self._obs, self.obs_path)
         _dump_npz_atomic(self._emb, self.emb_path)
-        
-        logging.info(
-            "ckpt:snapshot frame=%s shot=%s obs_rows=%d emb_rows=%d files=(%s, %s)",
-            frame_idx, shot_number, obs_count, emb_count, self.obs_path, self.emb_path
-        )
-
-        logging.debug("in checkpoint.checkpoint_now - about to call _write_status()")
+        # Capture a compact JSON list of the open tracks at this anchor.
+        self._open_tracks_inline = self._build_open_tracks_list(aggregator, shot_number)
         self._write_status(note or "checkpoint")
-        logging.debug("in checkpoint.checkpoint_now - just called _write_status()")
 
     def matches_video(self, video_path: _t.Union[str, Path]) -> bool:
         """Return True if the stored checkpoint was created for this video path."""
@@ -579,23 +600,71 @@ class CheckpointManager (TrackingCheckpoint):
         return _video_parent_dir(default_root=default_root, video_path=video_path)
 
     # ---------- resume helpers ----------
-    def get_track_order(self) -> dict[tuple[int, int], int]:
-        return dict(self._shot_track_to_order)
-
     def get_resume_anchor(self):
-        # If we haven't computed it in this process, try to read from status.json.
-        if self._last_det_frame is None:
-            status = self.read_status() or {}
-            lf = status.get("last_detection_frame")
-            ls = status.get("last_detection_shot")
-            lfirst = status.get("last_detection_shot_first_frame")
-            if lf is None:
-                return None
-            # Fill all three fields so subsequent calls are fast/consistent.
-            self._last_det_frame = int(lf)
-            self._last_det_shot = (int(ls) if ls is not None else None)
-            self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
-        return (self._last_det_frame, self._last_det_shot, self._last_det_shot_first_frame)
+        """
+        Return (last_detection_frame, last_detection_shot, last_detection_shot_first_frame)
+        when available. If status.json exists, prefer it. Otherwise, fall back
+        to in-memory attributes that may be set during tests.
+        """
+        # 1) Prefer status.json (single source of truth)
+        try:
+            if self.status_path and self.status_path.exists():
+                import json
+                st = json.loads(self.status_path.read_text() or "{}")
+                frame = st.get("last_detection_frame")
+                shot = st.get("last_detection_shot")
+                shot_first_frame = st.get("last_detection_shot_first_frame")
+                if frame is not None:
+                    return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
+        except Exception:
+            pass
+
+        # 2) Fall back to in-memory fields (used by tests)
+        frame = getattr(self, "_last_det_frame", None)
+        shot = getattr(self, "_last_det_shot", None)
+        shot_first_frame = getattr(self, "_last_det_shot_first_frame", None)
+        if frame is not None:
+            # Ensure ints; return triple (shot_first may be None)
+            return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
+
+        return None
+    
+    def snapshot_open_tracks(self, aggregator) -> None:
+        """
+        Store open tracks with:
+          - shot
+          - track_id
+          - last_frame (ANY)
+          - last_det_frame (authoritative)
+          - bbox at last_det_frame (if known), else last bbox
+        """
+        open_list = []
+        for track in getattr(aggregator, "tracks", []):
+            if track.is_closed():
+                continue
+            last_any = track.last_frame()
+            last_det = track.last_det_frame()
+            # Prefer bbox at last DET; fall back to last ANY bbox
+            bbox = None
+            if last_det is not None:
+                # find obs at last_det
+                for o in reversed(track.observations):
+                    if o.frame_idx == last_det and o.bbox is not None:
+                        bbox = tuple(int(v) for v in o.bbox[:4])
+                        break
+            if bbox is None:
+                lb = track.get_last_bbox()
+                bbox = tuple(int(v) for v in lb[:4]) if lb else (0, 0, 0, 0)
+            open_list.append({
+                "shot": int(getattr(track, "shot_id", -1)),
+                "track_id": int(getattr(track, "track_id", -1)),
+                "last_frame": (int(last_any) if last_any is not None else -1),
+                "last_det_frame": (int(last_det) if last_det is not None else -1),
+                "bbox": bbox,
+            })
+        status = self.read_status() or {}
+        status["open_tracks"] = open_list
+        self.write_status(status)
     
     def resume_available(self) -> bool:
         return self.status_path.exists() and self.obs_path.exists() and self.emb_path.exists()
@@ -1136,8 +1205,64 @@ class CheckpointManager (TrackingCheckpoint):
             summary["obs_rows"], summary["emb_rows"], summary["track_order_entries"]
         )
         return summary
-
     
+    def _build_open_tracks_list(self, aggregator: ShotFaceTrackAggregatorProtocol, shot_number: int) -> list[dict]:
+        """
+        Each open track MUST expose attributes (not methods):
+            - track_id: int
+            - last_frame_idx: int
+            - last_det_frame_idx: int
+            - last_bbox: tuple/list len>=4 (xyxy), ints preferred
+            - closed: bool
+        The shot number is provided by the caller; we do not read it from the track.
+        """
+        tracks = getattr(aggregator, "tracks", None)
+        if not isinstance(tracks, (list, tuple)):
+            raise TypeError("aggregator.tracks must be a list/tuple")
+
+        out: list[dict] = []
+        for t in tracks:
+            if not hasattr(t, "closed"):
+                raise TypeError("track missing required boolean attribute 'closed'")
+            if t.closed:
+                continue
+
+            # Hard requirements — attributes only.
+            try:
+                track_id = int(t.track_id)
+                last_frame_idx = int(t.last_frame_idx)
+                last_det_frame_idx = int(t.last_det_frame_idx)
+                bb = t.last_bbox
+            except AttributeError as e:
+                raise TypeError(f"track missing required attribute: {e}") from e
+
+            if not isinstance(bb, (list, tuple)) or len(bb) < 4:
+                raise TypeError("track.last_bbox must be a length-4 sequence")
+            x1, y1, x2, y2 = (int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3]))
+
+            out.append({
+                "shot": int(shot_number),
+                "track_id": track_id,
+                "last_frame": last_frame_idx,
+                "last_det_frame": last_det_frame_idx,
+                "closed": False,
+                "bbox": [x1, y1, x2, y2],
+            })
+        return out
+        
+    def hydrate_open_tracks_into(self, aggregator) -> int:
+        """
+        Read status.json['open_tracks'] and rehydrate them into the provided aggregator.
+        Safe no-op if nothing is present.
+        """
+        try:
+            status = self.read_status() or {}
+            tracks = status.get("open_tracks") or []
+            return int(aggregator.rehydrate_open_tracks(tracks))
+        except Exception:
+            logging.exception("checkpoint: hydrate_open_tracks_into failed")
+            return 0
+     
     # ---------- internals ----------
     def _write_status(self, note: str) -> None:
         # derive a stable, ordered list from the dict
@@ -1157,6 +1282,7 @@ class CheckpointManager (TrackingCheckpoint):
             "shot_segmentation_path": self._cfg.get("shot_segmentation_path"),
             "checkpoint_dir": str(self.root),
             "track_order": shot_track_order_list,
+            "open_tracks": self._open_tracks_inline,
             "log_level": self._cfg.get("log_level", "INFO"),
             "log_file": self._cfg.get("log_file"),
         }

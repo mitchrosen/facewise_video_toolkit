@@ -3,7 +3,7 @@ from facekit.pipeline.track_across_segments import track_across_segments
 from typing import List
 import numpy as np
 from facekit.pipeline.checkpoint import TrackingCheckpoint
-
+from facekit.tracking.aggregator import ShotFaceTrackAggregatorProtocol
 
 def test_callbacks_invoked(monkeypatch):
     # stub detector/embedder
@@ -63,6 +63,7 @@ def test_callbacks_invoked(monkeypatch):
                     *, 
                     frame_idx: int, 
                     shot_number: int, 
+                    aggregator: ShotFaceTrackAggregatorProtocol,
                     shot_first_frame: int | None = None,
                     note: str = "checkpoint") -> None:
                 self.checkpoints.append((int(frame_idx), int(shot_number)))
@@ -81,7 +82,7 @@ def test_callbacks_invoked(monkeypatch):
                 return (None, None, None, None)
             def get_track_order(self) -> dict[tuple[int, int], int]:
                 return getattr(self, "_track_order", {})  
-
+            
     # a minimal shot json file
     import json, tempfile, pathlib
     shots = {"shots":[{"shot_number":1,"first_frame":0,"last_frame":9}]}

@@ -2,9 +2,11 @@ import json, os
 from pathlib import Path
 import numpy as np
 import pytest
+from typing import Optional, List, Tuple
 from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.output.json_v2 import ObservationsCollector, EmbeddingCollector
 from facekit.errors import ResumeSafetyError
+from facekit.tracking.aggregator import ShotFaceTrackAggregatorProtocol
 
 class DummyObs:
     rows = 0
@@ -21,6 +23,19 @@ class RecordingObs(DummyObs):
     def trim_to(self, n): self.trimmed_to=n; self.rows=n
 
 class RecordingEmb(RecordingObs): pass
+
+class DummyTrack:
+    def __init__(self, tid, bbox, last_f, last_det, closed, shot_id=6):
+        self.track_id = int(tid)
+        self.last_bbox = tuple(int(v) for v in bbox[:4])
+        self.last_frame_idx = int(last_f)
+        self.last_det_frame_idx = int(last_det)
+        self.closed = bool(closed)
+
+class DummyAggregator:
+    def __init__(self, tracks=None, shot_number=6):
+        self.tracks = list(tracks) if tracks is not None else []
+        self.shot_number = int(shot_number)
 
 class FileBackedObs:
     def __init__(self): self.rows = 0; self.trimmed_to = None
@@ -146,7 +161,8 @@ def test_status_lifecycle(tmp_path):
     cm.on_frame(0)
     cm.on_frame(9)
     cm.on_frame(10)
-    cm.checkpoint_now(frame_idx=10, shot_number=1)
+    agg = DummyAggregator([DummyTrack(0, (0,0,10,10), last_f=10, last_det=10, closed=False)])
+    cm.checkpoint_now(frame_idx=10, shot_number=1, aggregator=agg)
     cm.on_shot_done()
     cm.finalize()
     st = json.loads((cm.root/"status.json").read_text())
@@ -163,7 +179,8 @@ def test_load_and_anchor_trims_to_pre_detection(tmp_path):
 
     # Pre-anchor rows, then checkpoint (anchor should record 7/3)
     obs.rows = 7; emb.rows = 3
-    cm.checkpoint_now(frame_idx=5, shot_number=1)
+    agg = DummyAggregator()  # no tracks needed; we just want the call to succeed
+    cm.checkpoint_now(frame_idx=5, shot_number=1, aggregator=agg)
 
     # Advance rows post-anchor and persist them
     obs.rows = 12; emb.rows = 9
@@ -199,7 +216,8 @@ def test_resume_available(tmp_path):
         options_snapshot={"video_path": str(v.resolve())}, 
         no_resume=False)
     cm.start(DummyObs(), DummyEmb(), options_snapshot={"video_path": str(v.resolve())})
-    cm.checkpoint_now(frame_idx=0, shot_number=1)
+    agg = DummyAggregator([])
+    cm.checkpoint_now(frame_idx=0, shot_number=1, aggregator=agg)
     assert cm.resume_available()
 
 def test_atomic_sidecars_exist_even_empty(tmp_path):
@@ -218,4 +236,34 @@ def test_compute_parent_dir_stable(tmp_path):
     p3 = CheckpointManager.compute_parent_dir(tmp_path/"ck", v2)
     assert p1 == p2
     assert p1 != p3
+
+def test_checkpoint_now_saves_open_tracks_snapshot(tmp_path):
+    run = tmp_path / "snap"; (run / "ckpt").mkdir(parents=True)
+    cm = CheckpointManager(run, video_path="/tmp/v.mp4", resume=False)
+
+    obs = ObservationsCollector()
+    emb = EmbeddingCollector(mode="sidecar", dim=512)
+    cm.start(obs, emb, options_snapshot={"detect_interval": 60})
+
+    # Two “open” tracks and one “closed” (closed should not appear as open)
+    t_open_a = DummyTrack(0, bbox=(10, 10, 50, 50), last_f=100, last_det=100, closed=False, shot_id=6)
+    t_open_b = DummyTrack(1, bbox=(20, 20, 60, 60), last_f=101, last_det=100, closed=False, shot_id=6)
+    t_closed = DummyTrack(9, bbox=(0, 0, 0, 0),  last_f=55,  last_det=54,  closed=True,  shot_id=6)
+    agg = DummyAggregator([t_open_a, t_open_b, t_closed], shot_number=6)
+
+    cm.checkpoint_now(frame_idx=101, shot_number=6, aggregator=agg)
+
+    st = json.loads((run / "status.json").read_text())
+    assert "open_tracks" in st and isinstance(st["open_tracks"], list)
+    # Only the open ones should be present
+    ids = {(t["shot"], t["track_id"]) for t in st["open_tracks"]}
+    assert (6, 0) in ids and (6, 1) in ids and (6, 9) not in ids
+
+    # Spot-check contents
+    oc = { (t["shot"], t["track_id"]): t for t in st["open_tracks"] }
+    a = oc[(6, 0)]
+    assert a["last_frame"] == 100
+    assert a["last_det_frame"] == 100
+    assert a["closed"] is False
+    assert tuple(a["bbox"]) == (10, 10, 50, 50)
 

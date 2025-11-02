@@ -83,14 +83,17 @@ def _atomic_copy(src: Path, dst: Path) -> None:
 def _validate_manifest_dict(
         manifest: dict, 
         schema_version: Literal["2.0", "2.1"],
-        total_frame_count: int | None):
+        total_frame_count: int | None,
+        schema_dir: str | None = None) -> list[str]:
     # Convenience for CLI: let dispatcher read via a temp path
     with NamedTemporaryFile("w+", suffix=".json", delete=True) as tmp:
         tmp.write(json.dumps(manifest))
         tmp.flush()
         return validate_manifest(Path(tmp.name), 
                                  schema_version=schema_version, 
-                                 total_frame_count=total_frame_count)
+                                 total_frame_count=total_frame_count,
+                                 schema_dir=schema_dir,
+                                 )
 
 def run_pipeline(args):
     # ---- forbid inline embeddings for 2.1 ----
@@ -356,7 +359,7 @@ def run_pipeline(args):
             manifest["observations_sidecar"] = obs_collector.finalize_sidecar(
                 obs_path,
                 # If we resumed, only persist rows strictly after the anchor frame.
-                min_frame_exclusive=resume_anchor_f if resume_anchor_f is not None else None,
+                min_frame_exclusive=None,
             )
 
             # Ensure manifest has at least one shot, even if no faces/tracks were found.
@@ -378,7 +381,12 @@ def run_pipeline(args):
             epath = cfg.emb_sidecar_path or video_path.with_suffix(".embeddings.npz")
             manifest["embedding_sidecar"] = emb_collector.finalize_sidecar(epath)
 
-        errs = _validate_manifest_dict(manifest, schema_version=args.schema_version, total_frame_count=total_frames)
+        errs = _validate_manifest_dict(
+            manifest,
+            schema_version=args.schema_version,
+            total_frame_count=total_frames,
+            schema_dir=args.schema_dir,
+        )
         if errs:
             logging.error("Validation errors:")
             for e in errs:
@@ -417,6 +425,9 @@ def main() -> None:
     parser.add_argument("--shot-segmentation", default=None, help="Path to shot segmentation JSON (optional)",)
     parser.add_argument("--schema-version", default="2.0", choices=["2.0","2.1"],
                         help = "Manifest schema version to write (default: 2.0).")
+    parser.add_argument("--schema-dir", default=None,
+                        help = "Directory containing schema JSON files. "
+                        "If omitted, uses FACEKIT_SCHEMA_DIR or the package default.")
     parser.add_argument("--output-segment-json", default=None, 
                         help="Optional path to save segment-only tracks JSON")
     parser.add_argument("--output-global-json", nargs="?", const=True, default=None,

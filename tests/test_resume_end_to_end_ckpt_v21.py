@@ -246,9 +246,9 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
     vidA = tmp_path / "A.mp4"
     vidA.write_bytes(b"not a real video")
     run = CheckpointManager._create_new_run_dir(parent, {"video_path": str(vidA)})
-    (run / "ckpt").mkdir()
-    (run / "ckpt" / "obs_ckpt.npz").write_bytes(b"PK\x03\x04")  # any zip header
-    (run / "ckpt" / "emb_ckpt.npz").write_bytes(b"PK\x03\x04")
+    Path(run, "ckpt").mkdir()
+    Path(run, "ckpt", "obs_ckpt.npz").write_bytes(b"PK\x03\x04")  # any zip header
+    Path(run, "ckpt", "emb_ckpt.npz").write_bytes(b"PK\x03\x04")
 
     st = {
         "video_path": str(vidA),
@@ -276,7 +276,7 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         "last_saved_utc": "now", "note": "opened",
         "track_order": [{"shot": 1, "track_id": 0, "order": 0}],
     }
-    (run / "status.json").write_text(json.dumps(st, indent=2))
+    Path(run, "status.json").write_text(json.dumps(st, indent=2))
 
     # Try to open with a different video path
     vidB = tmp_path / "B.mp4"
@@ -289,17 +289,17 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         mgr.validate_resume_or_raise({"video_path": str(vidB), "schema_version": "2.1"}, force=False)
 
 def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
-    parent = tmp_path / "ck2"
+    parent = Path(tmp_path, "ck2")
     parent.mkdir()
-    vid = tmp_path / "v.mp4"
+    vid = Path(tmp_path, "v.mp4")
     vid.write_bytes(b"v")
     run = CheckpointManager._create_new_run_dir(parent, {"video_path": str(vid)})
-    (run / "ckpt").mkdir()
-    (run / "ckpt" / "obs_ckpt.npz").write_bytes(b"PK\x03\x04")
-    (run / "ckpt" / "emb_ckpt.npz").write_bytes(b"PK\x03\x04")
+    Path(run, "ckpt").mkdir()
+    Path(run, "ckpt", "obs_ckpt.npz").write_bytes(b"PK\x03\x04")
+    Path(run, "ckpt", "emb_ckpt.npz").write_bytes(b"PK\x03\x04")
     st = {"video_path": str(vid), "schema_version": "2.0",
               "track_order": [{"shot": 1, "track_id": 0, "order": 0}]}  # <- mismatch
-    (run / "status.json").write_text(json.dumps(st))
+    Path(run, "status.json").write_text(json.dumps(st))
     mgr = CheckpointManager.open(parent_dir=parent, video_path=vid, options_snapshot={"video_path": str(vid)}, no_resume=False, resume_latest=True)
     with pytest.raises(ResumeSafetyError):
         mgr.validate_resume_or_raise({"video_path": str(vid), "schema_version": "2.1"}, force=False)

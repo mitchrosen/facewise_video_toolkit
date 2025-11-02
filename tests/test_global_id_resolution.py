@@ -43,16 +43,22 @@ def make_track_with_frames(track_id: int, emb: np.ndarray, shot_id: int, start: 
 
 def test_clusters_get_same_global_id():
     """Two tight clusters should yield two distinct global IDs."""
-    resolver = GlobalIdentityResolver(embedding_threshold=0.8)
+    resolver = GlobalIdentityResolver(embedding_threshold=0.95)
     # Cluster A
     emb_a = make_vector(angle_rad=0, seed=1)
-    emb_b = make_vector(angle_rad=np.arccos(0.99), seed=2)  # sim ≈ 0.99
-    # Cluster B
-    emb_c = make_vector(angle_rad=np.arccos(0.6), seed=3)   # sim ≈ 0.6
-    emb_d = make_vector(angle_rad=np.arccos(0.61), seed=4)  # sim ≈ 0.61
+    emb_b = make_vector(angle_rad=np.arccos(0.99), seed=2)     # sim ~ 0.99
+    # Cluster B: also tight (> 0.97)
+    emb_c = make_vector(angle_rad=np.arccos(0.975), seed=3)    # sim ~ 0.975
+    emb_d = make_vector(angle_rad=np.arccos(0.972), seed=4)    # sim ~ 0.972
 
-    tracks = [make_track(0, emb_a), make_track(1, emb_b),
-              make_track(2, emb_c), make_track(3, emb_d)]
+    # Put the two tight pairs in different shots so the resolver is allowed to merge them.
+    tracks = [
+        make_track(0, emb_a, shot_id=0),
+        make_track(1, emb_b, shot_id=0),
+        make_track(2, emb_c, shot_id=1),
+        make_track(3, emb_d, shot_id=1),
+    ]
+
     resolver.resolve_global_ids(tracks, start_id=0)
     ids = {t.global_id for t in tracks}
     assert len(ids) == 2, f"Expected 2 clusters but got {len(ids)}: {ids}"
@@ -111,12 +117,16 @@ def test_noise_effect_on_merging():
 
 def test_cluster_assignment_in_mixed_scenario():
     """Two clusters and an outlier."""
-    resolver = GlobalIdentityResolver(embedding_threshold=0.85)
-    t1 = make_track(0, make_vector(angle_rad=0, seed=1))
-    t2 = make_track(1, make_vector(angle_rad=np.arccos(0.98), seed=2))
-    t3 = make_track(2, make_vector(angle_rad=np.arccos(0.70), seed=3))
-    t4 = make_track(3, make_vector(angle_rad=np.arccos(0.69), seed=4))
-    t5 = make_track(4, make_vector(angle_rad=np.arccos(0.0),  seed=5))  # outlier
+    resolver = GlobalIdentityResolver(embedding_threshold=0.92)
+    # Put the two clusters in different shots; outlier in its own shot.
+    t1 = make_track(0, make_vector(angle_rad=0, seed=1),               shot_id=0)
+    t2 = make_track(1, make_vector(angle_rad=np.arccos(0.98), seed=2), shot_id=0)
+    # Cluster 2: tight, ~0.95+
+    t3 = make_track(2, make_vector(angle_rad=np.arccos(0.955), seed=3), shot_id=1)
+    t4 = make_track(3, make_vector(angle_rad=np.arccos(0.953), seed=4), shot_id=1)
+    # Outlier
+    t5 = make_track(4, make_vector(angle_rad=np.arccos(0.0),  seed=5), shot_id=2)
+
     tracks = [t1, t2, t3, t4, t5]
     resolver.resolve_global_ids(tracks, start_id=0)
     ids = [t.global_id for t in tracks]
