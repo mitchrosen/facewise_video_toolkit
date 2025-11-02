@@ -28,6 +28,7 @@ from facekit.output.json_v2 import (
     build_v2_manifest_from_tracks,
     build_v2_1_manifest_from_tracks,
     derive_face_metadata,
+    derive_face_metadata_from_observations,
     write_v2_json,
     EmbeddingCollector,
     ObservationsCollector
@@ -315,7 +316,8 @@ def run_pipeline(args):
             emb_store=emb_store,
             emb_sidecar_path=sidecar_path,
         )
-        face_meta = derive_face_metadata(tracks)
+        face_meta = derive_face_metadata_from_observations(obs_collector, tracks)
+
 
         if args.schema_version == "2.0":
             writer_collector: EmbeddingCollector | None = None
