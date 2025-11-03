@@ -652,11 +652,8 @@ class EmbeddingCollector:
             return 0
         if self.dim is not None and arr.shape[1] != self.dim:
             raise ValueError(f"EmbeddingCollector.load_npz: dim mismatch {arr.shape[1]} != {self.dim}")
-        for row in arr:
-            self._embs.append(row.copy())
-        n = int(arr.shape[0])
-        self._base += n
-        return n
+        self._embs.extend(row.copy() for row in arr)
+        return int(arr.shape[0])
 
     def trim_to(self, n: int) -> None:
         n = max(0, int(n))

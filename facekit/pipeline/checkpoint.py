@@ -1135,6 +1135,26 @@ class CheckpointManager (TrackingCheckpoint):
 
         return loaded_obs, loaded_emb
     
+    def audit_missing_embeddings_before_anchor_shot(self) -> dict[int, tuple[int, int]]:
+        """
+        Enforce invariant:
+        - Shots strictly BEFORE the anchor shot:
+            * OK if det_rows == 0 (no faces detected).
+            * NOT OK if 0 < have < det (some DET rows lack embeddings).
+        - Current anchor shot may have have < det (we batch at end-of-shot).
+        Returns a map of offending shots -> (det_rows, have_rows).
+        """
+        out: dict[int, tuple[int,int]] = {}
+        if self._last_det_shot is None:
+            return out
+
+        for shot in range(1, int(self._last_det_shot)):
+            det, have = self._count_det_rows_for_shot(shot)
+            # Only flag shots that actually had detections.
+            if det > 0 and have < det:
+                out[int(shot)] = (det, have)
+        return out
+        
     def rehydrate_runtime(
         self,
         obs_collector,
@@ -1204,7 +1224,96 @@ class CheckpointManager (TrackingCheckpoint):
             summary["anchor_frame"], summary["anchor_shot"], summary["anchor_shot_first_frame"],
             summary["obs_rows"], summary["emb_rows"], summary["track_order_entries"]
         )
+
+        # --- Resume-time safety check for embeddings completeness in completed shots ---
+        try:
+            self._validate_resume_embeddings(
+                anchor_shot=self._last_det_shot,
+            )
+        except ResumeSafetyError:
+            # Bubble up as fatal (global-ID resolution requires completeness on past shots)
+            raise
+        except Exception as e:
+            # Non-schema exceptions should not crash resume; log loudly.
+            logging.exception("rehydrate: embeddings validation encountered a non-fatal error: %s", e)
+
         return summary
+
+    # ---------- embeddings validation helpers ----------
+    def _det_stats_for_shot(self, shot_num: int) -> tuple[int, int]:
+        """
+        Returns (det_rows, det_rows_with_embeddings) for a given shot.
+        Uses the canonical observations structured array (vectorized; no block peeking).
+        """
+        if not hasattr(self, "obs_collector") or self.obs_collector is None:
+            return (0, 0)
+        try:
+            arr = self.obs_collector.to_array()
+        except Exception:
+            return (0, 0)
+        if getattr(arr, "size", 0) == 0:
+            return (0, 0)
+
+        try:
+            det_code = SRC_TO_CODE[Source.DETECTED]
+            mask_shot = (arr["shot"] == int(shot_num))
+            mask_det  = (arr["src"]  == int(det_code))
+            mask      = mask_shot & mask_det
+            det_rows  = int(mask.sum())
+            if det_rows == 0:
+                return (0, 0)
+            with_emb  = int(((arr["emb_idx"] >= 0) & mask).sum())
+            return (det_rows, with_emb)
+        except Exception:
+            # Be cautious; prefer to not fail here. The caller enforces policy.
+            return (0, 0)
+
+    def _validate_resume_embeddings(self, *, anchor_shot: int | None) -> None:
+        """
+        Policy:
+          - For shots < anchor_shot:
+               * If det_rows == 0: OK (no faces detected → zero embeddings acceptable).
+               * Else require det_rows_with_embeddings == det_rows; otherwise fatal.
+          - For shot == anchor_shot: allow partial/zero (mid-shot resume).
+        """
+        # Establish the set of shots we know about from track_order (stable across resumes).
+        try:
+            shots_present = sorted({int(s) for (s, _) in (self._shot_track_to_order or {}).keys()})
+        except Exception:
+            shots_present = []
+
+        if not shots_present:
+            # No tracks yet; nothing to validate.
+            logging.info("resume: no shots present in track_order; skipping embeddings validation.")
+            return
+
+        # If we don't know the anchor_shot, treat all completed shots as empty set.
+        a_shot = anchor_shot if anchor_shot is not None else None
+
+        for s in shots_present:
+            if a_shot is not None and s > a_shot:
+                # Future shots (shouldn't exist in track_order yet), skip defensively.
+                continue
+            if a_shot is not None and s == a_shot:
+                # Current (interrupted) shot: embeddings may be incomplete; allowed.
+                continue
+
+            # Completed shots must be consistent: either no DET rows, or full embeddings coverage.
+            det_rows, with_emb = self._det_stats_for_shot(s)
+            if det_rows == 0:
+                # OK: no detected faces in this shot → zero embeddings acceptable.
+                logging.info("resume: shot=%d has no DET rows; zero embeddings is acceptable.", s)
+                continue
+            if with_emb < det_rows:
+                # Fatal: we have DET rows but not enough embeddings stored for a *completed* shot.
+                raise ResumeSafetyError(
+                    f"resume: embeddings incomplete for completed shot {s}: "
+                    f"det_rows={det_rows}, with_embeddings={with_emb}. "
+                    "This would break deterministic global-ID resolution. "
+                    "Re-run prior segment or regenerate checkpoints."
+                )
+            # Otherwise OK.
+            logging.info("resume: shot=%d embeddings coverage OK (det=%d, with_emb=%d).", s, det_rows, with_emb)
     
     def _build_open_tracks_list(self, aggregator: ShotFaceTrackAggregatorProtocol, shot_number: int) -> list[dict]:
         """

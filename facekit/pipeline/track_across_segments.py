@@ -54,11 +54,6 @@ def _track_summary(tr: FaceTrack) -> dict:
         "last_det_frame": last_det_frame,
     }
 
-def _log_tracks_state(msg: str, tracks: Iterable[FaceTrack], level: int=logging.INFO) -> None:
-    logging.log(level, "%s (count=%d)", msg, sum(1 for _ in tracks))
-    for tr in tracks:
-        logging.log(level, "  track: %s", _track_summary(tr))
-
 
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     """
@@ -310,6 +305,16 @@ def track_across_segments(
 
         resume_abs_frame: int = _resolve_anchor()
 
+        # === AUDIT FENCE #0: record collector rows BEFORE any new work ===
+        rows_before = None
+        try:
+            if checkpoint and hasattr(checkpoint, "obs_collector"):
+                rows_before = int(checkpoint.obs_collector.count())
+                logging.info("resume: obs_collector rows BEFORE processing=%d", rows_before)
+        except Exception:
+            logging.exception("resume: failed to read obs_collector.count() before")
+        #############----------------##################
+
         # Identify anchor-containing shot BEFORE any trimming (used for logging)
         anchor_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame) if resume_abs_frame > 0 else None
         anchor_shot_num = (
@@ -350,8 +355,6 @@ def track_across_segments(
                 emb_lookup=_emb_lookup,
                 emb_array_lookup=_emb_array_lookup,
             )
-
-            _log_tracks_state("resume: rehydrated tracks (pre-anchor)", prior_tracks, level=logging.INFO)
 
             # Log by-shot counts & seeds we computed
             try:
@@ -399,20 +402,7 @@ def track_across_segments(
                 segment_id_seed_by_shot = {}
                 trackid_seed_by_shot = {}
 
-            # --- Resume integrity checks (for shots before anchor_shot_frame_idx embeddings must be finite) ---
-            missing_by_shot: dict[int, int] = {}
-            for track in prior_tracks or []:
-                shot_num = int(getattr(track, "shot_id", -1))
-                if shot_num in completed_shot_nums: 
-                    for obs in getattr(track, "observations", []) or []:
-                        if obs.source == Source.DETECTED:
-                            ok = (obs.embedding is not None) and np.isfinite(obs.embedding).all()
-                            if not ok:
-                                missing_by_shot[shot_num] = missing_by_shot.get(shot_num, 0) + 1
-            if missing_by_shot:
-                raise ResumeSafetyError(
-                    f"rehydrate: missing DET embeddings in completed shots before anchor_shot_num: {missing_by_shot}"
-                )
+            checkpoint._validate_resume_embeddings(anchor_shot=anchor_shot_num)
                 
             logging.info("resume: prior_tracks strictness OK (anchor_shot_num=%s); %d tracks rehydrated",
                 anchor_shot_num, len(prior_tracks or []))
@@ -458,10 +448,16 @@ def track_across_segments(
                 start_at = max(first, resume_abs_frame)
             else:
                 start_at = first
-
             if shot_idx == 0:
-                logging.info("resume: first_new_frame=%d (shot=[%d..%d]) detect_interval=%d mod=%d",
-                    start_at, first, last, detect_interval, (start_at % detect_interval))
+                # === AUDIT FENCE #1: make the loop range explicit & fail fast on empty range ===
+                logging.info(
+                    "resume: first_new_frame=%d (shot=[%d..%d]) detect_interval=%d mod=%d",
+                    start_at, first, last, detect_interval, ((start_at - first) % max(1, detect_interval)),
+                )
+                if start_at > last:
+                    raise ResumeSafetyError(
+                        f"empty work-range at resume: start_at={start_at} > shot_last={last} for shot={shot_number}"
+                    )
 
             # Determine seeded prior tracks only when resuming and 
             # for the first processed shot (anchor-containing shot)
@@ -520,15 +516,6 @@ def track_across_segments(
                 seg_seed,
             )
 
-            # If this is the first processed shot, dump prior_tracks *for that shot* so we know the reference
-            if shot_idx == 0:
-                prior_for_shot = [tr for tr in prior_tracks if int(getattr(tr, "shot_id", -1)) == int(shot_number)]
-                _log_tracks_state(f"shot={shot_number}: prior_tracks for this shot (pre-anchor)", prior_for_shot, level=logging.INFO)
-
-            # With warmstart, aggregator may already contain seeded tracks
-            logging.info("shot=%d init: aggregator has %d tracks (0 when cold, >0 when warmstart)",
-                        int(shot_number), len(aggregator.tracks))
-
             # Seed the aggregator’s next track_id only if we did not already pass next_tid_seed.
             if not seeded_tracks and seed_tid > 0:
                 if hasattr(aggregator, "set_track_id_seed") and callable(getattr(aggregator, "set_track_id_seed")):
@@ -552,7 +539,25 @@ def track_across_segments(
             for frame_idx in range(start_at, last + 1):
                 frame = frame_provider.next()
                 if frame is None:
+                    # If we're resuming, failing to land exactly at the anchor is unsafe.
+                    if _is_resume and frame_idx == start_at:
+                        raise ResumeSafetyError(
+                            f"frame provider failed to seek to start_at={start_at} for shot={shot_number} "
+                            f"(first={first}, last={last})."
+                        )
+                    # Cold start or transient hiccup: quick retry, then skip this frame.
+                    frame = frame_provider.next()
+                    if frame is None:
+                        logging.warning(
+                            "frame_provider returned None at frame %d (shot=%d); skipping frame.",
+                            frame_idx, shot_number
+                        )
+                        continue
                     break
+
+                # Log once to prove we actually enter the processing loop post-anchor
+                if frame_idx == start_at:
+                    logging.info("ENTER processing loop at frame=%d (anchor=%d)", frame_idx, resume_abs_frame)
 
                 # Guardrail: never emit pre-anchor frames
                 if resume_abs_frame and frame_idx < resume_abs_frame:
@@ -612,52 +617,17 @@ def track_across_segments(
                         shot_number, first, frame_idx, (frame_idx % detect_interval), tracker_active, detect_interval
                     )
 
-                    #############-------------DEBUG (guarded)------------##############
-                    def _debug_dump_collector(collector, tag):
-                        try:
-                            if collector is None:
-                                logging.debug("COLLECTOR-DUMP [%s]: <none>", tag)
-                                return
-                            # Keep the dump lightweight & resilient across stub impls.
-                            summary = getattr(collector, "summary", None)
-                            if callable(summary):
-                                logging.info("COLLECTOR-DUMP [%s]: %s", tag, summary(max_items=20))
-                                return
-                            # Fallback: try a very generic size/count probe
-                            get_count = getattr(collector, "count_rows", None)
-                            if callable(get_count):
-                                logging.info("COLLECTOR-DUMP [%s]: rows=%s", tag, get_count())
-                            else:
-                                logging.info("COLLECTOR-DUMP [%s]: (no summary/count API)", tag)
-                        except Exception as e:
-                            logging.debug("COLLECTOR-DUMP [%s] failed: %s", tag, e)
-
-                    if frame_idx == 21 and checkpoint is not None:
-                        # Support both public attrs and optional accessors without
-                        # tightening the TrackingCheckpoint protocol.
-                        oc = None
-                        ec = None
-                        getter = getattr(checkpoint, "get_obs_collector", None)
-                        if callable(getter):
-                            oc = getter()
-                        if oc is None:
-                            oc = getattr(checkpoint, "obs_collector", None)
-                        getter = getattr(checkpoint, "get_emb_collector", None)
-                        if callable(getter):
-                            ec = getter()
-                        if ec is None:
-                            ec = getattr(checkpoint, "emb_collector", None)
-                        _debug_dump_collector(oc, "obs_collector: pre frame 21 detect")
-                        _debug_dump_collector(ec, "emb_collector: pre frame 21 detect")
-                    #############-------------END DEBUG------------######
-
-                    if checkpoint:
-                        checkpoint.checkpoint_now(
-                            frame_idx=frame_idx, 
-                            shot_number=shot_number,
-                            aggregator=aggregator,
-                            shot_first_frame=first,
-                        )
+                    try:
+                        if checkpoint:
+                            checkpoint.checkpoint_now(
+                                frame_idx=frame_idx, 
+                                shot_number=shot_number,
+                                aggregator=aggregator,
+                                shot_first_frame=first,
+                                note=f"detect@{frame_idx}",
+                            )
+                    except Exception:
+                        logging.exception("checkpoint: failed to persist at detect frame %s", frame_idx)                       
                     
                     detections = detector.detect_faces_in_frame(frame)
                     
@@ -716,77 +686,8 @@ def track_across_segments(
                         frame_idx, int(shot_number), len(dets), dets
                     )
 
-                    # For each detection, compute IoU vs every current aggregator track and log the best
-                    for idx, ob in enumerate(observations):
-                        best_tid = None
-                        best_iou = -1.0
-                        best_last_bbox = None
-                        reasons = []
-                        for track in aggregator.tracks:
-                            if track.is_closed():
-                                reasons.append(f"skip track_id={track.track_id} (closed)")
-                                continue
-                            last_bbox = track.get_last_bbox()
-                            if last_bbox is None:
-                                reasons.append(f"skip track_id={track.track_id} (no last_bbox)")
-                                continue
-                            iou = float(compute_iou(last_bbox, ob.bbox))
-                            if iou > best_iou:
-                                best_iou = iou
-                                best_tid = track.track_id
-                                best_last_bbox = last_bbox
-
-                        # Decision log relative to threshold
-                        iou_thresh_eff = float(getattr(aggregator, "iou_threshold", 0.5))
-                        can_bind = best_iou >= iou_thresh_eff if best_iou >= 0 else False
-
-                        logging.info(
-                            "MATCH frame=%d det_idx=%d det_bbox=%s best_tid=%s best_iou=%.4f (thresh=%.3f) can_bind=%s best_last_bbox=%s",
-                            frame_idx, idx, tuple(int(v) for v in ob.bbox[:4]),
-                            (int(best_tid) if best_tid is not None else None),
-                            best_iou, iou_thresh_eff, bool(can_bind),
-                            (tuple(int(v) for v in best_last_bbox) if best_last_bbox else None)
-                        )
-
-                        if reasons:
-                            logging.debug("  skipped tracks: %s", reasons)
-
-                    # Snapshot aggregator state *before* the assignment happens
-                    _log_tracks_state(
-                        f"PRE-ASSIGN state at frame={frame_idx} shot={shot_number}",
-                        aggregator.tracks, level=logging.INFO
-                    )
-
                 # Add current frame observations to aggregator
                 created_count = aggregator.update_tracks_with_frame(frame_idx, observations)
- 
-                if _is_resume and shot_idx == 0 and need_detect:
-                    # On the very first DET frame after resume, verify whether we extended or created.
-                    if created_count == 0:
-                        logging.info("RESUME OK: first DET after anchor extended an existing track (no new track created).")
-                    else:
-                        logging.warning("RESUME NOTE: first DET after anchor created %d new track(s). "
-                                        "This is expected only if IoU<threshold or geometry changed.", created_count)
-
-                # POST-ASSIGN diagnostics (created_count now defined)
-                logging.info(
-                    "POST-ASSIGN frame=%d shot=%d created=%d open_now=%d total=%d",
-                    frame_idx, int(shot_number), int(created_count),
-                    sum(1 for t in aggregator.tracks if not t.is_closed()),
-                    len(aggregator.tracks)
-                )
-
-                # Log exactly which tracks received a DET observation at this frame
-                agg_det_now = aggregator.observations_at(frame_idx, source=Source.DETECTED, require_track_id=True)
-                if agg_det_now:
-                    logging.info(
-                        "ASSIGNED-DETS frame=%d: %s",
-                        frame_idx,
-                        [{"tid": int(o.track_id), "bbox": tuple(int(v) for v in o.bbox[:4])} for o in agg_det_now]
-                    )
-                else:
-                    logging.info("ASSIGNED-DETS frame=%d: none", frame_idx)
-
 
                 # Mark binding as used exactly once on the first detection frame where it applied.
                 if (
@@ -811,6 +712,11 @@ def track_across_segments(
                 # Checkpoint observations
                 if checkpoint:
                     frame_obs = aggregator.observations_at(frame_idx, require_track_id=True)
+                    # At the anchor frame, some pipelines can momentarily lack track_ids.
+                    # Retry *only at the anchor* without strictness so we at least persist those detections.
+                    if (not frame_obs) and (frame_idx == resume_abs_frame):
+                        logging.info("resume: no require_track_id observations at anchor; retrying without strictness.")
+                        frame_obs = aggregator.observations_at(frame_idx, require_track_id=False)
                     if frame_obs:
                         checkpoint.add_observations(shot_number, frame_idx, frame_obs)
                     if created_count:
@@ -936,6 +842,21 @@ def track_across_segments(
             ######################--------------###################
 
             if checkpoint:
-                checkpoint.on_shot_done()
+                 checkpoint.on_shot_done()
 
-    return all_tracks
+        # === AUDIT FENCE #3: rows AFTER processing and delta ===
+        try:
+            if checkpoint and hasattr(checkpoint, "obs_collector"):
+                rows_after = int(checkpoint.obs_collector.count())
+                delta = rows_after - (rows_before or 0)
+                logging.info("resume: obs_collector rows AFTER processing=%d (delta=%d)", rows_after, delta)
+                # If we were resuming, we expect to have appended something.
+                if resume_abs_frame > 0:
+                    assert delta > 0, (
+                        "no new observations appended during resume; "
+                        "check first_new_frame range and collector append mode"
+                    )
+        except Exception:
+            logging.exception("resume: failed to read obs_collector.count() after")
+
+        return all_tracks
