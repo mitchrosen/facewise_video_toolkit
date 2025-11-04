@@ -58,6 +58,10 @@ def main():
                         help="Path to write the **JSON V2** manifest for resolved global IDs")
     parser.add_argument("--output_video", nargs="?", const=True, default=None,
                         help="Optionally render labeled video with global + segment IDs")
+    parser.add_argument("--resolver-debug-json", default=None,
+                        help="If set, write resolver assignment debug JSON to this path.")
+    parser.add_argument("--resolver-seed-map", default=None,
+                        help="Path to JSON: {'seeds': [[shot,segment,global_id], ...]} to pin IDs for known groups.")
 
     parser.add_argument("--detect_interval", type=int, default=30)
     parser.add_argument("--embedding_batch_size_max", type=int, default=32)
@@ -166,7 +170,17 @@ def main():
         print(f"Wrote segment tracks to {segment_path}")
 
     # Resolve global IDs and (optionally) render
-    resolver = GlobalIdentityResolver(embedding_threshold=0.70)
+    seed_map = None
+    if args.resolver_seed_map:
+        with open(args.resolver_seed_map, "r") as f:
+            payload = json.load(f)
+        seed_map = {(int(s), int(seg)): int(gid) for s, seg, gid in payload.get("seeds", [])}
+
+    resolver = GlobalIdentityResolver(
+        embedding_threshold=0.70,
+        debug_dump_path=args.resolver_debug_json,
+        seed_map=seed_map,
+    )
     resolver.resolve_global_ids(tracks)
 
     if args.output_video:

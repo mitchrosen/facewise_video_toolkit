@@ -12,6 +12,7 @@ from typing import Protocol, List, Optional, Any, Dict, Tuple
 import numpy as np
 import shutil
 import logging
+
 from facekit.errors import ResumeSafetyError
 from facekit.pipeline.track_order import (
     track_order_dict_to_list,
@@ -23,7 +24,12 @@ from facekit.pipeline.track_order import (
 from facekit.utils.io import fsync_parent_dir
 from facekit.utils.io import atomic_write_npz
 from facekit.tracking.aggregator import ShotFaceTrackAggregatorProtocol
-
+from facekit.utils.debug_snapshots import (
+    snapshot_from_aggregator, 
+    load_latest_snapshot, 
+    diff_snapshot_vs_rehydrate,
+    write_snapshot_atomic,
+)
 from facekit.common.obs_consts import Source, SRC_TO_CODE
 
 REQUIRED_SCHEMA_VERSION = "2.3"
@@ -255,6 +261,7 @@ class CheckpointManager (TrackingCheckpoint):
         # Snapshot of CLI/options for safe resume (populated in start())
         self._cfg: dict[str, _t.Any] = {}
 
+        self.logger = getattr(self, "logger", None) or logging.getLogger("facekit.checkpoint")
     # ---------- public API ----------
 
     def start(self,
@@ -405,15 +412,25 @@ class CheckpointManager (TrackingCheckpoint):
             rows = []
             for obs in obs_list:
                 src_val = getattr(obs, "source", None) or Source.DETECTED
-                rows.append({
-                    "shot": int(shot_number),
+                # robust has_crop: true if aligned_face OR crop_ref present
+                _has_crop = int(
+                    (getattr(obs, "aligned_face", None) is not None) or
+                    (getattr(obs, "crop_ref", None) is not None)
+                )
+                row = {                    "shot": int(shot_number),
                     "track_id": int(tid),
                     "f": int(obs.frame_idx),
                     "bbox_xyxy": [float(v) for v in obs.bbox],
                     "src": src_val.lower(),
-                    "has_crop": int(getattr(obs, "aligned_face", None) is not None),
-                    **({"conf": float(obs.confidence)} if getattr(obs, "confidence", None) is not None else {}),
-                })
+                    "has_crop": _has_crop,
+                }
+                if getattr(obs, "confidence", None) is not None:
+                    row["conf"] = float(obs.confidence)
+                # ▶ carry crop_ref if present (relative to run dir)
+                _cr = getattr(obs, "crop_ref", None)
+                if _cr:
+                    row["crop_ref"] = str(_cr)
+                rows.append(row)
 
             # emb_idx is unknown here; set to -1 via emb_idx_fn
             _, k = self._obs.append_track_obs(rows, emb_idx_fn=lambda _o: -1)
@@ -1133,6 +1150,63 @@ class CheckpointManager (TrackingCheckpoint):
             lf, ls
         )
 
+        # --- Trim BY FRAME so nothing at/after the anchor remains ---
+        # If we know the last detection frame, drop any rows with f >= anchor_frame.
+        try:
+            if lf is not None:
+                anchor_frame_int = int(lf)
+
+                # Prefer collector-native frame trimming if available.
+                trimmed_by_frame = False
+                if hasattr(obs_collector, "trim_to_frame") and callable(obs_collector.trim_to_frame):
+                    obs_before = getattr(obs_collector, "count", lambda: None)()
+                    obs_collector.trim_to_frame(anchor_frame_int - 1)   # keep strictly < anchor
+                    obs_after = getattr(obs_collector, "count", lambda: None)()
+                    logging.info(
+                        "ckpt:frame-trim obs %s→%s @ frame=%d (strictly < anchor)",
+                        obs_before, obs_after, anchor_frame_int
+                    )
+                    trimmed_by_frame = True
+
+                if hasattr(emb_collector, "trim_to_frame") and callable(emb_collector.trim_to_frame):
+                    emb_before = getattr(emb_collector, "count", lambda: None)()
+                    emb_collector.trim_to_frame(anchor_frame_int - 1)
+                    emb_after = getattr(emb_collector, "count", lambda: None)()
+                    logging.info(
+                        "ckpt:frame-trim emb %s→%s @ frame=%d (strictly < anchor)",
+                        emb_before, emb_after, anchor_frame_int
+                    )
+                    trimmed_by_frame = True
+
+                # Fallback: if no trim_to_frame(), derive cut rows from the array & call trim_to(row_count)
+                if not trimmed_by_frame and hasattr(obs_collector, "to_array"):
+                    try:
+                        arr = obs_collector.to_array()
+                        # find the last index whose frame ('f') is < anchor_frame
+                        if getattr(arr, "size", 0) > 0:
+                            # We assume the collector preserves append order;
+                            # find the *position* of the last < anchor frame row.
+                            valid_mask = (arr["f"] < anchor_frame_int)
+                            keep_rows = int(valid_mask.sum())
+                            if keep_rows < getattr(obs_collector, "count", lambda: 0)():
+                                obs_before = getattr(obs_collector, "count", lambda: None)()
+                                if hasattr(obs_collector, "trim_to") and callable(obs_collector.trim_to):
+                                    obs_collector.trim_to(keep_rows)
+                                    obs_after = getattr(obs_collector, "count", lambda: None)()
+                                    logging.info(
+                                        "ckpt:frame-trim(obs) by row-count %s→%s using f<%d",
+                                        obs_before, obs_after, anchor_frame_int
+                                    )
+                    except Exception:
+                        logging.exception("ckpt:frame-trim fallback failed; continuing with row-anchors only.")
+
+                # Cache for downstream logs
+                self._last_det_frame = anchor_frame_int
+            else:
+                logging.info("ckpt:frame-trim skipped (no last_detection_frame in status).")
+        except Exception as e:
+            logging.exception("ckpt:frame-trim encountered an error: %s", e)
+
         return loaded_obs, loaded_emb
     
     def audit_missing_embeddings_before_anchor_shot(self) -> dict[int, tuple[int, int]]:
@@ -1224,6 +1298,22 @@ class CheckpointManager (TrackingCheckpoint):
             summary["anchor_frame"], summary["anchor_shot"], summary["anchor_shot_first_frame"],
             summary["obs_rows"], summary["emb_rows"], summary["track_order_entries"]
         )
+
+        # Guardrail: show any discrepancy if some helper computed a different heuristic.
+        try:
+            heur = getattr(self, "compute_anchor_from_collectors", None)
+            if callable(heur):
+                h = heur()
+                if isinstance(h, tuple):
+                    h = h[0]
+                if h is not None and self._last_det_frame is not None and int(h) != int(self._last_det_frame):
+                    logging.warning(
+                        "ckpt:collector-heuristic anchor=%s disagrees with status.json anchor=%s; ignoring heuristic",
+                        h, self._last_det_frame
+                    )
+        except Exception:
+            # purely diagnostic; never fatal
+            pass
 
         # --- Resume-time safety check for embeddings completeness in completed shots ---
         try:
@@ -1474,5 +1564,44 @@ class CheckpointManager (TrackingCheckpoint):
             logging.error("ckpt:export fallback copy failed: %s", e)
             return False
 
-   
+    @property
+    def snapshots_dir(self) -> Path:
+        return Path(self.run_dir, "ckpt", "snapshots")
+    
+    @property
+    def snapshots_ready(self) -> bool:
+        """True iff snapshotting can be performed (run_dir initialized)."""
+        return bool(getattr(self, "run_dir", None))
 
+    def write_checkpoint_snapshot(self, name: str, payload: dict) -> Path:
+        """
+        Persist a compact snapshot at detect frames.
+        """
+        if not self.snapshots_ready:
+            raise RuntimeError(
+                "ckpt:snapshot attempted before run_dir was initialized. "
+                "Call start_new_run() (or equivalent) to establish run_dir."
+            )
+        try:
+            sd = self.snapshots_dir
+            sd.mkdir(parents=True, exist_ok=True)
+            return write_snapshot_atomic(sd, name, payload)
+        except Exception:
+            self.logger.exception("ckpt:snapshot failed (name=%s)", name)
+            raise
+
+    def compare_rehydrate_to_snapshot(self, *, prior_tracks: list, anchor_frame: int | None) -> None:
+        """
+        Load the latest snapshot at/before the anchor frame and print a concise diff
+        against rehydrated tracks. Safe if nothing to compare.
+        """
+        try:
+            snap = load_latest_snapshot(self.snapshots_dir, up_to_frame=(anchor_frame if anchor_frame is not None else None))
+            if not snap:
+                self.logger.info("ckpt:snapshot none found for diff (up_to_frame=%s)", anchor_frame)
+                return
+            lines = diff_snapshot_vs_rehydrate(snap, prior_tracks)
+            for line in lines:
+                self.logger.info(line)
+        except Exception:
+            self.logger.exception("ckpt:snapshot diff failed")

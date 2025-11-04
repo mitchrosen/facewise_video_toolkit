@@ -5,6 +5,9 @@ import numpy as np
 from contextlib import ExitStack
 from bisect import bisect_left
 import copy
+from PIL import Image
+import os
+import tempfile
 import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
@@ -54,7 +57,6 @@ def _track_summary(tr: FaceTrack) -> dict:
         "last_det_frame": last_det_frame,
     }
 
-
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     """
     Return the **shot index** i such that shots[i]["last_frame"] >= abs_frame_idx,
@@ -70,6 +72,49 @@ def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     # First shot whose last_frame >= resume_abs_frame
     last_frames = [s["last_frame"] for s in shots]
     return bisect_left(last_frames, abs_frame_idx)
+
+def _ckpt_run_root(checkpoint) -> Path:
+    """
+    Return the run root directory for the active checkpoint.
+    Prefers .root (run_dir), falls back to .run_dir, else parent of .ckpt_dir.
+    """
+    cand = getattr(checkpoint, "root", None)
+    if cand:
+        return Path(cand)
+    cand = getattr(checkpoint, "run_dir", None)
+    if cand:
+        return Path(cand)
+    ckpt_dir = getattr(checkpoint, "ckpt_dir", None)
+    if ckpt_dir:
+        return Path(ckpt_dir).parent
+    raise RuntimeError("Cannot determine checkpoint run root (need one of .root, .run_dir, or .ckpt_dir)")
+
+def _shot_crops_dir(ckpt_root: Path, shot_number: int) -> Path:
+    p = ckpt_root / "ckpt" / "crops" / f"shot-{int(shot_number):04d}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _atomic_write_png(dst: Path, img_np) -> None:
+    # img_np expected 112x112x3, RGB or BGR depending on aligner
+    # ArcFace aligner you’re using returns RGB — if yours is BGR, swap here.
+    im = Image.fromarray(img_np)  # assumes RGB
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=dst.parent, suffix=".png", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        im.save(tmp_path, format="PNG", optimize=True)
+        tmp.flush(); os.fsync(tmp.fileno())
+    os.replace(tmp_path, dst)
+
+def _save_crop_for_obs(ckpt_root: Path, shot_number: int, frame_idx: int, tid: int, aligned_face) -> str:
+    crops_dir = _shot_crops_dir(ckpt_root, shot_number)
+    rel_name  = f"f{int(frame_idx):06d}_tid{int(tid):03d}.png"
+    abs_path  = crops_dir / rel_name
+    if not abs_path.exists():
+        _atomic_write_png(abs_path, aligned_face)
+    # return path relative to run root to keep status portable
+    # run root == checkpoint.root
+    rel_path = abs_path.relative_to(ckpt_root)
+    return str(rel_path)
 
 def _assign_segment_ids_for_rehydrated(prior_tracks, track_order: dict[tuple[int,int], int]) -> dict[int, int]:
     """
@@ -114,7 +159,95 @@ def _validate_shots_are_absolute_and_increasing(shots):
             f"Example windows: {diag}. "
             "Ensure the shot detector writes global first_frame/last_frame (no reset to 0 between shots)."
         )
+    
+def _backfill_preanchor_crops_for_seeded_tracks(
+    seeded_tracks: List[FaceTrack],
+    *,
+    frame_provider: FrameProvider,
+    detector: FaceDetector,
+    align_fn,  # e.g., align_face_for_arcface
+    crops_root: Path,
+    shot_number: int,
+    shot_first: int,
+    anchor_abs: int,
+    iou_thresh: float = 0.5,
+) -> int:
+    """
+    For each DET observation with frame_idx <= anchor_abs and missing aligned_face,
+    (1) try to re-detect on that frame and match by IOU; use landmarks to align;
+    (2) else fall back to simple bbox crop+resize to 112x112 (last resort).
+    Archive PNG and set obs.aligned_face and obs.crop_ref.
+    Returns number of crops created.
+    """
+    made = 0
+    # collect unique frames to process
+    frames_needed = set()
+    obs_by_frame: Dict[int, List[tuple[FaceObservation, int]]] = {}
+    for tr in seeded_tracks or []:
+        for o in getattr(tr, "observations", []) or []:
+            if getattr(o, "source", None) != Source.DETECTED:
+                continue
+            if int(o.frame_idx) > int(anchor_abs):
+                continue
+            if (getattr(o, "aligned_face", None) is not None) or (getattr(o, "crop_ref", None) is not None):
+                continue
+            frames_needed.add(int(o.frame_idx))
+            obs_by_frame.setdefault(int(o.frame_idx), []).append((o, int(getattr(tr, "track_id", -1))))
 
+    for f in sorted(frames_needed):
+        # fetch exact frame f (absolute index)
+        frame_provider.reset_to_frame(f)
+        frame = frame_provider.next()
+        if frame is None:
+            continue
+
+        # run detection to get landmarks; match to each obs by IOU
+        dets = detector.detect_faces_in_frame(frame) or None
+        boxes, lmks, confs = (dets if dets else ([], [], []))
+
+        for o, tid in obs_by_frame.get(f, []):
+            # best IOU match box->o.bbox
+            best_iou, best_j = 0.0, None
+            for j, b in enumerate(boxes):
+                bb = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+                iou = compute_iou(bb, tuple(int(v) for v in o.bbox[:4]))
+                if iou > best_iou:
+                    best_iou, best_j = iou, j
+
+            aligned = None
+            if best_j is not None and best_iou >= iou_thresh:
+                try:
+                    aligned = align_fn(frame, lmks[best_j], f, source="resume-backfill")
+                except Exception:
+                    aligned = None
+
+            # last-resort: bbox crop+resize (still beats having no embedding)
+            if aligned is None:
+                try:
+                    x1,y1,x2,y2 = [int(v) for v in o.bbox[:4]]
+                    x1,y1 = max(x1,0), max(y1,0)
+                    crop = frame[y1:y2, x1:x2]
+                    if crop is not None and crop.size:
+                        # resize to 112x112
+                        import cv2
+                        aligned = cv2.resize(crop, (112,112), interpolation=cv2.INTER_LINEAR)
+                        # convert BGR->RGB if needed for the embedder
+                        aligned = aligned[:, :, ::-1]
+                except Exception:
+                    aligned = None
+
+            if aligned is None:
+                continue
+
+            try:
+                rel = _save_crop_for_obs(crops_root, int(shot_number), f, tid, aligned)
+                setattr(o, "aligned_face", aligned)
+                setattr(o, "crop_ref", rel)
+                made += 1
+            except Exception:
+                logging.exception("backfill: failed to archive crop for frame=%d tid=%d", f, tid)
+
+    return made
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -356,6 +489,11 @@ def track_across_segments(
                 emb_array_lookup=_emb_array_lookup,
             )
 
+            checkpoint.compare_rehydrate_to_snapshot(
+                prior_tracks=prior_tracks,
+                anchor_frame=resume_abs_frame
+            )
+
             # Log by-shot counts & seeds we computed
             try:
                 by_shot_counts = {}
@@ -505,6 +643,25 @@ def track_across_segments(
                         last_bbox
                     )
 
+            # Backfill pre-anchor DET crops for seeded tracks in this shot
+            if seeded_tracks and checkpoint and resume_abs_frame > 0 and shot_idx == 0:
+                try:
+                    made = _backfill_preanchor_crops_for_seeded_tracks(
+                        seeded_tracks=aggregator.tracks,  # seeded into aggregator
+                        frame_provider=frame_provider,
+                        detector=detector,
+                        align_fn=align_face_for_arcface,
+                        crops_root=_ckpt_run_root(checkpoint),
+                        shot_number=shot_number,
+                        shot_first=first,
+                        anchor_abs=resume_abs_frame,
+                        iou_thresh=iou_thresh,
+                    )
+                    if made:
+                        logging.info("resume: backfilled %d pre-anchor crops (shot=%d)", made, int(shot_number))
+                except Exception:
+                    logging.exception("resume: backfill pre-anchor crops failed")            
+
             seed_tid = int(trackid_seed_by_shot.get(int(shot_number), 0))
             seg_seed = int(segment_id_seed_by_shot.get(int(shot_number), 0)) if segment_id_seed_by_shot else 0
 
@@ -626,6 +783,20 @@ def track_across_segments(
                                 shot_first_frame=first,
                                 note=f"detect@{frame_idx}",
                             )
+
+                            if getattr(checkpoint, "snapshots_ready", False):
+                                checkpoint.write_checkpoint_snapshot(
+                                    name=f"detect-{shot_number}-{frame_idx}",
+                                    payload={
+                                        "shot": int(shot_number),
+                                        "frame": int(frame_idx),
+                                        "note": f"detect@{frame_idx}",
+                                    },
+                                )
+                            else:
+                                logging.info("ckpt:snapshot skipped (not ready: no run_dir yet)")
+
+
                     except Exception:
                         logging.exception("checkpoint: failed to persist at detect frame %s", frame_idx)                       
                     
@@ -709,6 +880,26 @@ def track_across_segments(
                     sum(1 for t in aggregator.tracks if not t.is_closed()),
                 )
 
+                # Persist 112×112 crops to disk for DET observations on this frame
+                if checkpoint:
+                    det_obs = aggregator.observations_at(frame_idx, source=Source.DETECTED, require_track_id=True)
+                    if det_obs:
+                        crops_root = _ckpt_run_root(checkpoint)  
+                        for ob in det_obs:
+                            # only save if aligned_face present (detection path) & no crop_ref yet
+                            if getattr(ob, "aligned_face", None) is None:
+                                continue
+                            if getattr(ob, "crop_ref", None):
+                                continue
+                            try:
+                                rel = _save_crop_for_obs(
+                                    crops_root, shot_number, ob.frame_idx, ob.track_id, ob.aligned_face
+                                )
+                                # attach for checkpoint.add_observations to pick up
+                                setattr(ob, "crop_ref", rel)
+                            except Exception:
+                                logging.exception("crop-archive: failed at frame=%d tid=%s", ob.frame_idx, ob.track_id)
+
                 # Checkpoint observations
                 if checkpoint:
                     frame_obs = aggregator.observations_at(frame_idx, require_track_id=True)
@@ -746,7 +937,21 @@ def track_across_segments(
 
             # End of shot: batch embed tracks with aligned faces
             for track in aggregator.tracks:
-                crops = [obs.aligned_face for obs in track.observations if obs.aligned_face is not None]
+                crops = []
+                # Prefer in-memory aligned_face; otherwise lazy-load archived crop
+                for obs in track.observations:
+                    if obs.aligned_face is not None:
+                        crops.append(obs.aligned_face)
+                        continue
+                    cr = getattr(obs, "crop_ref", None)
+                    if checkpoint and cr:
+                        try:
+                            abs_path = Path(_ckpt_run_root(checkpoint), cr)
+                            if abs_path.exists():
+                                img = Image.open(abs_path).convert("RGB")
+                                crops.append(np.asarray(img))
+                        except Exception:
+                            logging.exception("embed-load: failed to load crop %s", cr)
                 if not crops:
                     continue
                 embs = embedder.get_embedding_batch(crops, batch_size=embedding_batch_size_max)

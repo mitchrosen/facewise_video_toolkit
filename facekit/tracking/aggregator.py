@@ -74,14 +74,29 @@ class ShotFaceTrackAggregator:
                 last_det = -1
                 last_any = -1
                 for tr in seeds:
-                    ldf = tr.last_det_frame()
-                    if ldf is not None:
-                        last_det = max(last_det, int(ldf))
+                    last_det_frame = tr.last_det_frame()
+                    if last_det_frame is not None:
+                        last_det = max(last_det, int(last_det_frame))
                     lf = tr.last_frame()
                     if lf is not None:
                         last_any = max(last_any, int(lf))
                 base = last_det if last_det >= 0 else last_any
                 resume_abs_frame = int(base + 1) if base >= 0 else 0
+
+            # Derive the last scheduled/observed DET frame strictly before the anchor from prior tracks.
+            last_det_before_anchor = None
+            if resume_abs_frame is not None:
+                candidates = []
+                for tr in seeds:
+                    last_det_frame = tr.last_det_frame()
+                    if last_det_frame is not None and int(last_det_frame) < int(resume_abs_frame):
+                        candidates.append(int(last_det_frame))
+                if candidates:
+                    last_det_before_anchor = max(candidates)
+            logging.info(
+                "resume: derived LDBA=%s for shot=%d using prior tracks (anchor=%s)",
+                last_det_before_anchor, int(self.shot_number), resume_abs_frame
+)
 
             # --- Determine ID seed ---
             if next_tid_seed is None:
@@ -99,18 +114,31 @@ class ShotFaceTrackAggregator:
                 tr.shot_id = self.shot_number
                 assert tr.track_id >= 0
 
-                # Mark seeded tracks OPEN iff last obs < resume_abs_frame
+                # Decide open/closed at the resume anchor using LDBA.
+                # Rule: a prior track is OPEN at the anchor iff it survived at least through the
+                # last detection before the anchor (i.e., last_frame >= ldba).
                 last_frame = tr.last_frame() if hasattr(tr, "last_frame") else None
-                still_open = (last_frame is not None) and (int(last_frame) < int(resume_abs_frame))
-                # prefer explicit API if available
-                if still_open and hasattr(tr, "mark_open") and callable(getattr(tr, "mark_open")):
-                    tr.mark_open()
+
+                if last_det_before_anchor is not None:
+                    must_be_open = (last_frame is not None) and (int(last_frame) >= int(last_det_before_anchor))
                 else:
-                    # fallbacks that keep prior tracks usable
-                    if hasattr(tr, "is_closed") and tr.is_closed():
-                        # last resort; avoid mutating public API outside tests
-                        if hasattr(tr, "_closed"):
-                            tr._closed = False
+                    # Fallback if no last_det_before_anchor found: accept anything that reaches anchor-1 as "open".
+                    must_be_open = (last_frame is not None) and (int(last_frame) >= int(resume_abs_frame) - 1)
+
+                if must_be_open:
+                    if hasattr(tr, "mark_open") and callable(getattr(tr, "mark_open")):
+                        tr.mark_open()
+                    if hasattr(tr, "_closed"):
+                        tr._closed = False
+                    tr.is_active = False  # will become active if matched/updated
+                else:
+                    if hasattr(tr, "mark_closed") and callable(getattr(tr, "mark_closed")):
+                        tr.mark_closed()
+                    elif hasattr(tr, "_closed"):
+                        tr._closed = True
+                    tr.is_active = False
+
+
                 # Make sure helper flags exist in case downstream logic reads them
                 if not hasattr(tr, "is_active"):
                     tr.is_active = False

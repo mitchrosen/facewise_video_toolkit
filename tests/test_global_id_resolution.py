@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import patch
 import torch
 import random
+import math
 
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
@@ -24,9 +25,14 @@ def make_vector(angle_rad=0.0, noise=0.0, seed=None, size=512):
     v /= np.linalg.norm(v) + 1e-9
     return v
 
+class DummyObs:
+    def __init__(self, frame_idx: int):
+        self.frame_idx = frame_idx
+
 def make_track(track_id, embedding, shot_id=0):
     t = FaceTrack(shot_id=shot_id, track_id=track_id)
     t.embeddings = [embedding.astype(np.float32)]
+    t.observations = [DummyObs(0)]
     return t
 
 def make_track_with_frames(track_id: int, emb: np.ndarray, shot_id: int, start: int, end: int) -> FaceTrack:

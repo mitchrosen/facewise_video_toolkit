@@ -199,6 +199,13 @@ def run_pipeline(args):
             resume_latest=bool(args.resume_latest),
         )
 
+        # --- make checkpoint snapshots writable  ---
+        if not getattr(ckpt, "run_dir", None):
+            ckpt.run_dir = Path(getattr(ckpt, "root", parent_ckpt_dir))
+
+        logging.info("ckpt: run_dir=%s (snapshots at %s)",
+                     ckpt.run_dir, Path(ckpt.run_dir, "ckpt", "snapshots"))
+
         # Summarize selected run + resume intent
         status = ckpt.read_status() or {}
         logging.info(
