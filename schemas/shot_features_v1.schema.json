@@ -11,8 +11,7 @@
         "properties": {
           "shot_number": {
             "type": "integer",
-            "minimum": 1,
-            "description": "Shot number is 1-based and must be contiguous."
+            "description": "Shot number must be contiguous within this file, but may start at any integer."
           },
           "first_frame": {
             "type": "integer",

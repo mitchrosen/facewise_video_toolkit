@@ -5,7 +5,12 @@ from facekit.common.obs_consts import Source
 
 def _one_track():
     ag = ShotFaceTrackAggregator(shot_number=1)
-    ag.update_tracks_with_frame(0,[FaceObservation(0,(0,0,1,1),source=Source.DETECTED)])
+    obs = FaceObservation(
+        frame_idx=0,
+        bbox=(0, 0, 1, 1),
+        source=Source.DETECTED,
+    )
+    ag.update_tracks_with_frame(0,[obs])
     return ag, ag.tracks[0].track_id
 
 def test_attach_embeddings_rejects_non_array():

@@ -1,10 +1,26 @@
 import numpy as np
+from typing import Optional, List
+from dataclasses import dataclass
+import math
 import torch
 import torch.nn.functional as F
-from typing import List
-from facekit.tracking.face_structures import FaceTrack
 import logging
 
+from facekit.tracking.face_structures import FaceTrack
+
+def _first_abs_frame(track) -> int:
+    # Track may expose helpers; else infer from observations.
+    if hasattr(track, "first_frame") and callable(getattr(track, "first_frame")):
+        return int(track.first_frame())
+    obs = getattr(track, "observations", None) or []
+    if not obs:
+        return 1 << 30
+    return int(getattr(obs[0], "frame_idx", 1 << 30))
+
+@dataclass
+class _Comp:
+    tracks: list
+    earliest: int
 
 class GlobalIdentityResolver:
     def __init__(self, embedding_threshold: float = 0.7, device: str = "auto"):
@@ -30,7 +46,9 @@ class GlobalIdentityResolver:
         else:
             self.device = device
 
-        logging.info(f"[INFO] GlobalIdentityResolver initialized on {self.device}")
+        # self._audit = bool(int(os.environ.get("FACEKIT_GI_AUDIT", "0")))
+        self._audit = 1
+        logging.info(f"[INFO] GlobalIdentityResolver initialized on {self.device} (audit={self._audit})")
 
     def resolve_global_ids(self, tracks: List[FaceTrack], start_id: int = 0) -> int:
         """
@@ -48,19 +66,93 @@ class GlobalIdentityResolver:
             int: The next available global_id after assignment.
         """
         # ---------- helpers ----------
-        def robust_center(emb_list: List[np.ndarray], cutoff: float = 0.30) -> np.ndarray:
+        def robust_center(emb_list: List[np.ndarray], cutoff: float = 0.30) -> Optional[np.ndarray]:
             E = np.stack(emb_list).astype(np.float32)
-            E /= (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+            # row-normalize to unit length
+            norms = np.linalg.norm(E, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            E = E / norms
             c = E.mean(axis=0)
-            d = 1.0 - (E @ (c / (np.linalg.norm(c) + 1e-9)))
+            cn = np.linalg.norm(c)
+            if not np.isfinite(cn) or cn == 0.0:
+                return None
+            # trim outliers by cosine distance to the provisional center
+            c_hat = c / cn
+            d = 1.0 - (E @ c_hat)
             keep = d <= cutoff
-            return (E[keep].mean(axis=0) if keep.any() else c)
+            c2 = (E[keep].mean(axis=0) if keep.any() else c_hat)
+            cn2 = np.linalg.norm(c2)
+            if not np.isfinite(cn2) or cn2 == 0.0:
+                return None
+            return (c2 / cn2)
 
         def first_frame(t: FaceTrack) -> int:
             return t.first_frame()
 
         def last_frame(t: FaceTrack) -> int:
             return t.last_frame()
+        
+        # ----------- audit helpers -------------
+        def _obs_mix(t: FaceTrack):
+            from facekit.common.obs_consts import Source
+            n_det = n_trk = 0
+            for o in getattr(t, "observations", []) or []:
+                src = getattr(o, "source", None)
+                if src == Source.DETECTED: n_det += 1
+                elif src == Source.TRACKED: n_trk += 1
+            return n_det, n_trk
+
+        def _emb_stats(t: FaceTrack):
+            embs = getattr(t, "embeddings", None) or []
+            n = len(embs)
+            if n == 0:
+                return 0, 0, "0.000"
+            nan_cnt = sum(0 if (e is not None and np.isfinite(e).all()) else 1 for e in embs)
+            norms = []
+            for e in embs:
+                if e is None: continue
+                v = float(np.linalg.norm(np.asarray(e, dtype=np.float32)))
+                if math.isfinite(v): norms.append(v)
+            avg_norm = (sum(norms)/len(norms) if norms else 0.0)
+            return n, nan_cnt, f"{avg_norm:.3f}"
+
+        def _tspan(t: FaceTrack):
+            try:
+                return int(t.first_frame()), int(t.last_frame())
+            except Exception:
+                obs = getattr(t, "observations", None) or []
+                if not obs: return (1<<30, -1)
+                return int(obs[0].frame_idx), int(obs[-1].frame_idx)
+
+        # --- Preconditions: every track must have >= 1 observation ---
+        # Treat falsy (None or []) as invalid. Raise ValueError (as tests expect).
+        missing = [getattr(t, "track_id", None) for t in tracks
+                if not getattr(t, "observations", None)]
+        if missing:
+            raise ValueError(
+                "Track(s) have no observations; resolver requires >=1 observation per track. "
+                f"Offenders track_id={missing}"
+            )
+        
+        if self._audit:
+            logging.info("GI-AUDIT INPUT: count=%d", len(tracks))
+            # Deterministic order for diffs
+            def _key(t):
+                return (int(getattr(t, "shot_id", -1)),
+                        int(getattr(t, "segment_id", 1<<30) if getattr(t, "segment_id", None) is not None else 1<<30),
+                        int(getattr(t, "track_id", -1)),
+                        _tspan(t)[0])
+            for t in sorted(tracks, key=_key):
+                s  = int(getattr(t, "shot_id", -1))
+                sg = getattr(t, "segment_id", None)
+                tid= int(getattr(t, "track_id", -1))
+                f0,f1 = _tspan(t)
+                n_obs = len(getattr(t, "observations", []) or [])
+                n_det,n_trk = _obs_mix(t)
+                n_emb, n_nan, avg_norm = _emb_stats(t)
+                logging.info("GI-IN: shot=%d seg=%s tid=%d span=[%d..%d] n_obs=%d det=%d trk=%d emb=%d nan=%d avg_norm=%s",
+                             s, (str(int(sg)) if sg is not None else "-"), tid, f0, f1,
+                             n_obs, n_det, n_trk, n_emb, n_nan, avg_norm)
 
         # Step 0: Group tracks by (shot_id, segment_id)
         # Fall back to per-track grouping when no segment_id present
@@ -92,6 +184,20 @@ class GlobalIdentityResolver:
                 g["span_start"] = s0 if g["span_start"] is None else min(g["span_start"], s0)
                 g["span_end"]   = s1 if g["span_end"]   is None else max(g["span_end"],   s1)
             
+        if self._audit:
+            for key, g in sorted(groups.items(), key=lambda kv: (
+                -1 if kv[0][0] == "__per_track__" else int(kv[0][0]),
+                -1 if kv[0][0] == "__per_track__" else (int(kv[0][1]) if kv[0][1] is not None else (1<<30))
+            )):
+                if key[0] == "__per_track__":
+                    logging.info("GI-GROUP: per_track idx=%d members=%s", int(key[1]), g["members"])
+                else:
+                    logging.info("GI-GROUP: shot=%d seg=%s members=%s span=[%s..%s] embs=%d",
+                                 int(g["shot_id"]) if g["shot_id"] is not None else -1,
+                                 (str(int(key[1])) if key[1] is not None else "-"),
+                                 g["members"], str(g["span_start"]), str(g["span_end"]), len(g["all_embs"]))
+
+
         # Step 1: Build group representatives
         group_keys = []
         reps = []
@@ -102,9 +208,13 @@ class GlobalIdentityResolver:
         for key, g in groups.items():
             if g["all_embs"]:
                 rep = robust_center(g["all_embs"])
+                if rep is None:
+                    # Pathological embeddings: skip this group (falls back to leftover assignment)
+                    continue
                 group_keys.append(key)
                 reps.append(rep)
-                shots.append(g["shot_id"])
+                # Default unknown shot to -1 so must-not-link only triggers on real matches
+                shots.append(int(g["shot_id"]) if g["shot_id"] is not None else -1)
                 starts.append(g["span_start"] if g["span_start"] is not None else -10**9)
                 ends.append(g["span_end"]   if g["span_end"]   is not None else  10**9)
         
@@ -113,6 +223,9 @@ class GlobalIdentityResolver:
            for t in tracks:
                 t.global_id = start_id
                 start_id += 1
+                if self._audit:
+                    logging.info("GI-AUDIT: no reps -> assigned unique global_ids up to %d", start_id-1)
+
            return start_id
         
         # Map: group index -> member track indices
@@ -144,6 +257,10 @@ class GlobalIdentityResolver:
                     edges.append((s, i, j, lo, hi))
 
         edges.sort(key=lambda x: (-x[0], x[3], x[4]))  # similarity desc, then stable tiebreak
+        if self._audit:
+            logging.info("GI-EDGES: threshold=%.3f candidates=%d", emb_threshold, len(edges))
+            for s, i, j, lo, hi in edges:
+                logging.info("GI-EDGE: sim=%.4f i=%d j=%d tiebreak=(%d,%d)", float(s), i, j, lo, hi)
 
 
         # Step 3: Union-Find (Disjoint Set) with must-not-link constraint
@@ -183,6 +300,8 @@ class GlobalIdentityResolver:
                     for (sa0, sa1) in la:
                         for (sb0, sb1) in lb:
                             if overlaps(sa0, sa1, sb0, sb1):
+                                if self._audit:
+                                    logging.info("GI-BLOCK: shot=%d A=[%d..%d] B=[%d..%d]", int(sh), int(sa0), int(sa1), int(sb0), int(sb1))
                                 return False  # must-not-link violation
 
             # If constraint passes, merge by rank and merge span maps
@@ -198,12 +317,16 @@ class GlobalIdentityResolver:
                 merged.setdefault(sh, []).extend(lst)
             comp_spans[ra] = merged
             comp_spans[rb] = {}  # not used anymore
+            if self._audit:
+                logging.info("GI-UNION: a=%d b=%d -> root=%d", int(a), int(b), int(ra))
             return True
 
         merges = 0
         for s, i, j, _, _ in edges:
             if union(i, j):
                 merges += 1
+        if self._audit:
+            logging.info("GI-UNION-SUMMARY: merged=%d / candidates=%d / groups=%d", merges, len(edges), m)
 
         # Step 4: Gather components and assign global IDs
         root_to_nodes = {}
@@ -211,27 +334,65 @@ class GlobalIdentityResolver:
             r = find(i)
             root_to_nodes.setdefault(r, []).append(i)
 
-        # Deterministic component order: by smallest original track index inside each component
-        def comp_min_track(nodes: List[int]) -> int:
-            mins = []
+        # Deterministic component order: by earliest absolute frame among a component's members
+        def comp_earliest_frame(nodes: List[int]) -> int:
+            earliest = 10**9
             for gi in nodes:
-                mins.extend(group_members[gi])
-            return min(mins) if mins else 10**9
+                # each group idx -> its span_start in `starts`
+                earliest = min(earliest, starts[gi] if starts[gi] is not None else 10**9)
+            return earliest
 
-        components = sorted(root_to_nodes.values(), key=comp_min_track)
+        # Stable ordering: earliest frame, then smallest member track index in the component
+        def comp_tiebreak(nodes: List[int]) -> int:
+            # choose the smallest original track index present in this component
+            return min(min(group_members[gi]) for gi in nodes if group_members[gi])
+        components = sorted(
+            root_to_nodes.values(),
+            key=lambda nodes: (comp_earliest_frame(nodes), comp_tiebreak(nodes))
+        )
 
+        # Validate inputs: each track must have observations
+        for t in tracks:
+            obs = getattr(t, "observations", None)
+            if not obs:
+                raise ValueError("GlobalIdentityResolver: track has no observations")
+ 
+        gid_assignments = []  # for audit dump
         for comp in components:
             for local_idx in comp:
                 for tr_idx in group_members[local_idx]:   
                     tracks[tr_idx].global_id = start_id
+                    gid_assignments.append((start_id,
+                        int(getattr(tracks[tr_idx], "shot_id", -1)),
+                        int(getattr(tracks[tr_idx], "segment_id", -1) if getattr(tracks[tr_idx], "segment_id", None) is not None else -1),
+                        int(getattr(tracks[tr_idx], "track_id", -1)),
+                        _tspan(tracks[tr_idx])[0],
+                        _tspan(tracks[tr_idx])[1],
+                    ))
             start_id += 1
+        if self._audit:
+            for gid, shot, seg, tid, f0, f1 in sorted(gid_assignments, key=lambda r: (r[0], r[1], r[4])):
+                logging.info("GI-ASSIGN: gid=%d shot=%d seg=%s tid=%d span=[%d..%d]",
+                             gid, shot, ("-" if seg < 0 else str(seg)), tid, f0, f1)
+
 
         # Step 5: Assign unique IDs to tracks without embeddings
         # (Rare: groups existed but had zero embs; or tracks with no embs at all)
         assigned = {idx for members in group_members for idx in members}
-        for i, t in enumerate(tracks):
-            if i not in assigned:
-                t.global_id = start_id
-                start_id += 1
+        # Assign leftovers (tracks without any group rep / embeddings) AFTER components, by earliest frame
+        leftovers = [(i, t) for i, t in enumerate(tracks) if i not in assigned]
+        def _first_abs_frame_track(t: FaceTrack) -> int:
+            try:
+                return int(t.first_frame())
+            except Exception:
+                obs = getattr(t, "observations", None) or []
+                return int(getattr(obs[0], "frame_idx", 1 << 30)) if obs else (1 << 30)
+        leftovers.sort(key=lambda it: _first_abs_frame_track(it[1]))
+        for _, t in leftovers:
+            t.global_id = start_id
+            start_id += 1
+
+        if self._audit and leftovers:
+            logging.info("GI-LEFTOVERS: assigned %d unique ids up to %d", len(leftovers), start_id-1)
 
         return start_id

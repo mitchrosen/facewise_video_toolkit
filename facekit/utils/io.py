@@ -1,37 +1,92 @@
-# facekit/utils/io.py
-import os
-import errno
+from __future__ import annotations
 from pathlib import Path
+import os
+import tempfile
+import numpy as np
 from typing import Union
 
-def fsync_parent_dir(final_path: Union[str, Path]) -> None:
-    """
-    Best-effort: fsync the *directory that contains* `final_path`.
-    Useful after atomic os.replace(tmp, final_path) to reduce risk of metadata loss
-    on crash/power failure. Safe no-op on filesystems/platforms that don't support it.
-
-    Parameters
-    ----------
-    final_path : str | Path
-        Path to the final file that was just atomically replaced/written.
-    """
-    p = Path(final_path)
-    dir_path = p if p.is_dir() else p.parent
-
-    # Some platforms lack O_DIRECTORY. Use it when available; otherwise fall back.
-    flags = getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_RDONLY", 0)
+def fsync_parent_dir(path: Union[str, os.PathLike]) -> None:
+    """Best-effort fsync() of the parent dir to durably persist a prior os.replace()."""
+    p = Path(path)
     try:
-        dirfd = os.open(str(dir_path), flags)
+        fd = os.open(str(p.parent), os.O_RDONLY)
         try:
-            os.fsync(dirfd)
+            os.fsync(fd)
         finally:
-            os.close(dirfd)
-    except FileNotFoundError:
-        # Directory vanished? Nothing we can do.
-        return
-    except OSError as e:
-        # Common on FUSE/Google Drive or filesystems that don't support dir fsync.
-        # Ignore only "operation not supported"/"invalid argument".
-        if e.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EPERM):
-            # Re-raise unexpected errors so we don't hide real problems.
-            raise
+            os.close(fd)
+    except Exception:
+        pass
+
+def atomic_write_npz(
+    dst: Union[str, Path],
+    **named_arrays: np.ndarray,
+) -> str:
+    """
+    Atomically write one or more named numpy arrays to an .npz file.
+
+    Usage:
+        atomic_write_npz(path, observations=arr)
+        atomic_write_npz(path, embeddings=emb_arr)
+        atomic_write_npz(path, observations=arr, embeddings=emb_arr)
+    Args:
+        dst: Target file path ('.npz' suffix enforced).
+        **named_arrays: Mapping of name -> array(s) to store in the NPZ.
+    Returns:
+        Final file path as a string.
+    Raises:
+        ValueError if no arrays are provided.
+    """
+    if not named_arrays:
+        raise ValueError("Provide at least one named array, e.g. observations=arr")
+
+    dst = Path(dst).with_suffix(".npz")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    named_arrays = {k: np.asarray(v) for k, v in named_arrays.items()}
+
+    tmp = tempfile.NamedTemporaryFile(dir=dst.parent, suffix=".tmp", delete=False)
+    try:
+        np.savez(tmp, **named_arrays)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp.close()
+        os.replace(tmp.name, dst)
+        fsync_parent_dir(dst)
+        return str(dst)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except FileNotFoundError:
+            pass
+
+def atomic_write_npy(dst: Union[str, Path], array: np.ndarray) -> str:
+    """
+    Atomically write single ndarray to an .npy file.
+
+    Usage:
+        atomic_write_npy(path, observations=arr)
+        atomic_write_npy(path, embeddings=emb_arr)
+        atomic_write_npy(path, observations=arr, embeddings=emb_arr)
+    Args:
+        dst: Target file path ('.npy' suffix enforced).
+        **named_arrays: Mapping of name -> array(s) to store in the NPY.
+    Returns:
+        Final file path as a string.
+    Raises:
+        ValueError if no arrays are provided.
+    """
+    dst = Path(dst).with_suffix(".npy")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(dir=dst.parent, suffix=".tmp", delete=False)
+    try:
+        np.save(tmp, array)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp.close()
+        os.replace(tmp.name, dst)
+        fsync_parent_dir(dst)
+        return str(dst)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except FileNotFoundError:
+            pass

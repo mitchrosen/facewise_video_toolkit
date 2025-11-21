@@ -42,13 +42,19 @@ def validate_shot_features_json_v1(json_path: str | Path,
         return errors
 
     # 2. supplemental rules
-    # 2a. shot_number must start at 1 and increment by 1
-    for idx, shot in enumerate(shots, start=1):
-        if shot["shot_number"] != idx:
+    # 2a. shot_number must be contiguous, but may start at any integer.
+    # We use the first element's shot_number as the baseline and require
+    # each subsequent shot_number to be previous + 1.
+    first_shot_num = shots[0]["shot_number"]
+    expected = first_shot_num
+    for i, shot in enumerate(shots):
+        if shot["shot_number"] != expected:
             errors.append(
-                f"shot_number mismatch at array index {idx-1}: "
-                f"expected {idx}, got {shot['shot_number']}"
+                f"shot_number mismatch at array index {i}: "
+                f"expected {expected}, got {shot['shot_number']}"
             )
+        expected += 1
+
 
     # 2b. frames must be contiguous
     for prev, curr in zip(shots[:-1], shots[1:]):
