@@ -1,26 +1,42 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import numpy as np
-from facekit.common.obs_consts import Source
 
+from facekit.common.obs_consts import Source
+from facekit.tracking.face_structures import FaceObservation
+
+
+BBox = Tuple[int, int, int, int]
 
 @dataclass
-class Obs:
-    frame_idx: int
-    bbox: Tuple[float, float, float, float]  # xyxy
-    source: str = Source.DETECTED
-    confidence: float = 0.9
-    embedding: Optional[np.ndarray] = None   # optional (512,) vector
+class Obs(FaceObservation):
+    """
+    Test helper that behaves like the old Obs but *is* a FaceObservation,
+    so json_v2.normalize_obs_items_for_output is happy.
+    """
+    def __init__(
+        self,
+        frame_idx: int,
+        bbox: BBox,
+        source: Source = Source.DETECTED,
+        confidence: float = 0.9,
+        embedding: Optional[np.ndarray] = None,
+    ) -> None:
+        super().__init__(
+            frame_idx=frame_idx,
+            bbox=bbox,
+            source=source,
+            confidence=float(confidence),
+            embedding=embedding,
+        )
 
 
 class Track:
-    def __init__(self, shot: int, tid: int, gid: int | None = None,
-                 seg: int | None = None, obs: Optional[List[Obs]] = None):
-        self.shot_id = shot
-        self.track_id = tid
+    def __init__(self, shot_number: int, track_id: int, gid: int, obs: List[Obs]):
+        self.shot_number = shot_number
+        self.track_id = track_id
         self.global_id = gid
-        self.segment_id = seg
-        self.observations = obs or []
+        self.observations = list(obs)
 
     def first_frame(self) -> int:
         return self.observations[0].frame_idx if self.observations else 0

@@ -72,6 +72,8 @@ def generate_shot_features_json(
 
         t3 = time.time()
         shots = []
+        # We define the *local* shot numbers for this generated file as 1-based.
+        # This does NOT force other pipelines / prepared files to start at 1,
         for idx, (scene_start, scene_end) in enumerate(scenes, start=1):
             start_frame_num = scene_start.get_frames()
             end_frame_num = scene_end.get_frames() - 1
