@@ -1003,6 +1003,64 @@ def build_v2_manifest_from_tracks(
 
     return manifest
 
+def fix_shots(manifest: Dict[str, Any], shot_defs: List[Dict[str, Any]]) -> None:
+    """
+    Ensure manifest['shots']:
+      - contains one entry per shot in `shot_defs`
+      - each shot's (first_frame, last_frame) matches the shot segmentation,
+        regardless of whether the shot has tracks.
+
+    Mutates `manifest` in-place, including `totals.num_shots` and `totals.num_tracks` if present.
+    """
+    if not shot_defs:
+        return
+
+    shots = manifest.get("shots") or []
+
+    # Index existing shots by shot_number
+    existing_by_num: Dict[int, Dict[str, Any]] = {}
+    for s in shots:
+        if "shot_number" not in s:
+            continue
+        sn = int(s["shot_number"])
+        existing_by_num[sn] = s
+
+    # For every known shot definition:
+    #   - create a new shot entry if missing
+    #   - normalize first_frame/last_frame to the segmentation
+    for sd in shot_defs:
+        sn = int(sd["shot_number"])
+        first = int(sd.get("first_frame", 0))
+        last = int(sd.get("last_frame", max(first, first)))
+
+        entry = existing_by_num.get(sn)
+        if entry is None:
+            # No tracks for this shot -> trackless/graphics-only shot
+            entry = {
+                "shot_number": sn,
+                "first_frame": first,
+                "last_frame": last,
+                "num_tracks": 0,
+                "face_tracks": [],
+            }
+            shots.append(entry)
+            existing_by_num[sn] = entry
+        else:
+            # Shot already exists (has tracks); normalize coverage to full shot span
+            entry["first_frame"] = first
+            entry["last_frame"] = last
+
+    # Keep shots sorted by shot_number for stable output
+    shots.sort(key=lambda s: int(s["shot_number"]))
+    manifest["shots"] = shots
+
+    # Fix totals, if present
+    totals = manifest.get("totals")
+    if isinstance(totals, dict):
+        totals["num_shots"] = len(shots)
+        totals["num_tracks"] = sum(int(s.get("num_tracks", 0)) for s in shots)
+        manifest["totals"] = totals
+
 def normalize_obs_items_for_output(
     items: list[FaceObservation],
     *,

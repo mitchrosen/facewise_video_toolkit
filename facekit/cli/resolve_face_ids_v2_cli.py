@@ -27,6 +27,7 @@ from facekit.output.json_v2 import (
     V2WriterConfig,
     build_v2_manifest_from_tracks,
     build_v2_1_manifest_from_tracks,
+    fix_shots,
     derive_face_metadata_from_observations,
     write_v2_json,
     EmbeddingCollector,
@@ -150,6 +151,10 @@ def run_pipeline(args):
             )
             shot_json_path = tmp_path
         _fix_shot_coverage(shot_json_path, total_frames)
+
+        # Read the full shot definitions *once*; this is the authoritative shot list.
+        shot_data = json.loads(shot_json_path.read_text())
+        shot_defs = shot_data.get("shots", [])
 
         # Detector / embedder
         yolo = load_yolo5face_model(args.detector_model, args.config, device=device)
@@ -366,7 +371,8 @@ def run_pipeline(args):
             obs_path = Path(args.obs_sidecar_path) if args.obs_sidecar_path else video_path.with_suffix(".observations.npz")
 
             manifest = build_v2_1_manifest_from_tracks(
-                tracks, cfg,
+                tracks, 
+                cfg,
                 face_metadata=face_meta,
                 generation=None,
                 detector=detector,
@@ -376,6 +382,8 @@ def run_pipeline(args):
                 emb_collector=(emb_collector if emb_store == "sidecar" else None),
                 obs_collector=obs_collector, 
             )
+
+            fix_shots(manifest, shot_defs)
 
             # finalize observations sidecar
             manifest["observations_sidecar"] = obs_collector.finalize_sidecar(
