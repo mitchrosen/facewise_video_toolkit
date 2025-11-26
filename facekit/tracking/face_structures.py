@@ -16,7 +16,7 @@ class FaceObservation:
         track_id (int, optional): Track ID for tracked faces.
         embedding (np.ndarray, optional): Facial feature vector.
         confidence (float, optional): Confidence score from the detector.
-        aligned_face (np.ndarray, optional): Aligned face crop (e.g. ArcFace 112x112 RGB)
+        aligned_face (np.ndarray, optional): Aligned faces (e.g. ArcFace 112x112 RGB)
     """
     frame_idx: int
     source: Source  
@@ -141,7 +141,7 @@ class FaceTrack:
         # For tracking continuity: store landmarks if this was a detection
         if obs.source == Source.DETECTED and obs.landmarks is not None:
             # prepare for optical flow
-            self.last_known_landmarks = obs.landmarks
+            self.last_landmarks = obs.landmarks
 
         # Update last_bbox helper
         if obs.bbox is not None:

@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Union, Sequence
+
+Landmarks5 = Union[np.ndarray, Sequence[Sequence[float]]]
 
 # ArcFace 112×112 reference (left eye, right eye, nose, left mouth, right mouth)
 ARC_FACE_TEMPLATE = np.array(
@@ -16,7 +18,7 @@ ARC_FACE_TEMPLATE = np.array(
 
 def align_face_for_arcface(
     image: np.ndarray,
-    landmarks: List[Tuple[float, float]],
+    landmarks: Landmarks5,
     frame_idx: Optional[int] = None,
     source: Optional[str] = None,
     *,

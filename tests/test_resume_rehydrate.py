@@ -8,15 +8,25 @@ from facekit.pipeline.resume_rehydrate import rehydrate_observation_tracks
 def _rows(*items):
     return list(items)
 
+def _five_point_landmarks():
+    # 5 (x,y) points: left eye, right eye, nose, left mouth, right mouth
+    return [
+        [10.0, 12.0],
+        [20.0, 12.0],
+        [15.0, 18.0],
+        [12.0, 26.0],
+        [18.0, 26.0],
+    ]
+
 def test_rehydrate_sanitizes_and_filters_bad_rows():
     oc = ObservationsCollector()
     oc.append_track_obs(_rows(
         # ok
-        {"shot":1,"track_id":7,"f":5,"bbox_xyxy":[0.0,0.0,10.0,10.0],"src":Source.DETECTED,"conf":0.9},
+        {"shot":1,"track_id":7,"f":5,"bbox_xyxy":[0.0,0.0,10.0,10.0],"src":Source.DETECTED,"conf":0.9,"landmarks":_five_point_landmarks()},
         # reversed coords -> should be fixed or dropped by sanitize (we expect fixed)
         {"shot":1,"track_id":7,"f":6,"bbox_xyxy":[12.0,12.0,2.0,2.0],"src":Source.TRACKED},
         # NaNs -> should be dropped
-        {"shot":1,"track_id":7,"f":7,"bbox_xyxy":[np.nan,2.0,12.0,12.0],"src":Source.DETECTED},
+        {"shot":1,"track_id":7,"f":7,"bbox_xyxy":[np.nan,2.0,12.0,12.0],"src":Source.DETECTED,"landmarks":_five_point_landmarks()},
         # zero-width -> should be dropped
         {"shot":1,"track_id":7,"f":8,"bbox_xyxy":[5.0,5.0,5.0,10.0],"src":Source.TRACKED},
     ), emb_idx_fn=lambda _: -1)
@@ -34,3 +44,12 @@ def test_rehydrate_sanitizes_and_filters_bad_rows():
         # ints & finite & proper rectangle
         assert all(isinstance(v, int) for v in (x1,y1,x2,y2))
         assert x2 > x1 and y2 > y1
+
+
+def test_append_track_obs_requires_landmarks_for_detected():
+    oc = ObservationsCollector()
+    with pytest.raises(ValueError):
+        oc.append_track_obs(
+            [{"shot":1,"track_id":1,"f":1,"bbox_xyxy":[0,0,10,10],"src":Source.DETECTED}],
+            emb_idx_fn=lambda _: -1
+        )

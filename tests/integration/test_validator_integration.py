@@ -11,7 +11,6 @@ from facekit.detection.face_detector import FaceDetector
 from facekit.tracking.face_tracker import FaceTracker
 from facekit.tracking.tracker_validator import TrackerValidator, ValidatorParams
 
-
 BBox = Tuple[float, float, float, float]  # x, y, w, h
 
 
@@ -34,14 +33,9 @@ def _save_dbg(name, img):
     cv2.imwrite(str(p), img)
     return p
 
-def _need_cv2():
-    if cv2 is None:
-        pytest.skip("OpenCV not available.")
-
-
 def _video_path() -> str:
     """
-    Use TEST_VIDEO if set, else tests/assets/sample.mp4.
+    Use TEST_VIDEO if set, else tests/data/interview-sam-altman_5sec_snippet.mp4.
     """
     env_p = os.environ.get("TEST_VIDEO")
     if env_p and Path(env_p).exists():
@@ -49,15 +43,12 @@ def _video_path() -> str:
     candidate = Path(Path(__file__).parents[2], "tests", "data", "interview-sam-altman_5sec_snippet.mp4")
     if candidate.exists():
         return str(candidate)
-
-    pytest.skip("No test video found. Set TEST_VIDEO or add tests/assets/sample.mp4.")
-
+    pytest.skip("No test video found. Set TEST_VIDEO or add tests/data/interview-sam-altman_5sec_snippet.mp4.")
 
 def _open_cap(path: str):
     cap = cv2.VideoCapture(path)
     assert cap.isOpened(), f"Failed to open video: {path}"
     return cap
-
 
 def _read_frame(cap, idx: int) -> Optional[np.ndarray]:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -67,11 +58,7 @@ def _read_frame(cap, idx: int) -> Optional[np.ndarray]:
     ok, frame = cap.read()
     return frame if ok else None
 
-
 def _pick_pair(cap):
-    """
-    Choose a consecutive frame pair in the middle of the clip to reduce preroll weirdness.
-    """
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if total < 2:
         pytest.skip("Video has fewer than 2 frames.")
@@ -81,7 +68,6 @@ def _pick_pair(cap):
     if f0 is None or f1 is None:
         pytest.skip("Could not decode two consecutive frames.")
     return start, f0, f1
-
 
 def _first_face_bbox(det: FaceDetector, frame: np.ndarray) -> Optional[BBox]:
     out = det.detect_faces_in_frame(frame)
@@ -93,7 +79,6 @@ def _first_face_bbox(det: FaceDetector, frame: np.ndarray) -> Optional[BBox]:
     # detector returns xyxy; convert to xywh
     x1, y1, x2, y2 = [float(v) for v in boxes[0][:4]]
     return (x1, y1, x2 - x1, y2 - y1)
-
 
 def _iou_xywh(a: BBox, b: BBox) -> float:
     ax, ay, aw, ah = a
@@ -107,11 +92,9 @@ def _iou_xywh(a: BBox, b: BBox) -> float:
     union = aw * ah + bw * bh - inter + 1e-6
     return inter / union
 
-
 def _shift(b: BBox, dx: float, dy: float) -> BBox:
     x, y, w, h = b
     return (x + dx, y + dy, w, h)
-
 
 def _scale(b: BBox, sx: float, sy: float) -> BBox:
     x, y, w, h = b
@@ -119,14 +102,11 @@ def _scale(b: BBox, sx: float, sy: float) -> BBox:
     nw, nh = max(1.0, w * sx), max(1.0, h * sy)
     return (cx - 0.5 * nw, cy - 0.5 * nh, nw, nh)
 
-
 def _aspect(b: BBox, factor: float) -> BBox:
-    # increase w, decrease h (or vice-versa) to change w/h
     x, y, w, h = b
     cx, cy = x + 0.5 * w, y + 0.5 * h
     nw, nh = max(1.0, w * factor), max(1.0, h / factor)
     return (cx - 0.5 * nw, cy - 0.5 * nh, nw, nh)
-
 
 def _paint_hsv(frame: np.ndarray, box: BBox, color_bgr=(0, 255, 255)) -> np.ndarray:
     x, y, w, h = [int(v) for v in box]
@@ -166,6 +146,7 @@ def _sanitize_for_init(box, shape):
     h = max(1.0, min(h, H - y))
     return (int(round(x)), int(round(y)), int(round(w)), int(round(h)))
 
+
 # -----------------------
 # the test
 # -----------------------
@@ -173,7 +154,6 @@ def _sanitize_for_init(box, shape):
 def test_detect_track_and_validate_then_break_each_rule():
     video = _video_path()
 
-    # Load YOLOv5Face detector
     det_path = "models/detector/yolov5n_state_dict.pt"
     det_cfg  = "models/detector/yolov5n.yaml"
     device = "cuda" if (hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0) else "cpu"
@@ -198,10 +178,6 @@ def test_detect_track_and_validate_then_break_each_rule():
         box_xywh = to_xywh(b0, f0.shape)
         box_xywh = _sanitize_for_init(box_xywh, f0.shape)
 
-        # # Save visual debug
-        # _save_dbg("f0_det.png", _draw_box(f0, box_xywh, (0,255,0), "det(t)"))
-        # _save_dbg("f1_expect.png", _draw_box(f1, box_xywh, (255,255,0), "expected(t->t+1)"))
-
         tracker = FaceTracker(tracker_type="CSRT")
         tracker.init_trackers(np.ascontiguousarray(f0), [box_xywh], [1])
 
@@ -213,54 +189,56 @@ def test_detect_track_and_validate_then_break_each_rule():
 
         # 4) VALIDATE (should PASS on normal step)
         pass_params = ValidatorParams(
-            iou_thresh=0.4,       # modest
-            area_delta_max=0.6,   # modest
+            iou_thresh=0.4,
+            area_delta_max=0.6,
             asp_ratio_delta_max=0.6,
             v_max=0.9,
-            hsv_thresh=1.0,       # lenient appearance for natural changes
+            hsv_thresh=1.0,
         )
-        v_ok = TrackerValidator([f0, f1], first_frame_idx=first_idx, params=pass_params)
-        v_ok.set_baseline({1: b0}, first_idx)
-        assert v_ok.validate({1: b1_track}, first_idx + 1, verbose=True), "Normal track should pass validation."
+        v_ok = TrackerValidator(params=pass_params)
+
+        # Seed baseline via validate() on the first frame
+        assert v_ok.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
+        assert v_ok.validate({1: b1_track}, current_frame=f1, frame_idx=first_idx + 1) is True
 
         # 5) BREAK EACH RULE (one-by-one)
 
         # -- IoU too low: shift bbox a lot (keep frame same)
         bad_iou_params = ValidatorParams(iou_thresh=0.7, hsv_thresh=1.0)
-        v_iou = TrackerValidator([f0, f1], first_frame_idx=first_idx, params=bad_iou_params)
-        v_iou.set_baseline({1: b0}, first_idx)
-        b1_iou = _shift(b0, dx=0.7 * b0[2], dy=0.0)  # shift ~70% of width
+        v_iou = TrackerValidator(params=bad_iou_params)
+        assert v_iou.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
+        b1_iou = _shift(b0, dx=0.7 * b0[2], dy=0.0)
         assert _iou_xywh(b0, b1_iou) < 0.7
-        assert v_iou.validate({1: b1_iou}, first_idx + 1, verbose=True) is False
+        assert v_iou.validate({1: b1_iou}, current_frame=f1, frame_idx=first_idx + 1) is False
 
-        # -- Area change too large: zoom by +60% area
+        # -- Area change too large
         bad_area_params = ValidatorParams(area_delta_max=0.2, hsv_thresh=1.0)
-        v_area = TrackerValidator([f0, f1], first_frame_idx=first_idx, params=bad_area_params)
-        v_area.set_baseline({1: b0}, first_idx)
-        b1_area = _scale(b0, sx=1.6, sy=1.6)  # ~+156% area; |Δ|/A0 ~ 0.56
-        assert v_area.validate({1: b1_area}, first_idx + 1, verbose=True) is False
+        v_area = TrackerValidator(params=bad_area_params)
+        assert v_area.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
+        b1_area = _scale(b0, sx=1.6, sy=1.6)
+        assert v_area.validate({1: b1_area}, current_frame=f1, frame_idx=first_idx + 1) is False
 
         # -- Aspect ratio change too large
         bad_ar_params = ValidatorParams(asp_ratio_delta_max=0.2, hsv_thresh=1.0)
-        v_ar = TrackerValidator([f0, f1], first_frame_idx=first_idx, params=bad_ar_params)
-        v_ar.set_baseline({1: b0}, first_idx)
+        v_ar = TrackerValidator(params=bad_ar_params)
+        assert v_ar.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
         b1_ar = _aspect(b0, factor=1.8)
-        assert v_ar.validate({1: b1_ar}, first_idx + 1, verbose=True) is False
+        assert v_ar.validate({1: b1_ar}, current_frame=f1, frame_idx=first_idx + 1) is False
 
-        # -- Velocity too high: big center jump vs previous diagonal
+        # -- Velocity too high
         bad_vel_params = ValidatorParams(v_max=0.3, hsv_thresh=1.0)
-        v_vel = TrackerValidator([f0, f1], first_frame_idx=first_idx, params=bad_vel_params)
-        v_vel.set_baseline({1: b0}, first_idx)
+        v_vel = TrackerValidator(params=bad_vel_params)
+        assert v_vel.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
         diag = (b0[2] ** 2 + b0[3] ** 2) ** 0.5
-        b1_vel = _shift(b0, dx=0.9 * diag, dy=0.0)  # center shift ~0.9*diag
-        assert v_vel.validate({1: b1_vel}, first_idx + 1, verbose=True) is False
+        b1_vel = _shift(b0, dx=0.9 * diag, dy=0.0)
+        assert v_vel.validate({1: b1_vel}, current_frame=f1, frame_idx=first_idx + 1) is False
 
         # -- Appearance (HSV) change: paint inside bbox on frame t+1 but keep geometry
-        bad_app_params = ValidatorParams(iou_thresh=0.4, hsv_thresh=0.05)  # strict appearance
+        bad_app_params = ValidatorParams(iou_thresh=0.4, hsv_thresh=0.05)
         f1_painted = _paint_hsv(f1, b0, color_bgr=(0, 255, 255))
-        v_app = TrackerValidator([f0, f1_painted], first_frame_idx=first_idx, params=bad_app_params)
-        v_app.set_baseline({1: b0}, first_idx)
-        assert v_app.validate({1: b1_track}, first_idx + 1, verbose=True) is False
+        v_app = TrackerValidator(params=bad_app_params)
+        assert v_app.validate({1: b0}, current_frame=f0, frame_idx=first_idx) is True
+        assert v_app.validate({1: b1_track}, current_frame=f1_painted, frame_idx=first_idx + 1) is False
 
     finally:
         cap.release()

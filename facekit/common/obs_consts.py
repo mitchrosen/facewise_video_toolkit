@@ -6,16 +6,20 @@ class Source(StrEnum):
     TRACKED  = "tracked"
     FLOW     = "flow"
     FALLBACK = "fallback"
+    INTERPOLATED = "interpolated"
+    EXTRAPOLATED = "extrapolated"
 
     def __str__(self) -> str:  # makes, for example, print(member) -> "detected" 
         return self.value
 
 
 SRC_TO_CODE = {
-    Source.DETECTED: 0,
-    Source.TRACKED:  1,
-    Source.FLOW:     2,
-    Source.FALLBACK: 3,
+    Source.DETECTED:     0,
+    Source.TRACKED:      1,
+    Source.FLOW:         2,
+    Source.FALLBACK:     3,
+    Source.INTERPOLATED: 4,
+    Source.EXTRAPOLATED: 5,
 }
 CODE_TO_SRC = {v: k for (k, v) in SRC_TO_CODE.items()}
 
