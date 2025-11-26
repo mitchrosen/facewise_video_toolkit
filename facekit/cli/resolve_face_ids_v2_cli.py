@@ -23,10 +23,12 @@ from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 from facekit.tracking.face_structures import FaceTrack
 from facekit.validation import validate_manifest
+from facekit.tracking.track_consolidation_and_pruning import apply_track_consolidation_and_pruning
 from facekit.output.json_v2 import (
     V2WriterConfig,
     build_v2_manifest_from_tracks,
     build_v2_1_manifest_from_tracks,
+    fix_shots,
     derive_face_metadata_from_observations,
     write_v2_json,
     EmbeddingCollector,
@@ -151,6 +153,10 @@ def run_pipeline(args):
             shot_json_path = tmp_path
         _fix_shot_coverage(shot_json_path, total_frames)
 
+        # Read the full shot definitions *once*; this is the authoritative shot list.
+        shot_data = json.loads(shot_json_path.read_text())
+        shot_defs = shot_data.get("shots", [])
+
         # Detector / embedder
         yolo = load_yolo5face_model(args.detector_model, args.config, device=device)
         detector = FaceDetector(yolo)
@@ -237,7 +243,7 @@ def run_pipeline(args):
             logging.info("resume: stable segment labeling enabled (track_order entries=%d)",
                          int(anchor_summary.get("track_order_entries", 0)))
             # Emit an easily parsable line for tests:
-            print(f"ANCHOR:{int(resume_anchor_f or 0)}", flush=True)
+            logging.info(f"ANCHOR:{int(resume_anchor_f or 0)}")
         else:
             logging.info("resume: disabled or no prior state; starting cold.")
     
@@ -276,6 +282,14 @@ def run_pipeline(args):
             resolver = GlobalIdentityResolver()
             next_gid = resolver.resolve_global_ids(tracks, start_id=0)
             logging.info("global-id: assignment complete (next_gid=%d)", next_gid)
+
+            tracks = apply_track_consolidation_and_pruning(
+                tracks,
+                min_gap_len=args.post_min_gap_len,     # pick defaults you like
+                min_track_len=args.post_min_track_len,
+                iou_threshold=args.post_iou_threshold,
+            )
+            logging.info("post: tracks after consolidation/pruning=%d", len(tracks))
 
         ckpt.finalize()
 
@@ -366,7 +380,8 @@ def run_pipeline(args):
             obs_path = Path(args.obs_sidecar_path) if args.obs_sidecar_path else video_path.with_suffix(".observations.npz")
 
             manifest = build_v2_1_manifest_from_tracks(
-                tracks, cfg,
+                tracks, 
+                cfg,
                 face_metadata=face_meta,
                 generation=None,
                 detector=detector,
@@ -376,6 +391,8 @@ def run_pipeline(args):
                 emb_collector=(emb_collector if emb_store == "sidecar" else None),
                 obs_collector=obs_collector, 
             )
+
+            fix_shots(manifest, shot_defs)
 
             # finalize observations sidecar
             manifest["observations_sidecar"] = obs_collector.finalize_sidecar(
@@ -464,6 +481,21 @@ def main() -> None:
     parser.add_argument("--embedding-batch-size-max", type=int, default=32)
     parser.add_argument("--device",  choices=["auto", "cuda", "cpu"], default="auto",
                         help="Compute device for detector/embedder (default: auto)")
+    
+    # Post processing
+    parser.add_argument("--post-min-gap-len", type=int, default=210,
+                        help=("Minimum gap length (in frames) that will NOT be filled during post-processing. "
+                              "Gaps shorter than this, between tracks with the same global ID and sufficient "
+                              "spatial overlap, may be filled via interpolation and the two contiguous tracks merged."))
+    parser.add_argument("--post-min-track-len", type=int, default=70,
+                        help=("Minimum track length (in frames) required for a track to survive post-processing. "
+                              "Tracks shorter than this may be reassigned to nearby global IDs or pruned entirely "
+                              "if no valid reassignment exists."))
+    parser.add_argument("--post-iou-threshold", type=float, default=0.2,
+                        help=("Minimum Intersection-over-Union (IoU) required when considering spatial continuity "
+                              "during post-processing. Used both for reassigning short tracks to nearby global IDs "
+                              "and for filling short gaps between tracks."))
+
     # Storage controls
     parser.add_argument("--emb-store", choices=["inline", "sidecar", "none"], default="inline",
                         help="How to serialize embeddings in V2 manifest (default: inline).",)

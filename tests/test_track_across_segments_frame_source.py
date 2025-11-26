@@ -49,17 +49,31 @@ def test_track_across_segments_with_provider(tmp_path: Path, monkeypatch):
     shot_json = tmp_path / "shots.json"
     shot_json.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 4}]}))
 
-    # Always-detect stub so we exercise detection→aggregate→bootstrap path every frame
     class FakeDetector:
+        def __init__(self):
+            self.calls = 0
+
         def detect_faces_in_frame(self, frame, target_size=640):
-            # one box, trivial landmarks/conf
-            return [(10, 10, 30, 30)], [[(12, 12)] * 5], [0.99]
+            self.calls += 1
+            x = float(self.calls)  # deterministic and NOT constant across frames
+            lms = [[(x, 12.0)] + [(0.0, 0.0)] * 4]  # shape (1,5,2)
+            return [(10, 10, 30, 30)], lms, [0.99]
 
     # Alignment: return a dummy crop
-    monkeypatch.setattr(
-        "facekit.pipeline.track_across_segments.align_face_for_arcface",
-        lambda frame, lm, frame_idx=None, source=None: np.zeros((112, 112, 3), dtype=np.uint8),
-    )
+    def _asserting_align(frame, landmarks, frame_idx=None, source=None, *, return_meta=False):
+        assert landmarks is not None
+        arr = np.asarray(landmarks, dtype=np.float32)
+        if arr.shape == (1,5,2): arr = arr[0]
+        assert arr.shape == (5,2)
+        assert np.all(np.isfinite(arr))
+
+        expected_x = float(frame_idx + 1)
+        assert float(arr[0,0]) == expected_x
+
+        chip = np.zeros((112,112,3), np.uint8)
+        if return_meta:
+            return chip, {"frame_idx": frame_idx, "source": source}
+        return chip
 
     # Embedder: return valid (K,512) float32
     class FakeEmbedder:
@@ -170,16 +184,31 @@ def test_track_across_segments_with_readercoordinator_instance_not_closed(tmp_pa
     shot_json = tmp_path / "shots.json"
     shot_json.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 4}]}))
 
-    # Detector: always returns one face
     class FakeDetector:
+        def __init__(self):
+            self.calls = 0
+
         def detect_faces_in_frame(self, frame, target_size=640):
-            return [(10, 10, 30, 30)], [[(12, 12)] * 5], [0.99]
+            self.calls += 1
+            x = float(self.calls)  # deterministic and NOT constant across frames
+            lms = [[(x, 12.0)] + [(0.0, 0.0)] * 4]  # shape (1,5,2)
+            return [(10, 10, 30, 30)], lms, [0.99]
 
     # Aligner: deterministic dummy crop
-    monkeypatch.setattr(
-        "facekit.pipeline.track_across_segments.align_face_for_arcface",
-        lambda frame, lm, frame_idx=None, source=None: np.zeros((112, 112, 3), dtype=np.uint8),
-    )
+    def _asserting_align(frame, landmarks, frame_idx=None, source=None, *, return_meta=False):
+        assert landmarks is not None
+        arr = np.asarray(landmarks, dtype=np.float32)
+        if arr.shape == (1,5,2): arr = arr[0]
+        assert arr.shape == (5,2)
+        assert np.all(np.isfinite(arr))
+
+        expected_x = float(frame_idx + 1)
+        assert float(arr[0,0]) == expected_x
+
+        chip = np.zeros((112,112,3), np.uint8)
+        if return_meta:
+            return chip, {"frame_idx": frame_idx, "source": source}
+        return chip
 
     # Embedder: valid (K, 512) float32
     class FakeEmbedder:

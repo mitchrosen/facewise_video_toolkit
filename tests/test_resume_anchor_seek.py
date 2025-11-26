@@ -22,12 +22,16 @@ def _write_shots(path: Path, first: int, last: int, per_shot: int = None):
             s, sn = e + 1, sn + 1
     path.write_text(json.dumps({"shots": shots}))
 
-
 class DummyDetector:
+    def __init__(self):
+        self.calls = 0
+
     def detect_faces_in_frame(self, frame):
         # Return a single fake detection every time: (boxes, landmarks, confidences)
-        return ([(0, 0, 10, 10)], [[(0, 0)] * 5], [0.9])
-
+        # Encode a non-constant value in landmarks[0][0] so tests can sanity-check it.
+        self.calls += 1
+        x = float(self.calls)  # deterministic, non-constant across calls
+        return ([(0, 0, 10, 10)], [[(x, 0.0)] + [(0.0, 0.0)] * 4], [0.9])
 
 class DummyEmbedder:
     def get_embedding_batch(self, crops, batch_size=32):
@@ -122,14 +126,20 @@ def _seed_preanchor_run(
     # Seed one pre-anchor DET obs in the anchor shot to exercise rehydrate.
     # This mirrors what track_across_segments would have persisted before crash.
     oc.append_track_obs(
-        [{
-            "shot": anchor_shot,
-            "track_id": 1,
-            "f": 150,
-            "bbox_xyxy": [0, 0, 10, 10],
-            "src": "detected",
-            "crop_ref": "crops/shot2/frame150_tid1.png",  # dummy path is fine
-        }],
+        [
+            {
+                "shot": anchor_shot,
+                "track_id": 1,
+                "f": 150,
+                "bbox_xyxy": [0, 0, 10, 10],
+                "src": "detected",
+                "has_landmarks": 1,
+                "landmarks": np.asarray(
+                    [[151.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+                    dtype=np.float32,
+                ),
+            }
+        ],
         emb_idx_fn=lambda _: -1,  # no embedding index yet; will be filled via add_embeddings
     )
 
@@ -143,6 +153,31 @@ def _seed_preanchor_run(
 
     # Finalize to actually write obs_ckpt.npz / emb_ckpt.npz to disk.
     ckpt.finalize()
+
+    # ---- Sanity-check the seeded landmarks are present and not defaulted ----
+    # We seeded a single DET row at f=150 with landmarks[0][0] == 151.0.
+    pos = oc.find_rows(shot=anchor_shot, track_id=1, frame_last=150, count=1)
+    assert pos, "expected to find the seeded observation row"
+
+    # Handle both (block,row) and flat row_idx returns.
+    p0 = pos[-1]
+    row_idx = int(p0[1]) if (isinstance(p0, tuple) and len(p0) == 2) else int(p0)
+
+    # Access the structured row via (block_idx,row_idx) or assume single block 0.
+    if isinstance(p0, tuple) and len(p0) == 2:
+        b_idx, r_idx = int(p0[0]), int(p0[1])
+    else:
+        b_idx, r_idx = 0, int(p0)
+
+    assert hasattr(oc, "_rows"), "ObservationsCollector missing _rows; update accessor"
+    row = oc._rows[b_idx][r_idx]
+
+    # Validate landmarks using the persisted fields
+    assert int(row["has_landmarks"]) == 1, "seeded row missing landmarks flag"
+    lm10 = row["landmarks_flat10"]
+    # We seeded x1=151.0, y1=0.0
+    assert float(lm10[0]) == 151.0, f"expected landmarks_flat10[0]==151.0, got {float(lm10[0])}"
+    assert float(lm10[1]) == 0.0, f"expected landmarks_flat10[1]==0.0, got {float(lm10[1])}"
 
     # Now patch status.json to reflect the anchor and a minimal track_order,
     # mimicking a partially-complete but structurally valid status file.
@@ -273,7 +308,6 @@ def test_resume_starts_at_anchor_abs_frame(tmp_path: Path, monkeypatch):
         assert f >= anchor, f"persisted observations for pre-anchor frame {f} < {anchor}"
 
     # Embeddings ARE allowed for pre-anchor DET frames in the anchor-containing shot
-    # (backfill crops -> embed at shot end). They must NOT be from earlier shots.
     for (shotnum, _tid, last_idx, _embs) in add_emb_calls:
         # must be for the anchor shot
         assert shotnum == anchor_shot, f"unexpected embeddings for non-anchor shot {shotnum}"

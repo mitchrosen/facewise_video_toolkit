@@ -16,13 +16,12 @@ from facekit.common.obs_consts import (
 )
 from facekit.utils.io import atomic_write_npz, atomic_write_npy
 from facekit.tracking.face_structures import FaceObservation
+from facekit.pipeline.checkpoint import CheckpointManager
 
 XYXY = Tuple[float, float, float, float]
 
 SCHEMA_VERSION_V2_0 = "2.0"
 SCHEMA_VERSION_V2_1 = "2.1"
-
-PARANOID = bool(os.environ.get("FACEKIT_PARANOID"))
 
 @dataclass
 class V2WriterConfig:
@@ -199,17 +198,17 @@ def _to_int01(flag) -> int:
     # normalize truthy → 1, falsy → 0
     return 1 if bool(flag) else 0
 
-
 ObsRow = np.dtype([
-    ("f", np.int32),                 # absolute frame index
-    ("shot", np.int32),              # shot number (for grouping)
-    ("track_id", np.int32),          # per-shot track identity
-    ("bbox_xyxy", np.float32, (4,)), # x1,y1,x2,y2
-    ("src", np.uint8),               # 0=detected,1=tracked,2=flow
-    ("conf", np.float32),            # NaN if absent
-    ("emb_idx", np.int32),            # -1 if absent
-    ("has_crop", np.uint8),          # 1 if a 112x112 crop exists on disk, else 0
-    ("crop_ref", "U256"),            # path to aligned crop ("" if none)
+    ("f", np.int32),
+    ("shot", np.int32),
+    ("track_id", np.int32),
+    ("bbox_xyxy", np.float32, (4,)),
+    ("src", np.uint8),
+    ("conf", np.float32),
+    ("emb_idx", np.int32),
+
+    ("has_landmarks", np.uint8),            # 1 iff landmarks_flat10 is valid
+    ("landmarks_flat10", np.float32, (10,)) # [x1,y1,...,x5,y5] in ArcFace order
 ])
 
 class ObservationsCollector:
@@ -217,7 +216,7 @@ class ObservationsCollector:
     @property
     def columns(self) -> tuple[str, ...]:
         # Must match ObsRow exactly
-        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","has_crop")
+        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","has_landmarks","landmarks_flat10")
     
     @property
     def schema(self) -> dict:
@@ -238,9 +237,9 @@ class ObservationsCollector:
         track_id: int,
         frame_last: int | None = None,
         count: int | None = None,
-        # optional filters (all backward-compatible)
+        # optional filters
         only_unassigned: bool | None = None,
-        only_with_crop: bool | None = None,
+        only_with_landmarks: bool | None = None,
         source: int | None = None,
         **kwargs,
     ) -> list[tuple[int, int]]:
@@ -250,14 +249,15 @@ class ObservationsCollector:
         AND (emb_idx == -1 if only_unassigned)
         AND (f <= frame_last if provided)
         AND (src == source if provided)
-        AND (valid bbox if only_with_crop)
-        Ordered from newest to oldest (descending frame index).
-        Accepts legacy alias `frame_max` via **kwargs.
-        """
+        AND (has_landmarks == 1 if only_with_landmarks)
 
-        logging.info(f"In find_rows: shot {shot}, track_id{track_id}, frame_last {frame_last}, count {count}, \
-                     only_unassigned {only_unassigned}, only_with_crop {only_with_crop}, source {source} \
-                     rows {self._rows}")
+        Ordering:
+        Rows are returned newest→oldest (descending frame index), based on current storage order.
+
+        Notes:
+        - Accepts legacy alias `frame_max` via **kwargs.
+        - Callers should not rely on ordering for correctness; use frame_at_pos(pos) if needed.
+        """
 
         # Back-compat alias: some callers used frame_max
         if frame_last is None and "frame_max" in kwargs and kwargs["frame_max"] is not None:
@@ -283,14 +283,13 @@ class ObservationsCollector:
                     continue
                 if source is not None and int(row["src"]) != int(source):
                     continue
-                if only_with_crop:
-                    if "has_crop" in row.dtype.names:
-                        if int(row["has_crop"]) != 1:
+                if only_with_landmarks:
+                    if "has_landmarks" in row.dtype.names:
+                        if int(row["has_landmarks"]) != 1:
                             continue
                     else:
-                        # legacy fallback: bbox sanity as proxy
-                        if not _bbox_valid(row["bbox_xyxy"]):
-                            continue
+                        # legacy checkpoints without landmarks field cannot satisfy this filter
+                        continue
 
                 out.append((b_idx, r_idx))
                 if want is not None and len(out) >= want:
@@ -377,71 +376,67 @@ class ObservationsCollector:
         k = len(obs_items)
         block = np.empty(k, dtype=ObsRow)
 
-        def _validate_faceObs_dict(o: dict):
-            if not isinstance(o, dict):
+        def _validate_faceObs_dict(row: dict):
+            if not isinstance(row, dict):
                 raise TypeError("ObservationsCollector.append_track_obs expects normalized dicts.")
 
             missing = []
             # use .get to avoid KeyError so we can report everything at once
-            if o.get("shot") is None:       missing.append("shot_id")
-            if o.get("track_id") is None:   missing.append("track_id")
-            if o.get("f") is None:          missing.append("frame_idx")
-            if ("bbox_xyxy" not in o) and ("bbox_xywh" not in o):
+            if row.get("shot") is None:       missing.append("shot_id")
+            if row.get("track_id") is None:   missing.append("track_id")
+            if row.get("f") is None:          missing.append("frame_idx")
+            if ("bbox_xyxy" not in row) and ("bbox_xywh" not in row):
                 missing.append("bbox")
-            if o.get("src") is None:
+            if row.get("src") is None:
                 missing.append("source")
 
             if missing:
-                raise ValueError(f"Observation missing required fields: {missing} | row={o!r}")
+                raise ValueError(f"Observation missing required fields: {missing} | row={row!r}")
 
             # --- normalize src to int code  ---
-            return _src_to_int(o.get("src"))
+            return _src_to_int(row.get("src"))
         
-        for i, o in enumerate(obs_items):
-            oN = o if isinstance(o, dict) else dict(o)  # ensure dict-like
-            src_any = _validate_faceObs_dict(oN)
+        for i, obs in enumerate(obs_items):
+            row = obs if isinstance(obs, dict) else dict(obs)  # ensure dict-like
+            src_any = _validate_faceObs_dict(row)
 
-            f = int(oN["f"])
-            shot = int(oN["shot"])
-            if "bbox_xyxy" in oN and oN["bbox_xyxy"] is not None:
-                bb = [float(x) for x in oN["bbox_xyxy"]]
+            f = int(row["f"])
+            shot = int(row["shot"])
+            if "bbox_xyxy" in row and row["bbox_xyxy"] is not None:
+                bb = [float(x) for x in row["bbox_xyxy"]]
             else:
-                x, y, w, h = oN["bbox_xywh"]
+                x, y, w, h = row["bbox_xywh"]
                 bb = [float(x), float(y), float(x + w), float(y + h)]
 
             src_code =_src_to_int(src_any)
-            conf = float(oN["conf"]) if ("conf" in oN and oN["conf"] is not None) else np.nan
+            conf = float(row["conf"]) if ("conf" in row and row["conf"] is not None) else np.nan
 
-            # Normalize crop_ref to a string
-            crop_ref = oN.get("crop_ref") or ""
-            crop_ref = str(crop_ref)
+            # --- Landmarks (strict) ---
+            has_landmarks, lm_flat10 = CheckpointManager._landmarks_to_flat10(row)
 
-            # has_crop: normalize to 0/1; infer from crop_ref when missing
-            has_crop = oN.get("has_crop", None)
-            if has_crop is None:
-                has_crop = 1 if crop_ref else 0
-            has_crop = _to_int01(has_crop)
-
-            if has_crop:
-                crop_ref = oN.get("crop_ref") or ""
-            crop_ref = str(crop_ref)
-
+            # DETECTED rows must have landmarks
+            det_code = int(src_to_code(Source.DETECTED.value))
+            if int(src_code) == det_code and has_landmarks != 1:
+                raise ValueError(
+                    f"append_track_obs: DETECTED row missing landmarks "
+                    f"(shot={shot}, track_id={int(row['track_id'])}, f={f})"
+                )
             emb_idx = -1
             if emb_idx_fn is not None:
                 try:
-                    emb_idx = int(emb_idx_fn(oN))
+                    emb_idx = int(emb_idx_fn(row))
                 except Exception:
                     emb_idx = -1
 
             block[i]["f"] = f
             block[i]["shot"] = shot 
-            block[i]["track_id"] = int(oN["track_id"])
+            block[i]["track_id"] = int(row["track_id"])
             block[i]["bbox_xyxy"] = bb
             block[i]["src"] = src_code
             block[i]["conf"] = conf
             block[i]["emb_idx"] = emb_idx
-            block[i]["has_crop"] = has_crop
-            block[i]["crop_ref"] = crop_ref
+            block[i]["has_landmarks"] = int(has_landmarks)
+            block[i]["landmarks_flat10"] = lm_flat10
 
         offset = self._count
         self._rows.append(block)
@@ -482,8 +477,8 @@ class ObservationsCollector:
                 {"name":"src","type":"u1","desc":"0=detected,1=tracked,2=flow"},
                 {"name":"conf","type":"f4","desc":"NaN if absent"},
                 {"name":"emb_idx","type":"i4","desc":"-1 if absent"},
-                {"name":"has_crop","type":"u1","desc":"1 if crop saved"},
-                {"name":"crop_ref","type":"U256","desc":"path to aligned crop or empty"},
+                {"name":"has_landmarks","type":"u1","desc":"1 if landmarks_flat10 is valid"},
+                {"name":"landmarks_flat10","type":"f4[10]","desc":"[x1,y1,...,x5,y5] ArcFace order"},
             ],
             "count": int(arr.shape[0]),
         }
@@ -587,14 +582,11 @@ class ObservationsCollector:
                 if not np.isnan(conf):
                     d["conf"] = conf
 
-                if "crop_ref" in row.dtype.names:
-                    val = row["crop_ref"]
-                    # handle possible bytes/unicode
-                    if isinstance(val, bytes):
-                        val = val.decode("utf-8", "ignore")
-                    crop_ref = str(val).strip()
-                    if crop_ref:
-                        d["crop_ref"] = crop_ref
+                # Landmarks: expose both has_landmarks + landmarks_flat10 (as Python list)
+                if "has_landmarks" in row.dtype.names:
+                    d["has_landmarks"] = int(row["has_landmarks"])
+                    if int(row["has_landmarks"]) == 1 and "landmarks_flat10" in row.dtype.names:
+                        d["landmarks_flat10"] = [float(x) for x in row["landmarks_flat10"]]
 
                 groups.setdefault((s, t), []).append(d)
 
@@ -1002,6 +994,64 @@ def build_v2_manifest_from_tracks(
     manifest["generation"] = base_gen
 
     return manifest
+
+def fix_shots(manifest: Dict[str, Any], shot_defs: List[Dict[str, Any]]) -> None:
+    """
+    Ensure manifest['shots']:
+      - contains one entry per shot in `shot_defs`
+      - each shot's (first_frame, last_frame) matches the shot segmentation,
+        regardless of whether the shot has tracks.
+
+    Mutates `manifest` in-place, including `totals.num_shots` and `totals.num_tracks` if present.
+    """
+    if not shot_defs:
+        return
+
+    shots = manifest.get("shots") or []
+
+    # Index existing shots by shot_number
+    existing_by_num: Dict[int, Dict[str, Any]] = {}
+    for s in shots:
+        if "shot_number" not in s:
+            continue
+        sn = int(s["shot_number"])
+        existing_by_num[sn] = s
+
+    # For every known shot definition:
+    #   - create a new shot entry if missing
+    #   - normalize first_frame/last_frame to the segmentation
+    for sd in shot_defs:
+        sn = int(sd["shot_number"])
+        first = int(sd.get("first_frame", 0))
+        last = int(sd.get("last_frame", max(first, first)))
+
+        entry = existing_by_num.get(sn)
+        if entry is None:
+            # No tracks for this shot -> trackless/graphics-only shot
+            entry = {
+                "shot_number": sn,
+                "first_frame": first,
+                "last_frame": last,
+                "num_tracks": 0,
+                "face_tracks": [],
+            }
+            shots.append(entry)
+            existing_by_num[sn] = entry
+        else:
+            # Shot already exists (has tracks); normalize coverage to full shot span
+            entry["first_frame"] = first
+            entry["last_frame"] = last
+
+    # Keep shots sorted by shot_number for stable output
+    shots.sort(key=lambda s: int(s["shot_number"]))
+    manifest["shots"] = shots
+
+    # Fix totals, if present
+    totals = manifest.get("totals")
+    if isinstance(totals, dict):
+        totals["num_shots"] = len(shots)
+        totals["num_tracks"] = sum(int(s.get("num_tracks", 0)) for s in shots)
+        manifest["totals"] = totals
 
 def normalize_obs_items_for_output(
     items: list[FaceObservation],

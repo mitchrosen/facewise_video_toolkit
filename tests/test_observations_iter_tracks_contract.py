@@ -1,12 +1,16 @@
 from facekit.output.json_v2 import ObservationsCollector
 from facekit.common.obs_consts import Source
 
+def _landmarks(x: float):
+    # 5-point landmarks, shape (5,2) as list-of-tuples
+    return [(float(x), 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
+
 def test_iter_tracks_groups_orders_and_filters_by_frame_max():
     oc = ObservationsCollector()
     oc.append_track_obs([
-        {"shot":1,"track_id":7,"f":5,"bbox_xyxy":[0,0,10,10],"src":Source.DETECTED},
+        {"shot":1,"track_id":7,"f":5,"bbox_xyxy":[0,0,10,10],"src":Source.DETECTED, "landmarks": _landmarks(5)},
         {"shot":1,"track_id":7,"f":9,"bbox_xyxy":[1,1,11,11],"src":Source.TRACKED},
-        {"shot":1,"track_id":7,"f":12,"bbox_xyxy":[2,2,12,12],"src":Source.DETECTED},
+        {"shot":1,"track_id":7,"f":12,"bbox_xyxy":[2,2,12,12],"src":Source.DETECTED, "landmarks": _landmarks(5)},
     ], emb_idx_fn=lambda _: -1)
 
     groups_all = list(oc.iter_tracks(frame_max=None))
