@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 .env
-*.mp4
+#*.mp4
 *.avi
 .vscode/
 .DS_Store
