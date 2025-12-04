@@ -27,7 +27,6 @@ from facekit.utils.io import fsync_parent_dir
 from facekit.utils.io import atomic_write_npz
 from facekit.tracking.aggregator import ShotFaceTrackAggregatorProtocol
 from facekit.utils.debug_snapshots import (
-    snapshot_from_aggregator, 
     load_latest_snapshot, 
     diff_snapshot_vs_rehydrate,
     write_snapshot_atomic,
@@ -36,8 +35,6 @@ from facekit.common.obs_consts import Source, SRC_TO_CODE, CODE_TO_SRC, src_to_c
 from facekit.tracking.face_structures import FaceObservation
 
 REQUIRED_SCHEMA_VERSION = "2.3"
-# PARANOID = bool(os.environ.get("FACEKIT_PARANOID"))
-PARANOID = 1
 
 class TrackingCheckpoint(Protocol):
     # lifecycle/progress
@@ -172,7 +169,7 @@ def _sha256_file(path: Path) -> Optional[str]:
     except Exception:
         return None
 
-def _assert_npz_keys(npz_path: Path, required_keys: tuple[str, ...], *, strict: bool) -> None:
+def _assert_npz_keys(npz_path: Path, required_keys: tuple[str, ...], *, strict: bool = True) -> None:
     """
     Ensure an NPZ exists and contains specific top-level keys.
     In strict mode, raise ResumeSafetyError if violated; else log and continue.
@@ -556,12 +553,7 @@ class CheckpointManager(TrackingCheckpoint):
             )
         # Convert FaceObservation -> dict rows exactly once (src already numeric)
         observations = [self._obs_to_row_dict(shot_number, ob) for ob in observations]
-        if PARANOID:
-            self.logger.debug("ckpt.add_observations: after _obs_to_row_dict "
-                         "shot=%s frame=%s n=%s sample=%r",
-                         shot_number, frame_idx, len(observations),
-                         observations[0] if observations else None)
-            
+
         # Skip anything strictly before the resume anchor.
         if self._is_pre_anchor(frame_idx):
             logging.debug("ckpt:add_obs SKIP (pre-anchor) frame=%s anchor=%s",
@@ -631,13 +623,6 @@ class CheckpointManager(TrackingCheckpoint):
                              len(bad), shot_number, frame_idx, bad[0])
                 raise TypeError(f"BUG: row passed to collector without int 'src': {bad[0]!r}")
             # emb_idx unknown here: set -1 via emb_idx_fn
-
-            if PARANOID:
-               self.logger.debug("ckpt.add_observations: to collector "
-                            "shot=%s frame=%s rows=%s first_src=%r",
-                            shot_number, frame_idx, len(out_rows),
-                             out_rows[0].get("src") if out_rows else None)
-
 
             _, added = self._obs.append_track_obs(out_rows, emb_idx_fn=lambda _o: -1)
             total_rows_added += int(added)
@@ -1188,8 +1173,6 @@ class CheckpointManager(TrackingCheckpoint):
         try:
             return json.loads(self.status_path.read_text())
         except Exception as e:
-            if PARANOID:
-                raise ResumeSafetyError(f"[ckpt] corrupt status.json: {e}")
             return None
         
     def _validate_collectors_schema(self, obs_collector, emb_collector) -> None:
@@ -1210,7 +1193,7 @@ class CheckpointManager(TrackingCheckpoint):
         # ---- observations sidecar structure (ckpt/obs_ckpt.npz) ----
         # We always require the checkpoint obs NPZ to have an 'observations' array.
         if self.obs_path.exists():
-            _assert_npz_keys(self.obs_path, ("observations",), strict=PARANOID)
+            _assert_npz_keys(self.obs_path, ("observations",))
         else:
             # If resume was requested but the obs sidecar is missing, this is a hard error.
             raise ResumeSafetyError(
@@ -1220,7 +1203,7 @@ class CheckpointManager(TrackingCheckpoint):
         # ---- embeddings sidecar structure (ckpt/emb_ckpt.npz) ----
         # Embeddings are optional, but when the file exists it must expose 'embeddings'.
         if self.emb_path.exists():
-            _assert_npz_keys(self.emb_path, ("embeddings",), strict=PARANOID)
+            _assert_npz_keys(self.emb_path, ("embeddings",))
 
         # ---- in-memory embedding collector sanity checks ----
         # If the embedding collector can expose its in-RAM array, make sure it looks sane.
@@ -1284,8 +1267,6 @@ class CheckpointManager(TrackingCheckpoint):
             try:
                 emb_rows = emb_collector.load_npz(self.emb_path)
             except Exception:
-                if PARANOID:
-                    raise ResumeSafetyError("ckpt:load: obs_collector.load_npz failed; strict mode active")
                 logging.info("ckpt:load obs_collector.load_npz() raised exception (non-strict)")
 
 
@@ -1505,14 +1486,14 @@ class CheckpointManager(TrackingCheckpoint):
                         f"ckpt.open: inconsistent checkpoint: emb_anchor={emb_anchor} "
                         f"but {emb_sidecar_path} is missing."
                     )
-                # NEW: structural sanity — in paranoid mode demand expected arrays:
+                # structural sanity 
                 try:
-                    _assert_npz_keys(obs_sidecar_path, ("observations",), strict=PARANOID)
+                    _assert_npz_keys(obs_sidecar_path, ("observations",))
                 except ResumeSafetyError:
                     # If we’re strict, bubble up. If not strict, continue after logging.
                     raise
                 try:
-                    _assert_npz_keys(emb_sidecar_path, ("embeddings",), strict=PARANOID)
+                    _assert_npz_keys(emb_sidecar_path, ("embeddings",))
                 except ResumeSafetyError:
                     raise
             else:

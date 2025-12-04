@@ -242,7 +242,7 @@ def run_pipeline(args):
             logging.info("resume: stable segment labeling enabled (track_order entries=%d)",
                          int(anchor_summary.get("track_order_entries", 0)))
             # Emit an easily parsable line for tests:
-            print(f"ANCHOR:{int(resume_anchor_f or 0)}", flush=True)
+            logging.info(f"ANCHOR:{int(resume_anchor_f or 0)}")
         else:
             logging.info("resume: disabled or no prior state; starting cold.")
     

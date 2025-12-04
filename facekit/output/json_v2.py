@@ -22,8 +22,6 @@ XYXY = Tuple[float, float, float, float]
 SCHEMA_VERSION_V2_0 = "2.0"
 SCHEMA_VERSION_V2_1 = "2.1"
 
-PARANOID = bool(os.environ.get("FACEKIT_PARANOID"))
-
 @dataclass
 class V2WriterConfig:
     video_path: Optional[str] = None

@@ -24,10 +24,8 @@ from facekit.pipeline.resume_rehydrate import rehydrate_tracks
 from facekit.utils.geometry import compute_iou
 from facekit.errors import ResumeSafetyError
 from facekit.utils.io import fsync_parent_dir
-from facekit.utils.debug_logging import _dump_agg_state
 
 logger = logging.getLogger(__name__)
-PARANOID = bool(os.environ.get("FACEKIT_PARANOID"))
 
 # --- Logging helpers (diagnostics only) ---------------------------------------
 
@@ -741,12 +739,6 @@ def track_across_segments(
                             f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}, frame={int(o.frame_idx)})"
                         )
 
-        if checkpoint and hasattr(checkpoint, "compare_rehydrate_to_snapshot"):
-            checkpoint.compare_rehydrate_to_snapshot(
-                prior_tracks=prior_tracks,
-                anchor_frame=resume_abs_frame
-            )
-
         # -------------------------------
         # Split rehydrated tracks:
         #   - pre-anchor shots -> KEEP in outputs now
@@ -897,8 +889,6 @@ def track_across_segments(
                     next_tid_seed=int(trackid_seed_by_shot.get(int(shot_number), 0)),
                 )
                 checkpoint.hydrate_open_tracks_into(aggregator)
-
-                _dump_agg_state("RESUME-AFTER-REHYDRATE", aggregator)
             else:
                 aggregator = ShotFaceTrackAggregator(
                     shot_number=shot_number,
@@ -1186,8 +1176,6 @@ def track_across_segments(
                     except Exception:
                         logging.exception("resume-log: failed DETECT-PERSIST probe")
 
-                _dump_agg_state(f"AFTER FRAME {frame_idx}", aggregator, frame=frame_idx)
-
                 # Mark binding as used exactly once on the first detection frame where it applied.
                 if (
                     need_detect
@@ -1242,13 +1230,6 @@ def track_across_segments(
                         logging.info("resume: no require_track_id observations at anchor; retrying without strictness.")
                         frame_obs_objs = aggregator.observations_at(frame_idx, require_track_id=False)
                     if frame_obs_objs:
-                        if PARANOID:
-                            if frame_obs_objs:
-                                logger.debug("seg: frame=%s shot=%s n_obs=%s first=%r",
-                                             frame_idx, shot_number, len(frame_obs_objs),
-                                             {"tid": frame_obs_objs[0].track_id,
-                                              "src": getattr(frame_obs_objs[0], "source", None),
-                                              "bbox": getattr(frame_obs_objs[0], "bbox", None)})
                         if not all(isinstance(o, FaceObservation) for o in frame_obs_objs):
                             bad = [type(o).__name__ for o in frame_obs_objs if not isinstance(o, FaceObservation)]
                             logger.error("seg: Non-FaceObservation in frame_obs_objs at frame=%s shot=%s types=%s sample=%r",
