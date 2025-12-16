@@ -17,7 +17,7 @@ from facekit.pipeline.checkpoint import TrackingCheckpoint
 
 logger = logging.getLogger(__name__)
 
-def _ckpt_run_root(checkpoint) -> Path | None:
+def _checkpoint_root_dir(checkpoint) -> Path | None:
     """
     Return the run root directory for the active checkpoint.
     Prefers .root (run_dir), falls back to .run_dir, else parent of .ckpt_dir.
@@ -107,7 +107,7 @@ def _save_crops_for_frame(
     if not det_obs:
         return
 
-    crops_root = _ckpt_run_root(checkpoint)
+    crops_root = _checkpoint_root_dir(checkpoint)
     _saved = 0
     for ob in det_obs:
         if getattr(ob, "aligned_face", None) is None:
@@ -131,7 +131,7 @@ def _save_crops_for_frame(
         int(_saved),
     )
 
-def _checkpoint_pre_detect(
+def do_checkpoint(
     checkpoint: TrackingCheckpoint | None,
     *,
     frame_idx: int,
@@ -140,7 +140,7 @@ def _checkpoint_pre_detect(
     shot_first_frame: int,
 ) -> None:
     """
-    Issue a checkpoint_before-detection event, if a checkpoint is configured.
+    Issue a checkpoint event, if a checkpoint is configured.
 
     This is called just before running the detector on a given frame so that
     status.json and sidecars reflect the current state even if detection or
@@ -262,75 +262,6 @@ def _checkpoint_observations_and_snapshot(
             )
     except Exception:
         logger.exception("checkpoint: snapshot write failed at detect frame %s", frame_idx)
-
-def _log_detect_persist(
-    checkpoint: TrackingCheckpoint | None,
-    *,
-    shot_number: int,
-    frame_idx: int,
-    aggregator: ShotFaceTrackAggregator,
-) -> None:
-    """
-    Emit a diagnostic log summarizing which DET rows were persisted for a frame.
-
-    This is purely for debugging/forensics. It inspects either:
-      - checkpoint.obs_collector.rows_for_frame(shot, frame), if available, or
-      - aggregator.observations_at(frame, Source.DETECTED), as a fallback.
-
-    Parameters
-    ----------
-    checkpoint :
-        Optional TrackingCheckpoint; if None, this is a no-op.
-    shot_number :
-        Logical shot identifier.
-    frame_idx :
-        Absolute frame index just processed by the detector.
-    aggregator :
-        ShotFaceTrackAggregator from which we can derive DET observations
-        when the collector API is not available.
-    """
-    if not checkpoint:
-        return
-    try:
-        det_persisted = []
-        if (
-            hasattr(checkpoint, "obs_collector")
-            and hasattr(checkpoint.obs_collector, "rows_for_frame")
-        ):
-            for r in checkpoint.obs_collector.rows_for_frame(shot_number, frame_idx):
-                if int(r.get("src", -1)) == int(Source.DETECTED.value):
-                    det_persisted.append(
-                        {
-                            "tid": int(r.get("tid", -1)),
-                            "emb_idx": int(r.get("emb_idx", -1)),
-                            "has_crop": 1 if r.get("crop_ref") else 0,
-                        }
-                    )
-        else:
-            for ob in aggregator.observations_at(
-                frame_idx, source=Source.DETECTED, require_track_id=True
-            ):
-                det_persisted.append(
-                    {
-                        "tid": int(getattr(ob, "track_id", -1)),
-                        "emb_idx": -1,
-                        "has_crop": 1
-                        if (
-                            getattr(ob, "aligned_face", None) is not None
-                            or getattr(ob, "crop_ref", None)
-                        )
-                        else 0,
-                    }
-                )
-        if det_persisted:
-            logging.info(
-                "DETECT-PERSIST shot=%d frame=%d rows=%s",
-                int(shot_number),
-                int(frame_idx),
-                det_persisted,
-            )
-    except Exception:
-        logging.exception("resume-log: failed DETECT-PERSIST probe")
 
 def _persist_embeddings_for_track(
     checkpoint: TrackingCheckpoint | None,

@@ -299,81 +299,52 @@ class ShotFaceTrackAggregator:
         for track in self.tracks:
             track.is_active = False
 
-        assigned_tracks: set[int] = set()
+        # Fast lookup
+        by_id: dict[int, FaceTrack] = {int(t.track_id): t for t in self.tracks}
+
         unmatched_obs: list[FaceObservation] = []
-
-        logging.info("pre-match: open_tracks=%d ids=%s",
-                    sum(1 for t in self.tracks if not t.is_closed()),
-                    [t.track_id for t in self.tracks if not t.is_closed()])
-        for tr in self.tracks:
-            logging.info("pre-match: tid=%d last_bbox=%s last_frame=%s closed=%s",
-                        tr.track_id,
-                        tr.get_last_bbox(),
-                        tr.last_frame(),
-                        tr.is_closed())
-
-        # Greedy IoU assignment: each detection → at most one track; each track ← at most one detection.
         for obs in observations:
-            best_track = None
-            best_iou = 0.0
-
-            for track in self.tracks:
-                if track.is_closed():
-                    continue
-                if track.track_id in assigned_tracks:
-                    continue
-
-                last_bbox = track.get_last_bbox()
-                if last_bbox is None:
-                    continue
-
-                iou = compute_iou(last_bbox, obs.bbox)
-                if iou >= self.iou_threshold and iou > best_iou:
-                    best_iou = iou
-                    best_track = track
-
-            if best_track is not None:
-                obs.track_id = best_track.track_id
-                if hasattr(obs, "shot_id"):
-                    obs.shot_id = self.shot_number
-
-                best_track.add_observation(obs)
-
-                best_track.is_active = True
-                assigned_tracks.add(best_track.track_id)
-                self._index_obs(obs)
-            else:
+            tid = getattr(obs, "track_id", None)
+            if tid is None:
                 unmatched_obs.append(obs)
+                continue
 
-        # Create new tracks for unmatched detections
+            tid = int(tid)
+            track = by_id.get(tid)
+
+            # If caller assigned to a non-existent or closed track, treat as unmatched -> new track.
+            if track is None or track.is_closed():
+                obs.track_id = None
+                unmatched_obs.append(obs)
+                continue
+
+            obs.shot_id = self.shot_number
+
+            track.add_observation(obs)
+            track.is_active = True
+            self._index_obs(obs)
+
         num_created = 0
+        # Create new tracks for unmatched detections
         for obs in unmatched_obs:
-
-            # Use collision-safe allocator
             new_tid = self._allocate_track_id()
             new_track = FaceTrack(track_id=new_tid, shot_id=self.shot_number)
-            
+
             obs.track_id = new_track.track_id
-            if hasattr(obs, "shot_id"):
-                obs.shot_id = self.shot_number
+            obs.shot_id = self.shot_number
 
             new_track.add_observation(obs)
-
+            new_track.mark_open()
             new_track.is_active = True
+
             self.tracks.append(new_track)
+            by_id[int(new_tid)] = new_track
             self._index_obs(obs)
             num_created += 1
 
         # On a detection frame, any not-matched open tracks are closed.
         for track in self.tracks:
             if not track.is_active and not track.is_closed():
-                # Verbose reason: show last bbox and that it missed IoU threshold
-                last_bbox = track.get_last_bbox()
-                logging.info(
-                    "CLOSE (unmatched on DET frame) shot=%d track_id=%d last_bbox=%s",
-                    int(self.shot_number), int(track.track_id),
-                    (tuple(int(v) for v in last_bbox) if last_bbox else None)
-                )
                 track.mark_closed()
 
         # ---- Consume/clear the resume override on the first DET frame post-resume ----

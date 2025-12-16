@@ -1,10 +1,9 @@
 import numpy as np
 import json
 from pathlib import Path
-from typing import List, Tuple, Dict, Union, Optional
+from typing import List, Tuple, Dict, Union, Callable
 import copy
 from contextlib import ExitStack
-from bisect import bisect_left
 from PIL import Image
 import logging
 
@@ -24,15 +23,13 @@ from facekit.pipeline.resume_rehydrate import (
     _validate_shots_are_absolute_and_increasing,
 )
 from facekit.pipeline.checkpoint_io import (
-    _ckpt_run_root,
+    _checkpoint_root_dir,
     _save_crops_for_frame, 
-    _checkpoint_pre_detect, 
+    do_checkpoint, 
     _checkpoint_observations_and_snapshot,
-    _log_detect_persist, 
     _persist_embeddings_for_track,
     _finalize_checkpoint_run
 )
-from facekit.utils.geometry import compute_iou
 from facekit.errors import ResumeSafetyError
 
 logger = logging.getLogger(__name__)
@@ -261,6 +258,164 @@ def _guard_no_rewind(frame_idx: int, resume_plan: ResumePlan) -> None:
         raise ResumeSafetyError(
             f"Illegal rewind: got frame_idx={frame_idx} < anchor={resume_plan.anchor_frame}"
         )
+    
+def _default_embedding_frame_policy(track, obs, frame_idx: int) -> bool:
+    """
+    Decide whether this observation/frame should be used for embedding.
+
+    For now this always returns True, meaning:
+      - if we can materialize an aligned_face or crop for this obs,
+        we will include it in the embed batch.
+
+    Later, we can replace or override this with:
+      - stride-based sampling (every Nth frame),
+      - max-embeddings-per-track caps,
+      - quality heuristics, etc.
+    """
+    return True
+
+
+def _collect_crops_for_embedding(
+    track,
+    *,
+    checkpoint,
+    run_root: Path | None,
+    embedding_frame_policy: Callable[[object, object, int], bool] | None = None,
+):
+    """
+    Collect (crops, frame_indices) for a single track, using:
+
+      - obs.aligned_face if present
+      - otherwise, a crop loaded from obs.crop_ref (if checkpoint + file exists)
+
+    The optional embedding_frame_policy(track, obs, frame_idx) can be used
+    to subsample frames (e.g., stride rules) without changing the call site.
+    """
+    if embedding_frame_policy is None:
+        embedding_frame_policy = _default_embedding_frame_policy
+
+    crops: list[np.ndarray] = []
+    frames_for_embed: list[int] = []
+
+    for obs in getattr(track, "observations", []) or []:
+        frame_idx = int(getattr(obs, "frame_idx", -1))
+
+        # Let the policy decide if this frame is even eligible
+        try:
+            if not embedding_frame_policy(track, obs, frame_idx):
+                continue
+        except Exception:
+            # Be conservative; if the policy explodes, skip this obs but keep going.
+            logging.exception(
+                "embed-policy: error applying embedding_frame_policy for "
+                "track_id=%s frame=%s",
+                getattr(track, "track_id", None),
+                frame_idx,
+            )
+            continue
+
+        # Case 1: aligned_face already in memory
+        if getattr(obs, "aligned_face", None) is not None:
+            try:
+                crops.append(obs.aligned_face)
+                frames_for_embed.append(frame_idx)
+            except Exception:
+                logging.exception(
+                    "embed-collect: failed to use aligned_face for track_id=%s frame=%s",
+                    getattr(track, "track_id", None),
+                    frame_idx,
+                )
+            continue
+
+        # Case 2: try to load crop from disk via crop_ref
+        cr = getattr(obs, "crop_ref", None)
+        if checkpoint and cr and run_root is not None:
+            try:
+                abs_path = Path(run_root, cr)
+                if abs_path.exists():
+                    img = Image.open(abs_path).convert("RGB")
+                    crops.append(np.asarray(img))
+                    frames_for_embed.append(frame_idx)
+            except Exception:
+                logging.exception("embed-load: failed to load crop %s", cr)
+
+    return crops, frames_for_embed
+
+from facekit.utils.geometry import compute_iou  # add if not already imported
+
+
+def extend_prev_track_for_overlapping_detection(
+    *,
+    aggregator: ShotFaceTrackAggregator,
+    detections: List[FaceObservation],
+    iou_threshold: float,
+) -> int:
+    """
+    Pair-driven greedy IoU matching:
+      - Build all (open_track, detection_obs) pairs with IoU >= threshold
+      - Sort by IoU desc, tie-break deterministically
+      - Assign 1-to-1 matches by descending IoU
+      - Mutates detection FaceObservations by setting obs.track_id for matched obs
+
+    Returns
+    -------
+    int : number of matches made
+    """
+    if not detections:
+        return 0
+
+    # Only consider detections that are not already assigned (should all be None here)
+    det_indices = [i for i, ob in enumerate(detections) if getattr(ob, "track_id", None) is None]
+    if not det_indices:
+        return 0
+
+    # Collect open tracks with a last bbox
+    open_tracks = []
+    for t in getattr(aggregator, "tracks", []) or []:
+        if t.is_closed():
+            continue
+        last_bbox = t.get_last_bbox()
+        if last_bbox is None:
+            continue
+        open_tracks.append((int(t.track_id), t, last_bbox))
+
+    if not open_tracks:
+        return 0
+
+    # Build candidate pairs
+    # pair = (iou, track_id, det_idx)
+    pairs: list[tuple[float, int, int]] = []
+    for det_idx in det_indices:
+        ob = detections[det_idx]
+        for track_id, _t, last_bbox in open_tracks:
+            iou = float(compute_iou(last_bbox, ob.bbox))
+            if iou >= float(iou_threshold):
+                pairs.append((iou, track_id, det_idx))
+
+    if not pairs:
+        return 0
+
+    # Sort: IoU desc, then track_id asc, then det_idx asc (det order already deterministic)
+    pairs.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+    used_tracks: set[int] = set()
+    used_dets: set[int] = set()
+    matched = 0
+
+    for _iou, track_id, det_idx in pairs:
+        if track_id in used_tracks:
+            continue
+        if det_idx in used_dets:
+            continue
+
+        detections[det_idx].track_id = int(track_id)
+        used_tracks.add(track_id)
+        used_dets.add(det_idx)
+        matched += 1
+
+    return matched
+
+
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -357,7 +512,7 @@ def track_across_segments(
     logging.info(
         "ckpt.paths: status_path=%s; _ckpt_run_root(checkpoint)=%s",
         getattr(checkpoint, "status_path", None),
-        (_ckpt_run_root(checkpoint) if checkpoint else None),
+        (_checkpoint_root_dir(checkpoint) if checkpoint else None),
     )
 
     shot_json_path = Path(shot_json_path)
@@ -392,8 +547,6 @@ def track_across_segments(
             all_tracks=all_tracks,
         )
 
-        reuse_binding_used: bool = False
-
         for shot_idx, shot_num in enumerate(shots):
             shot_number = shot_num["shot_number"]
             first = shot_num["first_frame"]
@@ -411,10 +564,6 @@ def track_across_segments(
                 embedding_thresh=embedding_thresh,
                 checkpoint=checkpoint,
             )
-
-            # --- shot-level diagnostics ---
-            shot_det_raw_total = 0          # number of raw det boxes this shot
-            shot_det_aligned_total = 0      # number of dets that produced aligned_face this shot
 
             face_tracker = FaceTracker(tracker_type="CSRT")
             tracker_active = False
@@ -442,29 +591,20 @@ def track_across_segments(
                 if frame is None:
                     continue
 
-                if frame_idx == start_at:
-                    logging.info(
-                        "ENTER processing loop at frame=%d (anchor=%d)",
-                        frame_idx,
-                        resume_plan.anchor_frame,
-                    )
-
                 _guard_no_rewind(frame_idx, resume_plan)
 
                 shot_frames.append(frame)
                 observations: List[FaceObservation] = []
 
-                detect_interval_hit = (frame_idx % detect_interval == 0)
+                is_scheduled_detect_frame = (frame_idx % detect_interval == 0)
 
                 no_tracker = (not tracker_active)
-                open_tracks = [t for t in aggregator.tracks if not t.is_closed()]
-                no_open_tracks = (len(open_tracks) == 0)
+                no_open_tracks = not any(not t.is_closed() for t in aggregator.tracks)
 
-                # Determine if this is a scheduled detection frame
-                need_detect = detect_interval_hit or no_tracker or no_open_tracks
+                # Determine if this is a detection frame
+                do_detection = is_scheduled_detect_frame or no_tracker or no_open_tracks
 
-
-                if not need_detect:
+                if not do_detection:
                     # Try tracking all existing tracks
                     tracked_boxes: Dict[int, Tuple[float, float, float, float]] = face_tracker.update_trackers(frame)
                     basic_fail = (not tracked_boxes) or any(b is None for b in tracked_boxes.values())
@@ -487,27 +627,13 @@ def track_across_segments(
                                 )
                             )
                     else:
-                        logging.debug(
-                            "TRACK - validator reject or tracker fail: frame=%d (basic_fail=%s)",
-                            frame_idx,
-                            basic_fail,
-                        )
                         aggregator.finalize_tracks()
                         tracker_active = False
-                        need_detect = True
+                        do_detection = True
 
-                if need_detect:  # Run detection if needed
-                    logging.info(
-                        "shot=%d first=%d frame=%d (mod=%d) tracker_active=%s, detect_interval=%d",
-                        shot_number,
-                        first,
-                        frame_idx,
-                        (frame_idx % detect_interval),
-                        tracker_active,
-                        detect_interval,
-                    )
+                if do_detection:  # Run detection 
 
-                    _checkpoint_pre_detect(
+                    do_checkpoint(
                         checkpoint,
                         frame_idx=frame_idx,
                         shot_number=shot_number,
@@ -519,7 +645,6 @@ def track_across_segments(
 
                     if detections:
                         boxes, landmark_lists, confidences = detections
-                        raw_count = len(boxes)
                         aligned_ok = 0
 
                         # Deterministically order detections
@@ -537,9 +662,7 @@ def track_across_segments(
                         landmark_lists = [landmark_lists[i] for i in order]
                         confidences = [confidences[i] for i in order]
 
-                        for det_idx, (box, landmarks, confidence) in enumerate(
-                            zip(boxes, landmark_lists, confidences)
-                        ):
+                        for box, landmarks, confidence in zip(boxes, landmark_lists, confidences):
                             bbox = tuple(int(v) for v in box[:4])
                             aligned_face = align_face_for_arcface(
                                 frame, landmarks, frame_idx, source="detect"
@@ -558,9 +681,6 @@ def track_across_segments(
                                         source=Source.DETECTED,
                                     )
                                 )
-
-                        shot_det_raw_total += int(raw_count)
-                        shot_det_aligned_total += int(aligned_ok)
                     else:
                         # no faces this frame; close shot-local tracks
                         aggregator.finalize_tracks()
@@ -578,41 +698,16 @@ def track_across_segments(
                             }
                         )
 
-                det_count = sum(
-                    1
-                    for o in observations
-                    if getattr(o, "source", None) == Source.DETECTED
-                )
-                logging.info(
-                    "DETECTION frame=%d shot=%d raw-detections=%d",
-                    frame_idx,
-                    int(shot_number),
-                    det_count,
-                )
-
-                if observations:
-                    det_cnt = sum(
-                        1
-                        for o in observations
-                        if getattr(o, "source", None) == Source.DETECTED
+                if observations and observations[0].source == Source.DETECTED:
+                    _ = extend_prev_track_for_overlapping_detection(
+                        aggregator=aggregator,
+                        detections=observations,
+                        iou_threshold=iou_thresh,
                     )
-                    if det_cnt:
-                        bboxes = [
-                            tuple(int(v) for v in o.bbox[:4])
-                            for o in observations
-                            if getattr(o, "source", None) == Source.DETECTED
-                        ]
-                        logging.info(
-                            "DETECT-EMIT shot=%d frame=%d det_n=%d boxes=%s",
-                            int(shot_number),
-                            int(frame_idx),
-                            int(det_cnt),
-                            bboxes[:6],
-                        )
 
-                created_count = aggregator.update_tracks_with_frame(
+                _ = aggregator.update_tracks_with_frame(
                     frame_idx, observations
-                )
+                    )
 
                 _save_crops_for_frame(
                     checkpoint,
@@ -629,45 +724,15 @@ def track_across_segments(
                     resume_plan=resume_plan,
                 )
 
-                _log_detect_persist(
-                    checkpoint,
-                    shot_number=shot_number,
-                    frame_idx=frame_idx,
-                    aggregator=aggregator,
-                )
-
-                # Reuse binding once on first detection frame of anchor shot
-                if (
-                    need_detect
-                    and not reuse_binding_used
-                    and resume_plan.reuse_tid_for_first_shot is not None
-                    and int(shot_number) == int(resume_plan.first_processed_shot_number)
-                    and created_count > 0
-                ):
-                    reuse_binding_used = True
-                    logging.info(
-                        "resume: reuse binding applied (shot=%d, reused tid=%d).",
-                        int(shot_number),
-                        int(resume_plan.reuse_tid_for_first_shot),
-                    )
-
                 agg_det = aggregator.observations_at(
                     frame_idx, source=Source.DETECTED, require_track_id=True
                 )
                 agg_trk = aggregator.observations_at(
                     frame_idx, source=Source.TRACKED, require_track_id=True
                 )
-                logging.debug(
-                    "POST-ASSIGN: frame=%d det_assigned=%d trk_assigned=%d created=%d open_tracks=%d",
-                    frame_idx,
-                    len(agg_det),
-                    len(agg_trk),
-                    created_count,
-                    sum(1 for t in aggregator.tracks if not t.is_closed()),
-                )
 
                 # If faces detected, init tracker with aggregator IDs and seed validator
-                if need_detect:
+                if do_detection:
                     det_obs = aggregator.observations_at(
                         frame_idx, source=Source.DETECTED, require_track_id=True
                     )
@@ -689,84 +754,51 @@ def track_across_segments(
                 if checkpoint:
                     checkpoint.on_frame(frame_idx)
 
-            logging.info(
-                "shot=%d summary: det_raw=%d det_aligned(crop|face)=%d",
-                int(shot_number),
-                int(shot_det_raw_total),
-                int(shot_det_aligned_total),
-            )
-
-            # --- embedding diagnostics (shot scope) ---
-            shot_embed_intended = 0   # total crops/aligned faces we intend to embed for this shot
-            shot_embed_vectors = 0    # total vectors returned by embedder for this shot
+            # ---- end-of-shot embedding pass ----------
+            run_root = _checkpoint_root_dir(checkpoint) if checkpoint else None
 
             for track in aggregator.tracks:
-                crops = []
-                frames_for_embed: list[int] = []
+                crops, frames_for_embed = _collect_crops_for_embedding(
+                    track,
+                    checkpoint=checkpoint,
+                    run_root=run_root,
+                    # embedding_frame_policy=None  # uses default for now
+                )
 
-                for obs in track.observations:
-                    if obs.aligned_face is not None:
-                        crops.append(obs.aligned_face)
-                        frames_for_embed.append(int(obs.frame_idx))
-                        logging.info(
-                            f"shot: {shot_number}, track:{track}, obs.aligned_face not None and appended"
-                        )
-                        continue
-                    cr = getattr(obs, "crop_ref", None)
-                    if checkpoint and cr:
-                        try:
-                            abs_path = Path(_ckpt_run_root(checkpoint), cr)
-                            if abs_path.exists():
-                                img = Image.open(abs_path).convert("RGB")
-                                crops.append(np.asarray(img))
-                                frames_for_embed.append(int(obs.frame_idx))
-                                logging.info(
-                                    f"shot: {shot_number}, track:{track}, no obs.aligned_face but abs_path found and crop appended"
-                                )
-                        except Exception:
-                            logging.exception("embed-load: failed to load crop %s", cr)
                 if not crops:
-                    logging.info(
-                        f"end of shot {shot_number} and no aligned faces found"
+                    continue
+
+                embs = embedder.get_embedding_batch(
+                    crops,
+                    batch_size=embedding_batch_size_max,
+                )
+
+
+                if embs is None:
+                    logging.error(
+                        "embed: embedder returned None for shot=%d tid=%s",
+                        int(shot_number),
+                        str(getattr(track, "track_id", "NA")),
                     )
                     continue
 
-                track_intended = len(crops)
-                shot_embed_intended += track_intended
-                logging.info(
-                    "embed-intent: shot=%d tid=%s crops_for_embed=%d",
-                    int(shot_number),
-                    str(track.track_id),
-                    int(track_intended),
-                )
-
-                embs = embedder.get_embedding_batch(
-                    crops, batch_size=embedding_batch_size_max
-                )
-                if len(embs) != len(frames_for_embed):
-                    raise RuntimeError(
-                        f"Embed count/frame mismatch: embs={len(embs)} frames={len(frames_for_embed)} "
-                        f"(shot={shot_number}, tid={track.track_id})"
-                    )
-
-                logging.info(
-                    "embed-return: shot=%d tid=%s vectors=%d shape=%s dtype=%s",
-                    int(shot_number),
-                    str(track.track_id),
-                    0 if embs is None else int(len(embs)),
-                    getattr(embs, "shape", None),
-                    getattr(getattr(embs, "dtype", None), "name", None),
-                )
-                shot_embed_vectors += 0 if embs is None else int(len(embs))
 
                 if not isinstance(embs, np.ndarray):
                     raise TypeError(f"Embedder must return np.ndarray, got {type(embs)}")
+            
                 if embs.ndim != 2 or embs.shape[1] != 512:
                     raise ValueError(
                         f"Embedder returned invalid array shape {embs.shape}; expected (K,512)"
                     )
                 if embs.dtype != np.float32:
                     embs = np.asarray(embs, dtype=np.float32, order="C")
+
+                
+                if len(embs) != len(frames_for_embed):
+                    raise RuntimeError(
+                        f"Embed count/frame mismatch: embs={len(embs)} frames={len(frames_for_embed)} "
+                        f"(shot={shot_number}, tid={track.track_id})"
+                    )
 
                 aggregator.attach_embeddings(track.track_id, embs)
 
@@ -781,13 +813,6 @@ def track_across_segments(
                     frames_for_embed=frames_for_embed,
                     embs=embs,
                 )
-
-            logging.info(
-                "EMB-RECONCILE shot=%d intended=%d returned=%d note=post-embed-loop",
-                int(shot_number),
-                int(shot_embed_intended),
-                int(shot_embed_vectors),
-            )
 
             aggregator.finalize_tracks()
 
