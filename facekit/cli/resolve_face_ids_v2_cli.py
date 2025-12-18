@@ -23,6 +23,7 @@ from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 from facekit.tracking.face_structures import FaceTrack
 from facekit.validation import validate_manifest
+from facekit.tracking.track_consolidation_and_pruning import apply_track_consolidation_and_pruning
 from facekit.output.json_v2 import (
     V2WriterConfig,
     build_v2_manifest_from_tracks,
@@ -282,6 +283,14 @@ def run_pipeline(args):
             next_gid = resolver.resolve_global_ids(tracks, start_id=0)
             logging.info("global-id: assignment complete (next_gid=%d)", next_gid)
 
+            tracks = apply_track_consolidation_and_pruning(
+                tracks,
+                min_gap_len=args.post_min_gap_len,     # pick defaults you like
+                min_track_len=args.post_min_track_len,
+                iou_threshold=args.post_iou_threshold,
+            )
+            logging.info("post: tracks after consolidation/pruning=%d", len(tracks))
+
         ckpt.finalize()
 
     # Optional: segment JSON (unchanged behavior)
@@ -472,6 +481,21 @@ def main() -> None:
     parser.add_argument("--embedding-batch-size-max", type=int, default=32)
     parser.add_argument("--device",  choices=["auto", "cuda", "cpu"], default="auto",
                         help="Compute device for detector/embedder (default: auto)")
+    
+    # Post processing
+    parser.add_argument("--post-min-gap-len", type=int, default=210,
+                        help=("Minimum gap length (in frames) that will NOT be filled during post-processing. "
+                              "Gaps shorter than this, between tracks with the same global ID and sufficient "
+                              "spatial overlap, may be filled via interpolation and the two contiguous tracks merged."))
+    parser.add_argument("--post-min-track-len", type=int, default=70,
+                        help=("Minimum track length (in frames) required for a track to survive post-processing. "
+                              "Tracks shorter than this may be reassigned to nearby global IDs or pruned entirely "
+                              "if no valid reassignment exists."))
+    parser.add_argument("--post-iou-threshold", type=float, default=0.2,
+                        help=("Minimum Intersection-over-Union (IoU) required when considering spatial continuity "
+                              "during post-processing. Used both for reassigning short tracks to nearby global IDs "
+                              "and for filling short gaps between tracks."))
+
     # Storage controls
     parser.add_argument("--emb-store", choices=["inline", "sidecar", "none"], default="inline",
                         help="How to serialize embeddings in V2 manifest (default: inline).",)

@@ -6,7 +6,7 @@ import types
 
 from facekit.cli import resolve_face_ids_v2_cli as cli
 from facekit.common.obs_consts import Source
-from facekit.tracking.face_structures import FaceObservation
+from facekit.tracking.face_structures import FaceObservation, FaceTrack
 
 @pytest.mark.parametrize("ver,expected_suffix", [("2.0","_v2.json"), ("2.1","_v2_1.json")])
 def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
@@ -49,7 +49,9 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
         def last_frame(self): 
             return 1
     def fake_track_across_segments(**kw):
-        return [_Track()]    
+        obs = [_Obs(0), _Obs(1)]
+        t = FaceTrack(shot_id=1, track_id=1, observations=obs, segment_id=0, global_id=0)
+        return [t]
     def fake_load_model(*a, **k): return _Det()
     def fake_generate_shot_features_json(**kw):
         Path(kw["output_json_path"]).write_text(

@@ -237,6 +237,9 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         output_global_json=True,             # trigger JSON manifest write
         output_video=None,
         detect_interval=30,
+        post_min_gap_len=210,
+        post_min_track_len=70,
+        post_iou_threshold=0.2,
         embedding_batch_size_max=32,
         device="cpu",
         emb_store="sidecar",
