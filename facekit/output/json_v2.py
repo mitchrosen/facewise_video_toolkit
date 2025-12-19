@@ -253,10 +253,6 @@ class ObservationsCollector:
         Accepts legacy alias `frame_max` via **kwargs.
         """
 
-        logging.info(f"In find_rows: shot {shot}, track_id{track_id}, frame_last {frame_last}, count {count}, \
-                     only_unassigned {only_unassigned}, only_with_crop {only_with_crop}, source {source} \
-                     rows {self._rows}")
-
         # Back-compat alias: some callers used frame_max
         if frame_last is None and "frame_max" in kwargs and kwargs["frame_max"] is not None:
             frame_last = int(kwargs["frame_max"])
