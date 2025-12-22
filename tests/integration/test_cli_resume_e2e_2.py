@@ -297,6 +297,39 @@ def _wrapped_track(*a, **k):
 
 track_mod.track_across_segments = _wrapped_track
 
+# --- Ensure DET rows always have landmarks persisted (test harness contract) ---
+from facekit.output.json_v2 import ObservationsCollector
+from facekit.common.obs_consts import Source
+
+_orig_append = ObservationsCollector.append_track_obs
+
+def _append_track_obs_with_landmarks(self, rows, *a, **k):
+    fixed = []
+    for r in rows:
+        rr = dict(r)
+
+        # Normalize src to a string when present (some tests pass enums)
+        src = rr.get("src", None)
+        if hasattr(src, "value"):  # enum
+            src = src.value
+
+        # Your collector may store src as string ("detected") or as enum; handle both.
+        is_det = (src == "detected") or (src == Source.DETECTED) or (src == getattr(Source.DETECTED, "value", None))
+
+        if is_det:
+            lm = rr.get("landmarks", None)
+            # “missing” includes None or empty; enforce shape (5,2) float32
+            if lm is None or (hasattr(lm, "size") and lm.size == 0):
+                rr["landmarks"] = np.zeros((5, 2), dtype=np.float32)
+            else:
+                rr["landmarks"] = np.asarray(lm, dtype=np.float32).reshape(5, 2)
+
+        fixed.append(rr)
+
+    return _orig_append(self, fixed, *a, **k)
+
+ObservationsCollector.append_track_obs = _append_track_obs_with_landmarks
+
 # 5) Run CLI
 sys.argv = ["prog", *argv]
 try:

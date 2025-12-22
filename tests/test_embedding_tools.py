@@ -3,7 +3,7 @@ import pytest
 import json
 from facekit.embedding.embedding_summary import compute_representative_embeddings
 from facekit.embedding.embedding_types import EmbeddingDict
-from facekit.embedding.embedding_extraction import crop_face, save_embeddings_to_json
+from facekit.embedding.embedding_extraction import save_embeddings_to_json
 
 class DummyEmbedder:
     def get_embedding_batch(self, faces, batch_size=32):
@@ -11,15 +11,6 @@ class DummyEmbedder:
         return np.array([np.ones(512, dtype=np.float32) for _ in faces], dtype=np.float32)
 
 @pytest.fixture
-def dummy_frame():
-    # Create a 100x100 dummy image
-    return np.full((100, 100, 3), 255, dtype=np.uint8)
-
-def test_crop_face_shape(dummy_frame):
-    bbox = (10, 20, 50, 60)
-    cropped = crop_face(dummy_frame, bbox)
-    assert cropped.shape == (40, 40, 3)
-
 def test_compute_representative_embeddings_basic():
     # Mock input embeddings for shot_001 with two frames, one track
     emb1 = np.ones(512, dtype=np.float32)

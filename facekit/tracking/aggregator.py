@@ -386,30 +386,6 @@ class ShotFaceTrackAggregator:
             if not track.is_active and not track.is_closed():
                 track.mark_closed()
 
-    def add_frame_observations(self, 
-                               frame_idx: int, 
-                               observations: List[Tuple[np.ndarray, List[Tuple[int, int]], np.ndarray]]):
-        """
-        Convert detector outputs for one frame into FaceObservations and update tracks.
-
-        observations: list of tuples with the following semantic shape per item:
-            (bbox, landmarks, aligned_face)
-              - bbox:       (x1, y1, x2, y2), may arrive as list -> coerced to tuple of ints
-              - landmarks:  5-point landmarks (unused here other than having produced aligned_face)
-              - aligned_face: ArcFace-aligned RGB crop (112x112x3) or None if alignment failed
-        """
-        frame_idx = int(frame_idx)
-        face_observations = []
-        for bbox, _landmarks, aligned_face in observations:
-            x1, y1, x2, y2 = map(int, bbox[:4])
-            obs = FaceObservation(
-                frame_idx=frame_idx, 
-                bbox=(x1,y1,x2,y2), 
-                aligned_face=aligned_face,
-                source=Source.DETECTED)
-            face_observations.append(obs)
-        self.update_tracks_with_frame(frame_idx, face_observations)
-
     def attach_embeddings(self, track_id: int, embeddings: np.ndarray, expected_dim: int = 512):
         track = next((t for t in self.tracks if t.track_id == track_id), None)
         if track is None:
@@ -499,11 +475,11 @@ class ShotFaceTrackAggregator:
 
         if missing_tracks:
             for t in missing_tracks:
-                aligned_count = sum(1 for obs in t.observations if obs.aligned_face is not None)
+                aligned_count = sum(1 for obs in t.observations if obs.landmarks is not None)
                 valid_embeds = sum(1 for e in t.embeddings if e is not None)
                 logging.error(f"  - Track {t.track_id}: duration={t.duration()}, "
                     f"frames={t.get_frame_indices()}, "
-                    f"aligned_faces={aligned_count}, "
+                    f"landmarks={aligned_count}, "
                     f"embeddings={valid_embeds}/{len(t.embeddings)}")
             raise RuntimeError(f"Track {missing_tracks[0].track_id} missing embedding")
 

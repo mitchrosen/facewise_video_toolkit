@@ -1,9 +1,5 @@
 import numpy as np
 from pathlib import Path
-from facekit.utils.io import fsync_parent_dir
-import tempfile
-import os
-from PIL import Image
 import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
@@ -12,124 +8,8 @@ from facekit.common.obs_consts import Source
 import facekit.pipeline.resume_rehydrate as _resume_rehydrate
 from facekit.pipeline.resume_rehydrate import ResumePlan
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
-from facekit.pipeline.checkpoint import TrackingCheckpoint
-
 
 logger = logging.getLogger(__name__)
-
-def _checkpoint_root_dir(checkpoint) -> Path | None:
-    """
-    Return the run root directory for the active checkpoint.
-    Prefers .root (run_dir), falls back to .run_dir, else parent of .ckpt_dir.
-    """
-    candidate = getattr(checkpoint, "root", None)
-    if candidate:
-        return Path(candidate)
-    candidate = getattr(checkpoint, "run_dir", None)
-    if candidate:
-        return Path(candidate)
-    ckpt_dir = getattr(checkpoint, "ckpt_dir", None)
-    if ckpt_dir:
-        return Path(ckpt_dir).parent
-    # For in-memory / test stubs that don't persist to disk, we can proceed
-    # without a run root. This only affects logging / debug snapshots.
-    logger.warning(
-        "Cannot determine checkpoint run root (need one of .root, .run_dir, or .ckpt_dir); "
-        "proceeding with None (disk-backed debug snapshots will be disabled)."
-    )
-    return None
-
-def _shot_crops_dir(ckpt_root: Path, shot_number: int) -> Path:
-    p = ckpt_root / "ckpt" / "crops" / f"shot-{int(shot_number):04d}"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def _atomic_write_png(dst: Path, img_np) -> None:
-    # img_np expected 112x112x3, RGB or BGR depending on aligner
-    # ArcFace aligner you’re using returns RGB — if yours is BGR, swap here.
-    im = Image.fromarray(img_np)  # assumes RGB
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=dst.parent, suffix=".png", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        im.save(tmp_path, format="PNG", optimize=True)
-        tmp.flush(); os.fsync(tmp.fileno())
-    os.replace(tmp_path, dst)
-    # Ensure directory entry is durable on crash
-    try:
-        fsync_parent_dir(dst)
-    except Exception as e:
-        logger.info(f"_atomic_write_png: fsync of parent dir failed: {e}")
-        pass
-
-def _save_crop_for_obs(ckpt_root: Path, shot_number: int, frame_idx: int, tid: int, aligned_face) -> str:
-    crops_dir = _shot_crops_dir(ckpt_root, shot_number)
-    rel_name  = f"f{int(frame_idx):06d}_tid{int(tid):03d}.png"
-    abs_path  = crops_dir / rel_name
-    if not abs_path.exists():
-        _atomic_write_png(abs_path, aligned_face)
-    # return path relative to run root to keep status portable
-    # run root == checkpoint.root
-    rel_path = abs_path.relative_to(ckpt_root)
-    return str(rel_path)
-
-def _save_crops_for_frame(
-    checkpoint: TrackingCheckpoint | None,
-    *,
-    shot_number: int,
-    frame_idx: int,
-    aggregator: ShotFaceTrackAggregator,
-) -> None:
-    """
-    Persist aligned 112×112 crops associated with detection observations on a frame.
-
-    For each DET observation with an in-memory aligned_face and no crop_ref yet,
-    this function:
-      * Writes a PNG into the checkpoint's run-root under ckpt/crops/shot-####.
-      * Sets obs.crop_ref to the path relative to the run-root so that
-        checkpoint.add_observations can persist the reference.
-
-    Parameters
-    ----------
-    checkpoint :
-        Optional TrackingCheckpoint providing the run-root. If None, this is a no-op.
-    shot_number :
-        Logical shot identifier.
-    frame_idx :
-        Absolute frame index just processed.
-    aggregator :
-        ShotFaceTrackAggregator from which DET observations are read.
-    """
-    if not checkpoint:
-        return
-    det_obs = aggregator.observations_at(
-        frame_idx, source=Source.DETECTED, require_track_id=True
-    )
-    if not det_obs:
-        return
-
-    crops_root = _checkpoint_root_dir(checkpoint)
-    _saved = 0
-    for ob in det_obs:
-        if getattr(ob, "aligned_face", None) is None:
-            continue
-        if getattr(ob, "crop_ref", None):
-            continue
-        try:
-            rel = _save_crop_for_obs(
-                crops_root, shot_number, ob.frame_idx, ob.track_id, ob.aligned_face
-            )
-            setattr(ob, "crop_ref", rel)
-            _saved += 1
-        except Exception:
-            logger.exception(
-                "crop-archive: failed at frame=%d tid=%s", ob.frame_idx, ob.track_id
-            )
-    logger.info(
-        "CROP-SAVED frame=%d shot=%d saved=%d",
-        frame_idx,
-        int(shot_number),
-        int(_saved),
-    )
 
 def do_checkpoint(
     checkpoint: TrackingCheckpoint | None,
@@ -275,8 +155,10 @@ def _persist_embeddings_for_track(
     Persist per-frame embeddings for a single track into the checkpoint sidecar.
 
     Embeddings are stored with *frame-level* indices so that rehydrate logic
-    can enforce DET↔EMB parity and attach embeddings back to observations
-    strictly before the resume anchor.
+    can enforce parity between:
+      - DET observations that have landmarks, and
+      - stored embeddings
+    and attach embeddings back to observations strictly before the resume anchor.
 
     Parameters
     ----------

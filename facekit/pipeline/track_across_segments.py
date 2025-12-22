@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Union, Callable
 import copy
 from contextlib import ExitStack
-from PIL import Image
 import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
@@ -23,12 +22,10 @@ from facekit.pipeline.resume_rehydrate import (
     _validate_shots_are_absolute_and_increasing,
 )
 from facekit.pipeline.checkpoint_io import (
-    _checkpoint_root_dir,
-    _save_crops_for_frame, 
     do_checkpoint, 
     _checkpoint_observations_and_snapshot,
     _persist_embeddings_for_track,
-    _finalize_checkpoint_run
+    _finalize_checkpoint_run,
 )
 from facekit.errors import ResumeSafetyError
 
@@ -264,7 +261,7 @@ def _default_embedding_frame_policy(track, obs, frame_idx: int) -> bool:
     Decide whether this observation/frame should be used for embedding.
 
     For now this always returns True, meaning:
-      - if we can materialize an aligned_face or crop for this obs,
+       - if we can materialize an aligned face for this obs (from frame + landmarks),
         we will include it in the embed batch.
 
     Later, we can replace or override this with:
@@ -274,75 +271,7 @@ def _default_embedding_frame_policy(track, obs, frame_idx: int) -> bool:
     """
     return True
 
-
-def _collect_crops_for_embedding(
-    track,
-    *,
-    checkpoint,
-    run_root: Path | None,
-    embedding_frame_policy: Callable[[object, object, int], bool] | None = None,
-):
-    """
-    Collect (crops, frame_indices) for a single track, using:
-
-      - obs.aligned_face if present
-      - otherwise, a crop loaded from obs.crop_ref (if checkpoint + file exists)
-
-    The optional embedding_frame_policy(track, obs, frame_idx) can be used
-    to subsample frames (e.g., stride rules) without changing the call site.
-    """
-    if embedding_frame_policy is None:
-        embedding_frame_policy = _default_embedding_frame_policy
-
-    crops: list[np.ndarray] = []
-    frames_for_embed: list[int] = []
-
-    for obs in getattr(track, "observations", []) or []:
-        frame_idx = int(getattr(obs, "frame_idx", -1))
-
-        # Let the policy decide if this frame is even eligible
-        try:
-            if not embedding_frame_policy(track, obs, frame_idx):
-                continue
-        except Exception:
-            # Be conservative; if the policy explodes, skip this obs but keep going.
-            logging.exception(
-                "embed-policy: error applying embedding_frame_policy for "
-                "track_id=%s frame=%s",
-                getattr(track, "track_id", None),
-                frame_idx,
-            )
-            continue
-
-        # Case 1: aligned_face already in memory
-        if getattr(obs, "aligned_face", None) is not None:
-            try:
-                crops.append(obs.aligned_face)
-                frames_for_embed.append(frame_idx)
-            except Exception:
-                logging.exception(
-                    "embed-collect: failed to use aligned_face for track_id=%s frame=%s",
-                    getattr(track, "track_id", None),
-                    frame_idx,
-                )
-            continue
-
-        # Case 2: try to load crop from disk via crop_ref
-        cr = getattr(obs, "crop_ref", None)
-        if checkpoint and cr and run_root is not None:
-            try:
-                abs_path = Path(run_root, cr)
-                if abs_path.exists():
-                    img = Image.open(abs_path).convert("RGB")
-                    crops.append(np.asarray(img))
-                    frames_for_embed.append(frame_idx)
-            except Exception:
-                logging.exception("embed-load: failed to load crop %s", cr)
-
-    return crops, frames_for_embed
-
 from facekit.utils.geometry import compute_iou  # add if not already imported
-
 
 def extend_prev_track_for_overlapping_detection(
     *,
@@ -415,7 +344,102 @@ def extend_prev_track_for_overlapping_detection(
 
     return matched
 
+def _iter_embedding_requests_for_shot(
+    aggregator: ShotFaceTrackAggregator,
+    *,
+    start_at: int,
+    resume_plan: ResumePlan,
+    embedding_frame_policy: Callable[[object, object, int], bool] | None = None,
+):
+    """
+    Yield (frame_idx, track_id, obs) for DETECTED observations that should be embedded.
+    We require landmarks, and we skip pre-anchor frames on resume.
+    """
+    if embedding_frame_policy is None:
+        embedding_frame_policy = _default_embedding_frame_policy
 
+    for track in getattr(aggregator, "tracks", []) or []:
+        tid = int(getattr(track, "track_id", -1))
+        for obs in getattr(track, "observations", []) or []:
+            if getattr(obs, "source", None) != Source.DETECTED:
+                continue
+
+            frame_idx = int(getattr(obs, "frame_idx", -1))
+
+            # never embed frames we didn’t process in this run
+            if frame_idx < int(start_at):
+                continue
+
+            # resume safety: skip anything before anchor
+            if resume_plan.is_resume and resume_plan.anchor_frame and frame_idx < int(resume_plan.anchor_frame):
+                continue
+
+            # must have landmarks (we’re deferring alignment)
+            lms = getattr(obs, "landmarks", None)
+            if lms is None:
+                continue
+
+            # policy may subsample frames
+            try:
+                if not embedding_frame_policy(track, obs, frame_idx):
+                    continue
+            except Exception:
+                logging.exception("embed-policy: failed; skipping track=%s frame=%s", tid, frame_idx)
+                continue
+
+            yield frame_idx, tid, obs
+
+def _materialize_aligned_faces_for_requests(
+    frame_provider: FrameProvider,
+    requests: list[tuple[int, int, FaceObservation]],
+):
+    """
+    Given sorted requests (frame_idx asc), stream frames once and produce:
+      aligned_faces_by_tid[tid] = [aligned_face...]
+      frames_by_tid[tid] = [frame_idx...]
+    """
+    if not requests:
+        return {}, {}
+
+    # requests must be sorted by frame_idx
+    requests.sort(key=lambda x: x[0])
+
+    aligned_faces_by_tid: dict[int, list[np.ndarray]] = {}
+    frames_by_tid: dict[int, list[int]] = {}
+
+    min_f = int(requests[0][0])
+    max_f = int(requests[-1][0])
+
+    # Seek to first needed frame, then stream to last needed frame
+    frame_provider.reset_to_frame(min_f)
+
+    req_i = 0
+    for frame_idx in range(min_f, max_f + 1):
+        frame = frame_provider.next()
+        if frame is None:
+            # tolerate rare read failures; just skip this frame’s requests
+            while req_i < len(requests) and int(requests[req_i][0]) == frame_idx:
+                req_i += 1
+            continue
+
+        # process all requests for this frame_idx
+        while req_i < len(requests) and int(requests[req_i][0]) == frame_idx:
+            _f, tid, obs = requests[req_i]
+
+            lms = getattr(obs, "landmarks", None)
+            aligned = None
+            try:
+                aligned = align_face_for_arcface(frame, lms, frame_idx, source="embed")
+            except Exception:
+                logging.exception("align: failed in embed pass (tid=%s frame=%s)", tid, frame_idx)
+
+            if aligned is not None:
+                aligned_faces_by_tid.setdefault(tid, []).append(aligned)
+                frames_by_tid.setdefault(tid, []).append(frame_idx)
+
+            req_i += 1
+
+    return aligned_faces_by_tid, frames_by_tid
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -444,7 +468,7 @@ def track_across_segments(
          and emits **tracking** observations for currently active tracks.
       4) If any tracker update fails, all open tracks are marked closed, and the pipeline **falls back to detection**
          on that frame to reboot tracking cleanly.
-      5) At shot end, batches all aligned detection crops through the `embedder` and attaches 512-D embeddings
+      5) At shot end, batches all aligned faces (computed from frame + landmarks) through the `embedder` and attaches 512-D embeddings
          to each `FaceTrack`. The aggregator is then finalized, and per-shot **segment IDs** are resolved.
 
     Parameters
@@ -462,7 +486,8 @@ def track_across_segments(
         Face detector used on scheduled detection frames. Its `detect_faces_in_frame(frame)` is expected
         to return `(boxes_xyxy, landmarks, confidences)` or `None` when no faces are present.
     embedder : FaceEmbedder
-        Embeds aligned detection crops at the end of each shot; must return an `np.ndarray` of shape (K, 512), float32.
+        Embeds aligned faces computed at the end of each shot from (frame + landmarks) for DETECTED observations;
+        must return an `np.ndarray` of shape (K, 512), float32.
     iou_thresh : float, default 0.5
         IOU threshold inside the per-shot `ShotFaceTrackAggregator` for associating detections to tracks.
     embedding_thresh : float, default 0.7
@@ -489,11 +514,12 @@ def track_across_segments(
         All finalized `FaceTrack` objects across all shots, each with:
           - `shot_id`, `track_id` (per-shot), `segment_id` (shot-local face ID),
           - `observations` (detection + tracking),
-          - attached 512-D embeddings for detection observations (if any crops existed).
+          - attached 512-D embeddings for DETECTED observations that have landmarks and whose frames were available.
 
     Notes
     -----
-    - **Detector scheduling:** Frames with detections produce aligned crops; tracking-only frames intentionally **do not**
+    - **Detector scheduling:** Frames with detections provide landmarks; we compute aligned faces in a later pass;
+      tracking-only frames intentionally **do not**
       create embeddings to keep the hot path fast. (A later second-pass can compute extra embeddings if needed.)
     - **Lifecycle:** When a `FrameProvider` is supplied, this function does not close it. When a path is supplied,
       the internally constructed provider is closed automatically via `ExitStack()`.
@@ -509,11 +535,6 @@ def track_across_segments(
     segment-id counter with the number of already-assigned tracks for that shot so new tracks
     continue numbering where the previous run left off (no gaps or renumbering).
     """
-    logging.info(
-        "ckpt.paths: status_path=%s; _ckpt_run_root(checkpoint)=%s",
-        getattr(checkpoint, "status_path", None),
-        (_checkpoint_root_dir(checkpoint) if checkpoint else None),
-    )
 
     shot_json_path = Path(shot_json_path)
     with open(shot_json_path, "r") as f:
@@ -622,7 +643,6 @@ def track_across_segments(
                                     bbox=bbox,
                                     embedding=None,
                                     confidence=None,
-                                    aligned_face=None,
                                     source=Source.TRACKED,
                                 )
                             )
@@ -664,23 +684,17 @@ def track_across_segments(
 
                         for box, landmarks, confidence in zip(boxes, landmark_lists, confidences):
                             bbox = tuple(int(v) for v in box[:4])
-                            aligned_face = align_face_for_arcface(
-                                frame, landmarks, frame_idx, source="detect"
-                            )
 
-                            if aligned_face is not None:
-                                aligned_ok += 1
-
-                                observations.append(
-                                    FaceObservation(
-                                        frame_idx=frame_idx,
-                                        bbox=bbox,
-                                        embedding=None,
-                                        confidence=float(confidence),
-                                        aligned_face=aligned_face,
-                                        source=Source.DETECTED,
-                                    )
+                            observations.append(
+                                FaceObservation(
+                                    frame_idx=frame_idx,
+                                    bbox=bbox,
+                                    landmarks=landmarks,          # <-- keep landmarks
+                                    embedding=None,
+                                    confidence=float(confidence),
+                                    source=Source.DETECTED,
                                 )
+                            )
                     else:
                         # no faces this frame; close shot-local tracks
                         aggregator.finalize_tracks()
@@ -708,13 +722,6 @@ def track_across_segments(
                 _ = aggregator.update_tracks_with_frame(
                     frame_idx, observations
                     )
-
-                _save_crops_for_frame(
-                    checkpoint,
-                    shot_number=shot_number,
-                    frame_idx=frame_idx,
-                    aggregator=aggregator,
-                )
 
                 _checkpoint_observations_and_snapshot(
                     checkpoint,
@@ -755,55 +762,69 @@ def track_across_segments(
                     checkpoint.on_frame(frame_idx)
 
             # ---- end-of-shot embedding pass ----------
-            run_root = _checkpoint_root_dir(checkpoint) if checkpoint else None
+            #   1) collect (frame_idx, tid, obs) for DETECTED observations that have landmarks
+            #   2) re-read frames for those indices in a single sequential mini-pass
+            #   3) align faces + embed, then attach + persist embeddings
+
+            requests = list(
+                _iter_embedding_requests_for_shot(
+                    aggregator,
+                    start_at=start_at,
+                    resume_plan=resume_plan,
+                    embedding_frame_policy=None,  # default policy always True for now
+                )
+            )
+
+            aligned_faces_by_tid, frames_by_tid = _materialize_aligned_faces_for_requests(
+                frame_provider,
+                requests,
+            )
 
             for track in aggregator.tracks:
-                crops, frames_for_embed = _collect_crops_for_embedding(
-                    track,
-                    checkpoint=checkpoint,
-                    run_root=run_root,
-                    # embedding_frame_policy=None  # uses default for now
-                )
+                tid = int(getattr(track, "track_id", -1))
+                aligned_faces = aligned_faces_by_tid.get(tid, [])
+                frames_for_embed = frames_by_tid.get(tid, [])
 
-                if not crops:
+                if not aligned_faces:
                     continue
 
                 embs = embedder.get_embedding_batch(
-                    crops,
+                    aligned_faces,
                     batch_size=embedding_batch_size_max,
                 )
-
 
                 if embs is None:
                     logging.error(
                         "embed: embedder returned None for shot=%d tid=%s",
                         int(shot_number),
-                        str(getattr(track, "track_id", "NA")),
+                        str(tid),
                     )
                     continue
 
-
                 if not isinstance(embs, np.ndarray):
                     raise TypeError(f"Embedder must return np.ndarray, got {type(embs)}")
-            
+
                 if embs.ndim != 2 or embs.shape[1] != 512:
                     raise ValueError(
                         f"Embedder returned invalid array shape {embs.shape}; expected (K,512)"
                     )
+
                 if embs.dtype != np.float32:
                     embs = np.asarray(embs, dtype=np.float32, order="C")
 
-                
                 if len(embs) != len(frames_for_embed):
                     raise RuntimeError(
                         f"Embed count/frame mismatch: embs={len(embs)} frames={len(frames_for_embed)} "
-                        f"(shot={shot_number}, tid={track.track_id})"
+                        f"(shot={shot_number}, tid={tid})"
                     )
 
-                aggregator.attach_embeddings(track.track_id, embs)
+                aggregator.attach_embeddings(tid, embs)
 
                 logging.info(
-                    f"end of shot {shot_number} and {len(embs)} embeddings attached to aggregator"
+                    "end of shot %s: %d embeddings attached (tid=%s)",
+                    str(shot_number),
+                    int(len(embs)),
+                    str(tid),
                 )
 
                 _persist_embeddings_for_track(

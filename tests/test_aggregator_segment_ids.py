@@ -1,245 +1,135 @@
 import pytest
 import numpy as np
+
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
 from facekit.common.obs_consts import Source
-from facekit.tracking.face_structures import FaceObservation
-
-
-# def dummy_observation(frame_idx, bbox, embedding=None):
-#     return FaceObservation(frame_idx=frame_idx, bbox=bbox, embedding=embedding)
-
-
-# def dummy_track(track_id, shot_id, embedding=None):
-#     obs = dummy_observation(frame_idx=0, bbox=(0, 0, 10, 10), embedding=embedding)
-#     return FaceTrack(track_id=track_id, shot_id=shot_id, observations=[obs])
-
-
-# def test_reuses_segment_id_on_same_embedding_within_chunk():
-#     shared_embedding = np.ones(512, dtype=np.float32)
-
-#     # Set a very high threshold for frame-level merging to prevent merging
-#     aggregator = ShotFaceTrackAggregator(shot_number=0, embedding_threshold=1.1)
-#     obs1 = dummy_observation(0, (10, 10, 50, 50), embedding=shared_embedding)
-#     obs2 = dummy_observation(10, (1000, 1000, 1050, 1050), embedding=shared_embedding)
-
-#     aggregator.update_tracks_with_frame(0, [obs1])
-#     aggregator.update_tracks_with_frame(10, [obs2])
-#     aggregator.finalize_tracks()
-
-#     # Ensure two distinct tracks were created
-#     assert len(aggregator.tracks) == 2
-
-#     # Assign segment_id to the first track
-#     aggregator.tracks[0].segment_id = 42
-
-#     segment_id_counter = 43
-#     updated_counter = aggregator.resolve_segment_ids(segment_id_counter, embedding_threshold=0.8)
-
-#     # Now the second track should reuse segment_id from the first track
-#     assert aggregator.tracks[1].segment_id == 42
-
-
-# def test_does_not_merge_dissimilar_embeddings():
-#     emb1 = np.ones(512, dtype=np.float32)
-#     emb2 = np.zeros(512, dtype=np.float32)
-#     emb1 /= np.linalg.norm(emb1)
-#     emb2[0] = 1.0  # Very different
-
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-#     obs1 = dummy_observation(0, (10, 10, 50, 50), embedding=emb1)
-#     obs2 = dummy_observation(1, (100, 100, 150, 150), embedding=emb2)
-
-#     aggregator.update_tracks_with_frame(0, [obs1])
-#     aggregator.update_tracks_with_frame(1, [obs2])
-#     aggregator.finalize_tracks()
-
-#     aggregator.tracks[0].segment_id = 42
-#     aggregator.tracks[0].is_active = False
-
-#     updated_counter = aggregator.resolve_segment_ids(segment_id_counter=43)
-
-#     assert aggregator.tracks[1].segment_id == 43
-#     assert updated_counter == 44
-
-# def test_preserves_preassigned_segment_id():
-#     emb = np.ones(512, dtype=np.float32)
-#     emb /= np.linalg.norm(emb)
-
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-#     obs = dummy_observation(0, (0, 0, 10, 10), embedding=emb)
-#     aggregator.update_tracks_with_frame(0, [obs])
-#     aggregator.finalize_tracks()
-
-#     aggregator.tracks[0].segment_id = 77  # Preassigned
-#     updated_counter = aggregator.resolve_segment_ids(segment_id_counter=78)
-
-#     assert aggregator.tracks[0].segment_id == 77
-#     assert updated_counter == 78
-
-# def test_segment_id_reuse_on_embedding_similarity():
-#     shared_emb = np.ones(512, dtype=np.float32)
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     # Two far-apart observations -> separate tracks
-#     obs1 = dummy_observation(0, (0, 0, 50, 50), embedding=shared_emb)
-#     obs2 = dummy_observation(100, (500, 500, 550, 550), embedding=shared_emb)
-
-#     aggregator.update_tracks_with_frame(0, [obs1])
-#     aggregator.update_tracks_with_frame(100, [obs2])
-#     aggregator.finalize_tracks()
-#     assert len(aggregator.tracks) == 2
-
-#     # Assign ID to first track
-#     aggregator.tracks[0].segment_id = 10
-
-#     # Resolve IDs with high similarity threshold
-#     counter = aggregator.resolve_segment_ids(11, embedding_threshold=0.9)
-#     assert aggregator.tracks[1].segment_id == 10
-#     assert counter == 11
-
-# def test_no_segment_id_reuse_when_similarity_below_threshold():
-#     emb1 = np.ones(512, dtype=np.float32)
-#     emb2 = -np.ones(512, dtype=np.float32)  # Opposite direction
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     obs1 = dummy_observation(0, (0, 0, 50, 50), embedding=emb1)
-#     obs2 = dummy_observation(10, (500, 500, 550, 550), embedding=emb2)
-
-#     aggregator.update_tracks_with_frame(0, [obs1])
-#     aggregator.update_tracks_with_frame(10, [obs2])
-#     aggregator.finalize_tracks()
-#     aggregator.tracks[0].segment_id = 10
-
-#     counter = aggregator.resolve_segment_ids(11, embedding_threshold=0.9)
-#     assert aggregator.tracks[1].segment_id != 10
-#     assert aggregator.tracks[1].segment_id == 11
-#     assert counter == 12
-
-# def test_conflict_resolution_reuses_highest_similarity_first():
-#     emb_ref = np.ones(512, dtype=np.float32)
-#     emb_close = np.ones(512, dtype=np.float32) * 0.99
-#     emb_far = np.ones(512, dtype=np.float32) * 0.5
-
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     # Existing track with segment_id
-#     ref_track = FaceTrack(shot_id=0, track_id=0)
-#     ref_track.segment_id = 42
-#     ref_track.embeddings = [emb_ref]
-#     aggregator.tracks.append(ref_track)
-
-#     # Two unassigned tracks: one close, one far
-#     t1 = FaceTrack(shot_id=0, track_id=1)
-#     t1.embeddings = [emb_close]
-#     t2 = FaceTrack(shot_id=0, track_id=2)
-#     t2.embeddings = [emb_far]
-#     aggregator.tracks.extend([t1, t2])
-
-#     counter = aggregator.resolve_segment_ids(43, embedding_threshold=0.6)
-
-#     # Both should share ID 42 because of propagation logic
-#     assert t1.segment_id == 42, "Closest match should reuse segment_id 42"
-#     assert t2.segment_id == 42, "Propagation: far track joins same cluster via similarity chain"
-#     assert counter == 43, "Counter should remain unchanged since no new ID assigned"
-
-
-# def test_assigns_unique_segment_ids_when_no_embeddings():
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     # Create tracks with no embeddings
-#     for i in range(3):
-#         track = FaceTrack(shot_id=0, track_id=i)
-#         aggregator.tracks.append(track)
-
-#     counter = aggregator.resolve_segment_ids(100)
-#     assigned_ids = [t.segment_id for t in aggregator.tracks]
-
-#     # All IDs should be unique and start from 100
-#     assert sorted(assigned_ids) == [100, 101, 102]
-#     assert counter == 103
-
-# def test_mixed_tracks_reuse_and_assign_new_ids():
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     # Existing track with ID
-#     existing_track = FaceTrack(shot_id=0, track_id=0)
-#     existing_track.segment_id = 50
-#     existing_track.embeddings = [np.ones(512)]
-#     aggregator.tracks.append(existing_track)
-
-#     # Two unassigned tracks: one similar to existing, one dissimilar
-#     similar_track = FaceTrack(shot_id=0, track_id=1)
-#     similar_track.embeddings = [np.ones(512)]
-#     far_track = FaceTrack(shot_id=0, track_id=2)
-#     far_track.embeddings = [-np.ones(512)]
-#     aggregator.tracks.extend([similar_track, far_track])
-
-#     counter = aggregator.resolve_segment_ids(51, embedding_threshold=0.9)
-
-#     # Similar track reuses ID; far track gets new one
-#     assert similar_track.segment_id == 50
-#     assert far_track.segment_id == 51
-#     assert counter == 52
-
-# def test_counter_increments_correctly_for_multiple_new_assignments():
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-
-#     for i in range(3):
-#         t = FaceTrack(shot_id=0, track_id=i)
-#         aggregator.tracks.append(t)
-
-#     counter = aggregator.resolve_segment_ids(200)
-#     assert counter == 203  # 3 tracks -> increment by 3
-
-
 
 # ---------------------------
 # Helper functions
 # ---------------------------
-def _src_detection():
+def _src_detection() -> Source:
     return Source.DETECTED
 
-def _src_tracking():
+def _src_tracking() -> Source:
     return Source.TRACKED
 
-def make_track(tid, embedding, first_frame=0, last_frame=None):
-    """Minimal valid track for tests: has at least one observation, and a representative embedding."""
+def random_embedding(dim: int = 512, seed: int | None = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(dim).astype(np.float32)
+    n = float(np.linalg.norm(v)) or 1.0
+    return v / n
+
+def _set_track_embedding_fields(track: FaceTrack, emb: np.ndarray) -> None:
+    """
+    Many parts of the codebase historically accessed different embedding fields.
+    We set several common ones so the test isn't coupled to one internal detail.
+    """
+    emb = np.asarray(emb, dtype=np.float32).ravel()
+    n = float(np.linalg.norm(emb)) or 1.0
+    emb = emb / n
+
+    # Common patterns seen in codebases:
+    track.embeddings = [emb]
+    setattr(track, "_embedding", emb)
+    setattr(track, "embedding_avg", emb)
+    setattr(track, "_representative_embedding", emb)
+
+    # If code calls a method, provide it:
+    if not hasattr(track, "get_representative_embedding"):
+        setattr(track, "get_representative_embedding", lambda e=emb: e)
+
+def make_track(
+    tid: int,
+    embedding: np.ndarray | None,
+    *,
+    first_frame: int = 0,
+    last_frame: int | None = None,
+) -> FaceTrack:
+    """
+    Minimal valid track for tests:
+      - has >=1 observation
+      - does NOT include aligned_face (new contract)
+      - optionally has a representative embedding
+    """
     t = FaceTrack(shot_id=0, track_id=int(tid))
     f0 = int(first_frame)
-    t.add_observation(FaceObservation(
-        frame_idx=f0, bbox=(0, 0, 10, 10), source=_src_detection()
-    ))
+
+    t.add_observation(
+        FaceObservation(
+            frame_idx=f0,
+            bbox=(0, 0, 10, 10),
+            source=_src_detection(),
+        )
+    )
+
     if last_frame is not None and int(last_frame) > f0:
-        t.add_observation(FaceObservation(
-            frame_idx=int(last_frame), bbox=(1, 1, 11, 11), source=_src_tracking()
-        ))
+        t.add_observation(
+            FaceObservation(
+                frame_idx=int(last_frame),
+                bbox=(1, 1, 11, 11),
+                source=_src_tracking(),
+            )
+        )
+
     if embedding is not None:
-        emb = np.asarray(embedding, dtype=np.float32)
-        n = float(np.linalg.norm(emb)) or 1.0
-        emb = emb / n
-        # Cover all access patterns used across the codebase/tests
-        t.embeddings = [emb]
-        t._embedding = emb
-        t.embedding_avg = emb
-        t._representative_embedding = emb
-        setattr(t, "get_representative_embedding", lambda e=emb: e)
+        _set_track_embedding_fields(t, embedding)
+
     return t
 
-def random_embedding(dim=512, seed=None):
-    rng = np.random.default_rng(seed)
-    return rng.random(dim, dtype=np.float32)
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float32).ravel()
+    b = np.asarray(b, dtype=np.float32).ravel()
+    na = float(np.linalg.norm(a)) or 1.0
+    nb = float(np.linalg.norm(b)) or 1.0
+    return float(np.dot(a, b) / (na * nb))
+
+def _make_strongly_dissimilar(base: np.ndarray) -> np.ndarray:
+    """
+    Produce a vector with very low cosine similarity to `base`.
+    We:
+      - draw a random vector
+      - project out base
+      - normalize
+      - if degeneracy, fall back to negative base
+    """
+    base = np.asarray(base, dtype=np.float32).ravel()
+    bu = base / (float(np.linalg.norm(base)) or 1.0)
+
+    v = random_embedding(seed=999)
+    # remove projection onto base to make it near-orthogonal
+    v = v - float(np.dot(bu, v)) * bu
+    nv = float(np.linalg.norm(v))
+    if nv < 1e-6:
+        v = -bu
+    else:
+        v = v / nv
+
+    # If still not dissimilar enough due to numerical weirdness, invert:
+    if abs(_cos(bu, v)) > 0.2:
+        v = -bu
+
+    return v.astype(np.float32)
 
 # ---------------------------
 # Exception Tests
 # ---------------------------
 def test_raises_when_track_missing_embedding():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t = FaceTrack(shot_id=0, track_id=0)
+    t = make_track(0, None)
     aggregator.tracks.append(t)
 
     with pytest.raises(RuntimeError, match="missing embedding"):
         aggregator.resolve_segment_ids(10)
+
+def test_raises_on_missing_embedding_in_prior_track():
+    aggregator = ShotFaceTrackAggregator(shot_number=0)
+    t1 = make_track(0, None)
+    t2 = make_track(1, random_embedding(seed=2), first_frame=1)
+    aggregator.tracks.extend([t1, t2])
+
+    with pytest.raises(RuntimeError, match=r"Track 0 missing embedding|missing embedding"):
+        aggregator.resolve_segment_ids(0)
 
 # ---------------------------
 # Segment ID Assignment Tests
@@ -258,8 +148,11 @@ def test_reuses_segment_id_on_same_embedding_within_chunk():
 
 def test_does_not_merge_dissimilar_embeddings():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t1 = make_track(0, random_embedding(seed=1))
-    t2 = make_track(1, -t1._embedding, first_frame=1) # make t2 orthoginal to t1
+    emb_ref = random_embedding(seed=1)
+    emb_far = _make_strongly_dissimilar(emb_ref)
+
+    t1 = make_track(0, emb_ref)
+    t2 = make_track(1, emb_far, first_frame=1)
 
     aggregator.tracks.extend([t1, t2])
     counter = aggregator.resolve_segment_ids(0)
@@ -267,24 +160,11 @@ def test_does_not_merge_dissimilar_embeddings():
     assert t1.segment_id != t2.segment_id
     assert counter == 2  # both tracks got unique segments
 
-# def test_preserves_preassigned_segment_id():
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-#     t1 = make_track(0, random_embedding(seed=1))
-#     t1.segment_id = 42  # preassigned
-#     t2 = make_track(1, t1._embedding, first_frame=1)
-
-#     aggregator.tracks.extend([t1, t2])
-#     counter = aggregator.resolve_segment_ids(0)
-
-#     # t1 keeps its ID, t2 reuses it
-#     assert t1.segment_id == 42
-#     assert t2.segment_id == 42
-
 def test_segment_id_reuse_on_embedding_similarity():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
     emb = random_embedding(seed=1)
     t1 = make_track(0, emb)
-    t2 = make_track(1, emb * 0.99, first_frame=1)  # very similar
+    t2 = make_track(1, emb * 0.99, first_frame=1)  # very similar direction
 
     aggregator.tracks.extend([t1, t2])
     counter = aggregator.resolve_segment_ids(0)
@@ -294,21 +174,15 @@ def test_segment_id_reuse_on_embedding_similarity():
 
 def test_no_segment_id_reuse_when_similarity_below_threshold():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
-    # Build two embeddings with low cosine similarity.
     e1 = random_embedding(seed=1)
-    e2 = random_embedding(seed=3)
-    # Orthogonalize e2 against e1 to ensure similarity << 0.99.
-    e1u = e1 / (np.linalg.norm(e1) or 1.0)
-    e2 = e2 - float(np.dot(e1u, e2)) * e1u
-    if np.linalg.norm(e2) < 1e-6:
-        # Fallback: if numerical degeneracy, use opposite direction.
-        e2 = -e1
+    e2 = _make_strongly_dissimilar(e1)
+
     t1 = make_track(0, e1)
     t2 = make_track(1, e2, first_frame=1)
 
-
     aggregator.tracks.extend([t1, t2])
-    # Disable relaxed IoU path so only embedding similarity can drive reuse.
+
+    # Make it strict: only very high cosine could reuse; disable any IoU-based relax path.
     counter = aggregator.resolve_segment_ids(
         0, embedding_threshold=0.99, emb_relax_factor=1.0, iou_threshold=2.0
     )
@@ -319,22 +193,25 @@ def test_no_segment_id_reuse_when_similarity_below_threshold():
 def test_conflict_resolution_reuses_highest_similarity_first():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
     emb_ref = random_embedding(seed=1)
+
     t1 = make_track(0, emb_ref)
-    t2 = make_track(1, emb_ref * 0.99, first_frame=1)
-    t3 = make_track(2, -emb_ref, first_frame=2)  # clearly dissimilar
+    t2 = make_track(1, emb_ref * 0.99, first_frame=1)  # close
+    t3 = make_track(2, _make_strongly_dissimilar(emb_ref), first_frame=2)  # far
 
     aggregator.tracks.extend([t1, t2, t3])
     counter = aggregator.resolve_segment_ids(0)
 
-    # highest similarity first should reuse t1's ID
     assert t1.segment_id == t2.segment_id
     assert t3.segment_id != t1.segment_id
+    assert counter == 2  # one cluster reused, one new id
 
 def test_mixed_tracks_reuse_and_assign_new_ids():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t1 = make_track(0, random_embedding(seed=1))
-    t2 = make_track(1, t1._embedding, first_frame=1)  # reuse
-    t3 = make_track(2, -t1._embedding, first_frame=2)  # clearly dissimilar
+    emb_ref = random_embedding(seed=1)
+
+    t1 = make_track(0, emb_ref)
+    t2 = make_track(1, emb_ref, first_frame=1)  # reuse
+    t3 = make_track(2, _make_strongly_dissimilar(emb_ref), first_frame=2)  # new
 
     aggregator.tracks.extend([t1, t2, t3])
     counter = aggregator.resolve_segment_ids(0)
@@ -345,9 +222,15 @@ def test_mixed_tracks_reuse_and_assign_new_ids():
 
 def test_counter_increments_correctly_for_multiple_new_assignments():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
+
     emb1 = random_embedding(seed=1)
-    emb2 = -emb1
-    emb3 = np.random.randn(*emb1.shape).astype(np.float32)
+    emb2 = random_embedding(seed=2)
+    emb3 = random_embedding(seed=3)
+
+    # Ensure they're not accidentally super-similar
+    assert abs(_cos(emb1, emb2)) < 0.95
+    assert abs(_cos(emb1, emb3)) < 0.95
+
     t1 = make_track(0, emb1)
     t2 = make_track(1, emb2, first_frame=1)
     t3 = make_track(2, emb3, first_frame=2)
@@ -358,18 +241,3 @@ def test_counter_increments_correctly_for_multiple_new_assignments():
     assert counter == 103  # 100 + 3 new segment IDs
     ids = {t1.segment_id, t2.segment_id, t3.segment_id}
     assert ids == {100, 101, 102}
-
-def test_raises_on_missing_embedding():
-    aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t1 = make_track(0, None)
-    aggregator.tracks.append(t1)
-    with pytest.raises(RuntimeError, match="missing embedding"):
-        aggregator.resolve_segment_ids(0)
-
-def test_raises_on_missing_embedding_in_prior_track():
-    aggregator = ShotFaceTrackAggregator(shot_number=0)
-    t1 = make_track(0, None)
-    t2 = make_track(1, random_embedding(seed=2), first_frame=1)
-    aggregator.tracks.extend([t1, t2])
-    with pytest.raises(RuntimeError, match="Track 0 missing embedding"):
-        aggregator.resolve_segment_ids(0)

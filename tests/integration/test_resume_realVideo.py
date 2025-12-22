@@ -147,6 +147,26 @@ def _zip_logs():
 # register exit hook
 atexit.register(_zip_logs)
 
+def _has_landmarks_fields(arr: np.ndarray) -> bool:
+    names = set(arr.dtype.names or ())
+    return ("landmarks" in names) or (("landmarks_xy" in names) and ("landmarks_n" in names)) or (("lmk_xy" in names) and ("lmk_n" in names))
+
+def _landmarks_present_mask(arr: np.ndarray) -> np.ndarray:
+    names = set(arr.dtype.names or ())
+    if "landmarks" in names:
+        lm = np.asarray(arr["landmarks"])
+        if lm.ndim >= 2:
+            axis = tuple(range(1, lm.ndim))
+            return np.any(np.isfinite(lm), axis=axis)
+        return np.isfinite(lm)
+    if ("landmarks_xy" in names) and ("landmarks_n" in names):
+        return arr["landmarks_n"].astype(np.int64, copy=False) > 0
+    if ("lmk_xy" in names) and ("lmk_n" in names):
+        return arr["lmk_n"].astype(np.int64, copy=False) > 0
+    raise AssertionError(f"Missing landmarks fields. dtype names = {list(arr.dtype.names or [])}")
+
+
+
 # ---- test ------------------------------------------------------------------
 
 @pytest.mark.integration
@@ -168,9 +188,13 @@ def test_resume_equivalence_full_e2e(tmp_path: Path):
     out_crash.touch()
     out_resume.touch()
 
-    # shared sidecars (obs/emb npz written by prod checkpoint)
-    obs_npz = tmp_path / "obs_sidecar.npz"
-    emb_npz = tmp_path / "emb_sidecar.npz"
+    # cold baseline sidecars
+    cold_obs_npz = tmp_path / "obs_sidecar_cold.npz"
+    cold_emb_npz = tmp_path / "emb_sidecar_cold.npz"
+
+    # crash+resume sidecars (shared across crash+resume only)
+    run_obs_npz = tmp_path / "obs_sidecar_run.npz"
+    run_emb_npz = tmp_path / "emb_sidecar_run.npz"
 
     env = _env_with_repo()
 
@@ -184,8 +208,8 @@ def test_resume_equivalence_full_e2e(tmp_path: Path):
         "--device", "cpu",
         "--schema-version", "2.1",
         "--emb-store", "sidecar",
-        "--obs-sidecar-path", str(obs_npz),
-        "--emb-sidecar-path", str(emb_npz),
+        "--obs-sidecar-path", str(cold_obs_npz),
+        "--emb-sidecar-path", str(cold_emb_npz),
         "--output-global-json", str(out_cold),
         "--no-resume",                    # ensure fresh run
         "--new-run",
@@ -246,10 +270,11 @@ if __name__ == "__main__":
         "--device", "cpu",
         "--schema-version", "2.1",
         "--emb-store", "sidecar",
-        "--obs-sidecar-path", str(obs_npz),
-        "--emb-sidecar-path", str(emb_npz),
+        "--obs-sidecar-path", str(run_obs_npz),
+        "--emb-sidecar-path", str(run_emb_npz),
         "--output-global-json", str(out_crash),
         "--no-resume",
+        "--new-run",
         "--log", "DEBUG",
     ]
 
@@ -294,14 +319,25 @@ if __name__ == "__main__":
     det_code = SRC_TO_CODE[Source.DETECTED]
     is_shot = arr["shot"] == shot
     is_det  = arr["src"]  == det_code
-    has_crop = ("has_crop" in arr.dtype.names) and (arr["has_crop"] == 1)
     with_emb = arr["emb_idx"] >= 0
 
+
+    assert _has_landmarks_fields(arr), (
+        "Observations sidecar is missing landmark fields. "
+        f"dtype names = {list(arr.dtype.names or [])}"
+    )
+    has_lm = _landmarks_present_mask(arr)
+
     print("DET rows total:", int((is_shot & is_det).sum()))
-    print("DET rows with crop:",
-        int((is_shot & is_det & has_crop).sum()) if has_crop is not None else "no has_crop field")
-    print("DET rows with crop+emb:",
-        int((is_shot & is_det & has_crop & with_emb).sum()) if has_crop is not None else "no has_crop field")
+    print("DET rows with emb:", int((is_shot & is_det & with_emb).sum()))
+    print("DET rows with landmarks:", int((is_shot & is_det & has_lm).sum()))
+
+    # Core contract: if we persisted a DET observation, we should have persisted its landmarks.
+    # (This is intentionally scoped to the same shot the test already inspects.)
+    assert int((is_shot & is_det).sum()) > 0, "Test precondition: expected at least one DET row in shot=1."
+    assert int((is_shot & is_det & has_lm).sum()) == int((is_shot & is_det).sum()), (
+        "Not all DET rows have persisted landmarks in the obs sidecar (shot=1)."
+    )
 
     # ---- 2.5) PROBE SIDECRS (pre-resume, strict parity up to anchor-1) ----
     probe = _repo_root() / "tests" / "utils" / "probe_sidecars.py"
@@ -329,8 +365,8 @@ if __name__ == "__main__":
         "--device", "cpu",
         "--schema-version", "2.1",
         "--emb-store", "sidecar",
-        "--obs-sidecar-path", str(obs_npz),
-        "--emb-sidecar-path", str(emb_npz),
+        "--obs-sidecar-path", str(run_obs_npz),
+        "--emb-sidecar-path", str(run_emb_npz),
         "--output-global-json", str(out_resume),
         "--resume-latest",
         "--log", "DEBUG",

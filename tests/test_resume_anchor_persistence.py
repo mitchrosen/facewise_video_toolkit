@@ -9,6 +9,14 @@ from facekit.output.json_v2 import ObservationsCollector, EmbeddingCollector
 from facekit.tracking import aggregator as _agg
 from facekit.common.obs_consts import Source
 
+def _make_landmarks(k: int = 5) -> np.ndarray:
+    # Small, deterministic landmark set
+    xy = np.zeros((k, 2), dtype=np.float32)
+    for i in range(k):
+        xy[i, 0] = 10.0 + i
+        xy[i, 1] = 20.0 + 2 * i
+    return xy
+
 def _write_shots(path: Path, first: int, last: int, per_shot: int = None):
     if per_shot is None:
         shots = [{"shot_number": 1, "first_frame": first, "last_frame": last}]
@@ -98,11 +106,11 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
     )
 
     # Wire up collectors exactly like the real pipeline would.
-    oc = ObservationsCollector()
-    embc = EmbeddingCollector(mode="sidecar", dim=512)
+    obs_collector = ObservationsCollector()
+    emb_collector = EmbeddingCollector(mode="sidecar", dim=512)
 
     # Start checkpoint manager with live collectors and options snapshot.
-    ckpt.start(oc, embc, options_snapshot=opts)
+    ckpt.start(obs_collector, emb_collector, options_snapshot=opts)
 
     # Anchor at 180 (inside shot #2)
     anchor = 180
@@ -111,7 +119,7 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
     ckpt._last_det_shot_first_frame = 120
 
     # Seed one pre-anchor obs to exercise rehydrate
-    oc.append_track_obs(
+    obs_collector.append_track_obs(
         [{
             "shot": 2,
             "track_id": 1,
@@ -119,7 +127,7 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
             "bbox_xyxy": [10, 10, 50, 50],
             "src": Source.DETECTED,
             "conf": 0.9,
-            "crop_ref": "crops/shot2/frame100_tid1.png",
+            "landmarks": _make_landmarks(5),
         },
         {
             "shot": 2,
@@ -127,12 +135,12 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
             "f": 150,
             "bbox_xyxy": [0, 0, 10, 10],
             "src": Source.DETECTED,
-            "crop_ref": "crops/shot2/frame150_tid1.png",  # dummy path is fine
+            "landmarks": _make_landmarks(5),
         }],
         emb_idx_fn=lambda _: -1,
     )
 
-    orig_find_rows = oc.find_rows
+    orig_find_rows = obs_collector.find_rows
 
     def _flat_find_rows(*args, **kwargs):
         rows = orig_find_rows(*args, **kwargs)
@@ -149,7 +157,7 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
                 flat.append(int(pos))
         return flat
 
-    oc.find_rows = _flat_find_rows
+    obs_collector.find_rows = _flat_find_rows
 
     # This now uses the live EmbeddingCollector wired in via start()
     ckpt.add_embeddings(

@@ -10,7 +10,7 @@ from facekit.common.obs_consts import Source, code_to_src, SRC_TO_CODE
 from facekit.errors import ResumeSafetyError
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 
-# ---------- bbox helpers (unchanged) ----------
+# ---------- bbox helpers ----------
 def _as_int_bbox(bb) -> tuple[int, int, int, int] | None:
     x1, y1, x2, y2 = bb
     vals = (float(x1), float(y1), float(x2), float(y2))
@@ -70,6 +70,55 @@ def _normalize_src(raw_src) -> Source:
         f"rehydrate: unsupported src type {type(raw_src)!r} value={raw_src!r}"
     )
 
+def _assign_segment_ids_for_rehydrated(
+    rehydrated_tracks: list["FaceTrack"],
+    *,
+    track_order: dict[tuple[int, int], int] | None,
+) -> dict[int, int]:
+    """
+    Assign stable shot-local segment_ids to rehydrated tracks.
+
+    - Uses checkpoint's track_order[(shot_id, track_id)] when present.
+    - Otherwise assigns increasing segment_ids after the max known id for that shot.
+    - Returns: segment_id_seed_by_shot {shot_id: next_segment_id_to_assign}
+    """
+    track_order = track_order or {}
+    seg_seed_by_shot: dict[int, int] = {}
+    max_seen_by_shot: dict[int, int] = {}
+
+    # First pass: assign any with explicit order
+    for t in rehydrated_tracks:
+        shot = int(getattr(t, "shot_id", 0))
+        tid = int(getattr(t, "track_id", 0))
+        key = (shot, tid)
+        if key in track_order:
+            seg = int(track_order[key])
+            t.segment_id = seg
+            max_seen_by_shot[shot] = max(max_seen_by_shot.get(shot, -1), seg)
+
+    # Second pass: fill unassigned in a stable order
+    # (stable: by shot, then by first_frame, then track_id)
+    def _first_frame(track) -> int:
+        if hasattr(track, "first_frame") and callable(getattr(track, "first_frame")):
+            return int(track.first_frame())
+        obs = getattr(track, "observations", [])
+        return int(obs[0].frame_idx) if obs else 0
+
+    remaining = [t for t in rehydrated_tracks if getattr(t, "segment_id", None) is None]
+    remaining.sort(key=lambda t: (int(getattr(t, "shot_id", 0)), _first_frame(t), int(getattr(t, "track_id", 0))))
+
+    for t in remaining:
+        shot = int(getattr(t, "shot_id", 0))
+        seed = max_seen_by_shot.get(shot, -1) + 1
+        t.segment_id = int(seed)
+        max_seen_by_shot[shot] = int(seed)
+
+    # Seed is always "max + 1"
+    for shot, mx in max_seen_by_shot.items():
+        seg_seed_by_shot[int(shot)] = int(mx) + 1
+
+    return seg_seed_by_shot
+
 def _row_to_faceobs(row: dict, track_id: int) -> FaceObservation | None:
     bb = _as_int_bbox(row["bbox_xyxy"])
     if bb is None:
@@ -91,30 +140,54 @@ def _row_to_faceobs(row: dict, track_id: int) -> FaceObservation | None:
         track_id=int(track_id) if track_id is not None and int(track_id) >= 0 else None,
         bbox=(x1, y1, x2, y2),
         embedding=None,
-        confidence=(
-            float(row["conf"])
-            if "conf" in row and row["conf"] is not None and not np.isnan(row["conf"])
-            else None
-        ),
-        aligned_face=None,
+        confidence=None,
         source=src,
     )
 
-    crop_ref = row.get("crop_ref") or row.get("crop_path") or ""
-    if crop_ref:
-        setattr(obs, "crop_ref", str(crop_ref))
+    # --- landmarks  ---
+    # Supported shapes:
+    #   - (K,2) float array
+    #   - (2K,) flattened float array
+    # If has_landmarks exists, we treat it as the authoritative boolean.
+    has_landmarks = None
+    if "has_landmarks" in row:
+        try:
+            has_landmarks = bool(int(row.get("has_landmarks") or 0))
+        except Exception:
+            has_landmarks = None
 
-    try:
-        logging.info(
-            "rehydrate DEBUG FaceObservation: shot=%r track_id=%r frame=%r src=%r crop_ref=%r",
-            row.get("shot"),
-            track_id,
-            obs.frame_idx,
-            obs.source,
-            getattr(obs, "crop_ref", None),
-        )
-    except Exception:
-        pass
+    landmarks = None
+    if "landmarks" in row:
+        raw_landmarks = row.get("landmarks")
+        if raw_landmarks is not None:
+            arr_landmarks = np.asarray(raw_landmarks, dtype=np.float32)
+            if arr_landmarks.ndim == 2 and arr_landmarks.shape[1] == 2 and arr_landmarks.shape[0] >= 1:
+                landmarks = arr_landmarks
+            elif arr_landmarks.ndim == 1 and (arr_landmarks.size % 2 == 0) and arr_landmarks.size >= 2:
+                landmarks = arr_landmarks.reshape((-1, 2))
+            else:
+                # present but malformed: treat as absent for safety
+                landmarks = None
+
+    # Apply policy:
+    # - If has_landmarks exists and is 1, but landmarks missing/malformed: still mark present (bool),
+    #   and leave obs.landmarks None (or raise if you want strictness here).
+    # - If has_landmarks exists and is 0: do not attach landmarks even if present (conservative).
+    if has_landmarks is True:
+        if landmarks is None:
+            raise ResumeSafetyError(
+                f"rehydrate: has_landmarks=1 but landmarks missing/malformed "
+                f"(shot={row.get('shot')}, f={row.get('f')}, tid={track_id})"
+            )
+        setattr(obs, "landmarks", landmarks)
+        setattr(obs, "has_landmarks", True)
+    elif has_landmarks is False:
+        setattr(obs, "has_landmarks", False)
+    else:
+        # No has_landmarks column: best-effort
+        if landmarks is not None:
+            setattr(obs, "landmarks", landmarks)
+            setattr(obs, "has_landmarks", True)
 
     return obs
 
@@ -176,7 +249,7 @@ def make_emb_lookup_from_sidecars(
                 f"rehydrate: invalid src={row['src']!r} in obs sidecar row idx={idx}"
             ) from e
 
-        if row_src is not det_src:
+        if row_src != det_src:
             continue
 
         emb_idx = int(row["emb_idx"])
@@ -276,32 +349,6 @@ def rehydrate_observation_tracks(
     for shot, track_id, rows in groups:
         obs_list: List[FaceObservation] = []
 
-        # DEBUG: dump raw rows for the specific test case (shot=2, tid=1)
-        try:
-            if int(shot) == 2 and int(track_id) == 1:
-                for r in rows:
-                    # r is expected to be a dict-like object
-                    try:
-                        logging.info(
-                            "rehydrate DEBUG raw row: "
-                            "shot=%r tid=%r f=%r src=%r crop_ref=%r has_crop=%r",
-                            r.get("shot"),
-                            r.get("track_id", r.get("tid")),
-                            r.get("f"),
-                            r.get("src"),
-                            r.get("crop_ref", None),
-                            r.get("has_crop", None),
-                        )
-                    except AttributeError:
-                        # If r is a numpy record instead of dict
-                        logging.info(
-                            "rehydrate DEBUG raw row (non-dict): type=%s fields=%s",
-                            type(r),
-                            getattr(r, "dtype", None),
-                        )
-        except Exception:
-            logging.exception("rehydrate DEBUG: logging raw rows failed")
-
         for r in rows:
             o = _row_to_faceobs(r, track_id)
             if o is not None:
@@ -348,19 +395,14 @@ def attach_embeddings_to_tracks(
     """
     Attach embeddings to DET observations for each track.
 
-    Matching policy:
-      - If emb_lookup returns (frames, embs): we align by chronological order of DET
-        observations; if len matches (or both are >0), we attach in order.
-      - Else if emb_array_lookup returns embs only: we align by count to DET obs (same ordering).
-      - If we cannot attach any embedding to a track that appears to have had DETs, we log,
-        and if `strict` we raise ResumeSafetyError.
-
-    Notes:
-      - We do not set `aligned_face` (not persisted).
-      - We attach embeddings only to DET observations (mirrors write-time behavior).
+    Contract:
+      - strict=True  (completed shots): every DET obs must have an embedding, counts must match.
+      - strict=False (anchor shot): embeddings may be missing entirely; do not treat as error.
     """
     tot_det = 0
     tot_attached = 0
+    missing_tracks = 0
+
     for tr in tracks:
         det_idxs = [i for i, o in enumerate(tr.observations) if o.source == Source.DETECTED]
         if not det_idxs:
@@ -380,25 +422,36 @@ def attach_embeddings_to_tracks(
             embs = emb_array_lookup(int(tr.shot_id), int(tr.track_id))
 
         if embs is None:
-            # couldn’t find any embeddings for this track
+            missing_tracks += 1
+            det_frames = None
             try:
-                # extra context for debugging lookup mismatch
                 det_frames = [int(o.frame_idx) for o in det_obs]
-                logging.error("%s: missing embs for (shot=%d, tid=%d) det_frames=%s",
-                          log_prefix, int(tr.shot_id), int(tr.track_id), det_frames[:10])
             except Exception:
-                pass
+                det_frames = None
 
             if strict:
+                # Completed-shot semantics: this is a hard failure.
+                if det_frames is not None:
+                    logging.error(
+                        "%s: missing embs for (shot=%d, tid=%d) det_frames=%s",
+                        log_prefix, int(tr.shot_id), int(tr.track_id), det_frames[:10]
+                    )
                 raise ResumeSafetyError(
                     f"{log_prefix}: no embeddings found for (shot={tr.shot_id}, tid={tr.track_id}) "
                     f"with {len(det_obs)} DET observations"
                 )
             else:
-                logging.info(
-                    "%s: missing embeddings for (shot=%d, tid=%d); allowed (strict=False)",
-                    log_prefix, int(tr.shot_id), int(tr.track_id),
-                )
+                # Anchor-shot semantics: expected; do NOT log as error.
+                if det_frames is not None:
+                    logging.info(
+                        "%s: no embeddings for (shot=%d, tid=%d) det_frames=%s; allowed (strict=False)",
+                        log_prefix, int(tr.shot_id), int(tr.track_id), det_frames[:10]
+                    )
+                else:
+                    logging.info(
+                        "%s: no embeddings for (shot=%d, tid=%d); allowed (strict=False)",
+                        log_prefix, int(tr.shot_id), int(tr.track_id)
+                    )
                 continue
 
         embs = np.asarray(embs)
@@ -408,15 +461,16 @@ def attach_embeddings_to_tracks(
                 "expected (K,512)"
             )
 
-        # Align by chronological order of DET obs. For resume pre-anchor we expect
-        # a 1:1 match (strict). Fail fast if counts differ.
         k_det  = len(det_obs)
         k_embs = int(embs.shape[0])
+
+        # strict=True => must match exactly for completed shots
         if strict and k_embs != k_det:
             raise ResumeSafetyError(
                 f"{log_prefix}: embedding count mismatch for (shot={tr.shot_id}, tid={tr.track_id}): "
                 f"DET={k_det} vs EMB={k_embs}"
             )
+
         k = min(k_det, k_embs)
         if k == 0:
             if strict:
@@ -425,18 +479,18 @@ def attach_embeddings_to_tracks(
                 )
             else:
                 logging.info(
-                    "%s: zero alignment between DET obs and embeddings for (shot=%d, tid=%d); allowed",
+                    "%s: zero alignment between DET obs and embeddings for (shot=%d, tid=%d); allowed (strict=False)",
                     log_prefix, int(tr.shot_id), int(tr.track_id),
                 )
                 continue
 
-        if k < len(det_obs) or k < embs.shape[0]:
+        # In non-strict mode, partial alignment might happen; keep it as warning.
+        if k < k_det or k < k_embs:
             logging.warning(
                 "%s: partial embedding alignment for (shot=%d, tid=%d): det_obs=%d, emb_rows=%d -> attaching %d",
-                log_prefix, int(tr.shot_id), int(tr.track_id), len(det_obs), int(embs.shape[0]), k
+                log_prefix, int(tr.shot_id), int(tr.track_id), k_det, k_embs, k
             )
 
-        # assign in-order AND publish to the track-level list
         if getattr(tr, "embeddings", None) is None:
             tr.embeddings = []
 
@@ -449,7 +503,8 @@ def attach_embeddings_to_tracks(
 
     pct = (100.0 * tot_attached / max(1, tot_det))
     logging.info(
-        "%s: DET obs=%d, with_embeddings=%d (%.1f%%)", log_prefix, tot_det, tot_attached, pct
+        "%s: DET obs=%d, with_embeddings=%d (%.1f%%), tracks_missing_embs=%d",
+        log_prefix, tot_det, tot_attached, pct, missing_tracks
     )
 
 # ---------- Phase 3: one-call rehydration (observations + embeddings) ----------
@@ -679,7 +734,7 @@ def _build_resume_plan(
     This function encapsulates all the heavy lifting that used to live inline
     in track_across_segments:
       * Resolve the anchor frame.
-      * Audit pre-anchor DET rows for embedding/crop parity.
+      * Audit pre-anchor DET rows for embedding/landmarks parity.
       * Rehydrate pre-anchor tracks from sidecars.
       * Split pre-anchor tracks into completed vs anchor-containing shots.
       * Push completed-shot tracks into all_tracks immediately.
@@ -767,7 +822,7 @@ def _build_resume_plan(
         logging.info("resume: no obs_collector on checkpoint; skipping pre-anchor rehydration")
         prior_tracks = []
 
-    # Hard guard: enforce DET↔EMB parity and crop_ref presence on pre-anchor DETs
+    # Hard guard: enforce DET↔EMB parity and landmarks presence on pre-anchor DETs
     for t in prior_tracks or []:
         shot_id = int(getattr(t, "shot_id", -1))
         is_completed_shot = shot_id in completed_shot_nums
@@ -776,30 +831,42 @@ def _build_resume_plan(
         if not (is_completed_shot or is_anchor_shot):
             continue
 
-        det_cnt = sum(
-            1
-            for o in (getattr(t, "observations", []) or [])
-            if getattr(o, "source", None) is Source.DETECTED
-            and int(o.frame_idx) <= int(resume_abs_frame - 1)
-        )
-        emb_cnt = len(getattr(t, "embeddings", []) or [])
+        # LANDMARK REQUIREMENT: anchor shot only
+        if is_anchor_shot:
+            for o in (getattr(t, "observations", []) or []):
+                if getattr(o, "source", None) != Source.DETECTED:
+                    continue
+                if int(o.frame_idx) > int(resume_abs_frame - 1):
+                    continue
 
-        if is_completed_shot and det_cnt > 0 and emb_cnt != det_cnt:
-            raise ResumeSafetyError(
-                f"rehydrate: pre-anchor embedding parity failed for (shot={shot_id}, "
-                f"tid={int(getattr(t,'track_id',-1))}): DET={det_cnt} vs EMB={emb_cnt}"
-            )
-
-        for o in getattr(t, "observations", []) or []:
-            if (
-                getattr(o, "source", None) is Source.DETECTED
-                and int(o.frame_idx) <= int(resume_abs_frame - 1)
-            ):
-                if getattr(o, "crop_ref", None) in (None, "", 0):
+                has_landmark_flag = getattr(o, "has_landmarks", None)
+                landmark = getattr(o, "landmarks", None)
+                landmark_present = (
+                    (has_landmark_flag is True)
+                    or (isinstance(landmark, np.ndarray) and landmark.size > 0)
+                )
+                if not landmark_present:
                     raise ResumeSafetyError(
-                        "rehydrate: missing crop_ref for pre-anchor DET "
+                        "rehydrate: missing landmarks for pre-anchor DET in anchor shot "
                         f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}, frame={int(o.frame_idx)})"
                     )
+
+        # EMBEDDING PARITY: completed shots only
+        if is_completed_shot:
+            det_cnt = 0
+            for o in (getattr(t, "observations", []) or []):
+                if getattr(o, "source", None) != Source.DETECTED:
+                    continue
+                if int(o.frame_idx) > int(resume_abs_frame - 1):
+                    continue
+                det_cnt += 1
+
+            emb_cnt = len(getattr(t, "embeddings", []) or [])
+            if det_cnt > 0 and emb_cnt != det_cnt:
+                raise ResumeSafetyError(
+                    f"rehydrate: pre-anchor embedding parity failed for completed shot "
+                    f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}): DET={det_cnt} vs EMB={emb_cnt}"
+                )
 
     # Split rehydrated tracks into fully completed vs anchor shot
     prior_tracks_completed: List[FaceTrack] = []
@@ -847,8 +914,10 @@ def _build_resume_plan(
             if (checkpoint and hasattr(checkpoint, "get_track_order"))
             else {}
         )
+
         segment_id_seed_by_shot = _assign_segment_ids_for_rehydrated(
-            prior_tracks, track_order_map or {}
+            prior_tracks,
+            track_order=track_order_map or {},
         )
 
         tmp: Dict[int, int] = {}
@@ -945,8 +1014,8 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
     """
     Resume-only audit: verify that every DET row with frame <= anchor-1 has an embedding.
     Uses rows_for_frame(shot, frame) if available. Falls back to iter_track_frames(...) to
-    at least count DETs and flag likely gaps. Logs which frames are missing and whether a
-    crop exists (when we can check it).
+    at least count DETs and flag likely gaps. Logs which frames are missing and whether
+    landmarks are present on those DET rows (when we can check it).
     """
     if not checkpoint or not hasattr(checkpoint, "obs_collector"):
         logging.info("RESUME-AUDIT: no checkpoint/collector; skipping.")
@@ -955,36 +1024,34 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
     oc = checkpoint.obs_collector
     has_rows_for_frame = hasattr(oc, "rows_for_frame") and callable(getattr(oc, "rows_for_frame"))
     has_iter_track_frames = hasattr(oc, "iter_track_frames") and callable(getattr(oc, "iter_track_frames"))
-    run_root = None
-    try:
-        run_root = _ckpt_run_root(checkpoint)
-    except Exception:
-        run_root = None
 
     if not has_rows_for_frame and not has_iter_track_frames:
         logging.info("RESUME-AUDIT: collector lacks rows_for_frame/iter_track_frames; skipping.")
         return
 
-    # Helper: record a missing embedding at (shot, tid, frame) with crop presence if we can see it.
-    def _record_missing(shot: int, tid: int, frame: int, crop_ref: Optional[str], det_by_key: Dict[tuple[int,int], list]):
-        has_crop = False
-        if crop_ref and run_root is not None:
-            try:
-                has_crop = (run_root / crop_ref).exists()
-            except Exception:
-                has_crop = False
-        det_by_key.setdefault((shot, tid), []).append({"f": int(frame), "has_crop": int(bool(has_crop))})
+    # Helper: record a missing embedding at (shot, tid, frame) with landmarks presence if we can see it.
+    def _record_missing(shot: int, tid: int, frame: int, has_landmarks: int | None, det_by_key: Dict[tuple[int,int], list]):
+        det_by_key.setdefault((shot, tid), []).append(
+            {"f": int(frame), "has_landmarks": int(bool(has_landmarks or 0))}
+        )
 
     det_by_key: Dict[tuple[int,int], list] = {}
     total_missing = 0
 
+    def _is_completed_shot(s: dict) -> bool:
+        return anchor_frame > 0 and int(s["last_frame"]) < int(anchor_frame)
+    
+    det_code = int(SRC_TO_CODE[Source.DETECTED])
     # Iterate only up to anchor-1 and (optionally) only up to anchor_shot.
     for s in shots:
+        if not _is_completed_shot(s):
+            continue 
+
         shot_num = int(s["shot_number"])
-        if anchor_shot is not None and shot_num > int(anchor_shot):
-            break  # nothing pre-anchor beyond the anchor shot
+
         first_f = int(s["first_frame"])
         last_f  = int(s["last_frame"])
+
         limit_last = min(last_f, (anchor_frame - 1)) if anchor_frame > 0 else last_f
         if limit_last < first_f:
             continue
@@ -999,48 +1066,69 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
                     continue
                 for r in rows:
                     try:
-                        if int(r.get("src", -1)) != int(Source.DETECTED.value):
+                        if int(r.get("src", -1)) != det_code:
                             continue
-                        tid = int(r.get("tid", -1))
+                        tid = int(r.get("track_id", r.get("tid", -1)))
                         emb_idx = int(r.get("emb_idx", -1))
-                        if emb_idx < 0:
-                            _record_missing(shot_num, tid, f, r.get("crop_ref"), det_by_key)
+
+                        # Determine landmark presence (prefer explicit flag)
+                        has_landmarks = 0
+                        if "has_landmarks" in r:
+                            try:
+                                has_landmarks = int(r.get("has_landmarks") or 0)
+                            except Exception:
+                                has_landmarks = 0
+                        elif "landmarks" in r:
+                            try:
+                                raw_landmarks = r.get("landmarks")
+                                if raw_landmarks is not None:
+                                    arr_lm = np.asarray(raw_landmarks)
+                                    has_landmarks = int(np.isfinite(arr_lm).any())
+                            except Exception:
+                                has_landmarks = 0
+                        
+                        # Only require embeddings where landmarks exist
+                        if emb_idx < 0 and has_landmarks == 1:
+                            _record_missing(shot_num, tid, f, has_landmarks, det_by_key)
                             total_missing += 1
+
                     except Exception:
                         # tolerate malformed rows
                         continue
+
         elif has_iter_track_frames:
-            # We can at least detect DET frames per (shot, tid) and infer that missing embs likely exist.
-            # We won’t know crop_ref on this path unless rows_for_frame exists, so mark has_crop=0.
-            # This is a coarse safety net.
-            # Iterate known tids by scanning iter_track_frames for small tid range until it yields nothing.
-            # If your collector exposes a way to list tids per shot, prefer that.
+            # Fallback path cannot validate embeddings-vs-landmarks because it lacks emb_idx and landmarks.
+            # So we do NOT record missing entries here (to avoid false failures).
             seen_any = False
-            for tid_guess in range(0, 2048):  # generous upper bound; adjust if you know a tighter cap
+            for tid_guess in range(0, 2048):
                 try:
                     frames_src = list(oc.iter_track_frames(shot_num, tid_guess))
                 except Exception:
                     frames_src = []
                 if not frames_src:
-                    # Heuristic break: after a few consecutive empty tids, stop probing.
-                    # (Assumes dense, small tid space per shot.)
                     if tid_guess > 32:
                         break
                     continue
                 seen_any = True
+
+                # Best-effort info logging only
+                det_frames = []
                 for f, src_code in frames_src:
                     try:
                         f = int(f)
                         if f > limit_last:
                             continue
-                        if int(src_code) != int(Source.DETECTED.value):
-                            continue
-                        # We don't know emb_idx here, but strict parity expects one vector per DET.
-                        # Flag as "missing/unknown"; later rows_for_frame (if implemented) will be authoritative.
-                        _record_missing(shot_num, int(tid_guess), f, None, det_by_key)
-                        total_missing += 1
+                        if int(src_code) == int(Source.DETECTED.value):
+                            det_frames.append(f)
                     except Exception:
                         continue
+
+                if det_frames:
+                    logging.info(
+                        "RESUME-AUDIT (coarse): shot=%d tid=%d has %d DET frames pre-anchor (cannot verify emb/landmarks without rows_for_frame)",
+                        shot_num, int(tid_guess), len(det_frames)
+                    )
+
             if not seen_any:
                 logging.debug("RESUME-AUDIT: no tracks observed via iter_track_frames for shot=%d", shot_num)
 
@@ -1051,7 +1139,7 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
 
     for (shot, tid), misses in sorted(det_by_key.items()):
         misses.sort(key=lambda r: int(r["f"]))
-        frames_str = ",".join(f'{m["f"]}({m["has_crop"]})' for m in misses)
+        frames_str = ",".join(f'{m["f"]}({m["has_landmarks"]})' for m in misses)
         logging.error(
             "RESUME-AUDIT shot=%d tid=%d missing_preanchor=%d frames=[%s]",
             shot, tid, len(misses), frames_str

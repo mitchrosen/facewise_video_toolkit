@@ -11,12 +11,35 @@ class FaceObservation:
     Represents a single face observation in a specific frame.
 
     Attributes:
-        frame_idx (int): Frame index where the face was observed.
-        bbox (tuple): Bounding box in pixel coordinates (x1, y1, x2, y2).
-        track_id (int, optional): Track ID for tracked faces.
-        embedding (np.ndarray, optional): Facial feature vector.
-        confidence (float, optional): Confidence score from the detector.
-        aligned_face (np.ndarray, optional): Aligned face crop (e.g. ArcFace 112x112 RGB)
+        frame_idx (int):
+            Absolute frame index where the face was observed.
+
+        bbox (tuple[int, int, int, int]):
+            Bounding box in pixel coordinates (x1, y1, x2, y2) in the
+            coordinate space of the original video frame.
+
+        track_id (int, optional):
+            Track ID assigned by the per-shot tracker. None for unassigned
+            detections prior to track association.
+
+        embedding (np.ndarray, optional):
+            512-D facial feature vector associated with this observation.
+            Embeddings are computed **after** the shot finishes and are
+            attached only to DETECTED observations.
+
+        confidence (float, optional):
+            Detector confidence score for this observation, if provided
+            by the face detector.
+
+        landmarks (np.ndarray | list[tuple[float, float]] | None):
+            Facial landmark coordinates for this detection, typically shape
+            (K, 2) in pixel coordinates relative to the full frame.
+
+            Landmarks are **persisted** in checkpoints and rehydrated on resume.
+            They are the canonical geometric representation used to:
+              - perform late face alignment,
+              - compute embeddings in a second pass,
+              - seed optical-flow–based landmark propagation.
     """
     frame_idx: int
     source: Source  
@@ -24,8 +47,7 @@ class FaceObservation:
     bbox: tuple[int, int, int, int] | None = None
     embedding: np.ndarray | None = None
     confidence: float | None = None
-    aligned_face: np.ndarray | None = None
-    landmarks: Optional[List[Tuple[float,float]]] = None
+    landmarks: np.ndarray | None = None  # shape (K,2) float32 
 
     def __post_init__(self) -> None:
         # STRICT: source must already be a Source enum (fail-fast; no coercion here)
@@ -43,6 +65,19 @@ class FaceObservation:
             self.bbox = (int(x1), int(y1), int(x2), int(y2))
             self.validate_bbox()
 
+        # Normalize landmarks to np.ndarray (K,2) float32 when provided
+        if self.landmarks is not None and not isinstance(self.landmarks, np.ndarray):
+            try:
+                lm = np.asarray(self.landmarks, dtype=np.float32)
+                if lm.ndim == 1 and lm.size % 2 == 0 and lm.size >= 2:
+                    lm = lm.reshape((-1, 2))
+                if lm.ndim == 2 and lm.shape[1] == 2 and lm.shape[0] >= 1:
+                    self.landmarks = lm
+                else:
+                    # malformed -> drop
+                    self.landmarks = None
+            except Exception:
+                self.landmarks = None
 
     def validate_bbox(self) -> None:
         # Allow None upstream (e.g., some FLOW/FALLBACK cases)
@@ -84,13 +119,12 @@ class FaceTrack:
     is_open: bool = True          # Track lifecycle
     embeddings: List[np.ndarray] = field(default_factory=list)
 
-    last_landmarks: Optional[np.ndarray] = None     # shape (5,2), float32
+    last_landmarks: Optional[np.ndarray] = None     # shape (K,2), float32
     last_bbox: Optional[Tuple[int,int,int,int]] = None
     last_gray_roi: Optional[np.ndarray] = None      # previous ROI gray for LK
 
-    last_frame_idx = -1
-    last_det_frame_idx = -1
-    last_bbox = (0, 0, 0, 0)
+    last_frame_idx: int = -1
+    last_det_frame_idx: int = -1
 
     #   Authoritative cached DET frame index (kept in sync on every DET add)
     _last_det_frame_idx: int | None = -1
@@ -141,7 +175,7 @@ class FaceTrack:
         # For tracking continuity: store landmarks if this was a detection
         if obs.source == Source.DETECTED and obs.landmarks is not None:
             # prepare for optical flow
-            self.last_known_landmarks = obs.landmarks
+            self.last_landmarks = np.asarray(obs.landmarks, dtype=np.float32)
 
         # Update last_bbox helper
         if obs.bbox is not None:
@@ -150,10 +184,6 @@ class FaceTrack:
         # Keep the DET cache authoritative
         if getattr(obs, "source", None) == Source.DETECTED:
             self._last_det_frame_idx = int(obs.frame_idx)
-      
-        # Update last_bbox helper
-        if obs.bbox is not None:
-            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
 
     def reset_for_frame(self):
         self.is_active = False
@@ -261,9 +291,9 @@ class FaceTrack:
             float(np.mean(y2s))
         )
     
-    def count_aligned_faces(self):
-        return sum(1 for obs in self.observations if obs.aligned_face is not None)
-
+    def count_landmark_observations(self) -> int:
+        return sum(1 for obs in self.observations if obs.landmarks is not None)
+    
     def count_embeddings(self):
         return len(self.embeddings)
 

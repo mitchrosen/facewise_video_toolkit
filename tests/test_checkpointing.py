@@ -31,6 +31,17 @@ class DummyTrack:
         self.last_frame_idx = int(last_f)
         self.last_det_frame_idx = int(last_det)
         self.closed = bool(closed)
+        self._last_f = int(last_f)
+
+    def is_closed(self) -> bool:
+        return bool(self.closed)
+    
+    def last_frame(self):
+        return int(self._last_f)
+
+    def last_detection_frame(self):
+        return int(self._last_det)
+    
 
 class DummyAggregator:
     def __init__(self, tracks=None, shot_number=6):

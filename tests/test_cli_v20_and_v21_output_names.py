@@ -36,8 +36,8 @@ def test_default_output_names(monkeypatch, tmp_path, ver, expected_suffix):
                 bbox=(0.0, 0.0, 1.0, 1.0),
                 embedding=None,
                 confidence=None,
-                aligned_face=None,
                 source=src,
+                landmarks=None,
             )
             self.shot_id = shot_id
     class _Track:

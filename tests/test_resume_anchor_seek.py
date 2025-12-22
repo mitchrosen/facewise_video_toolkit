@@ -7,9 +7,15 @@ from facekit.pipeline.track_across_segments import track_across_segments
 from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.output.json_v2 import ObservationsCollector, EmbeddingCollector
 from facekit.tracking import aggregator as _agg
+from facekit.common.obs_consts import Source
 
-
-# --- local helpers (no cross-imports) ---
+def _make_landmarks(k: int = 5) -> np.ndarray:
+    # Small, deterministic landmark set
+    xy = np.zeros((k, 2), dtype=np.float32)
+    for i in range(k):
+        xy[i, 0] = 10.0 + i
+        xy[i, 1] = 20.0 + 2 * i
+    return xy
 
 def _write_shots(path: Path, first: int, last: int, per_shot: int = None):
     if per_shot is None:
@@ -107,9 +113,9 @@ def _seed_preanchor_run(
     )
 
     # Wire up collectors exactly like the real pipeline would.
-    oc = ObservationsCollector()
-    embc = EmbeddingCollector(mode="sidecar", dim=512)
-    ckpt.start(oc, embc, options_snapshot=opts)
+    obs_collector = ObservationsCollector()
+    emb_collector = EmbeddingCollector(mode="sidecar", dim=512)
+    ckpt.start(obs_collector, emb_collector, options_snapshot=opts)
 
     # Anchor at 180 (inside shot #2: frames [120..239])
     anchor_shot = 2
@@ -121,14 +127,14 @@ def _seed_preanchor_run(
 
     # Seed one pre-anchor DET obs in the anchor shot to exercise rehydrate.
     # This mirrors what track_across_segments would have persisted before crash.
-    oc.append_track_obs(
+    obs_collector.append_track_obs(
         [{
             "shot": anchor_shot,
             "track_id": 1,
             "f": 150,
             "bbox_xyxy": [0, 0, 10, 10],
-            "src": "detected",
-            "crop_ref": "crops/shot2/frame150_tid1.png",  # dummy path is fine
+            "src": Source.DETECTED,
+            "landmarks": _make_landmarks(5),
         }],
         emb_idx_fn=lambda _: -1,  # no embedding index yet; will be filled via add_embeddings
     )

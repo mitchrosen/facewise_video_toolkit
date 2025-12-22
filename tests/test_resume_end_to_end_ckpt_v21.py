@@ -259,16 +259,15 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_crop", "i4"),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
 
     # Minimal but valid emb sidecar with required key 'embeddings'
     np.savez(emb_sidecar, embeddings=np.zeros((0, 512), dtype=np.float32))
 
-    st = {
+    status = {
         "video_path": str(vidA),
-        "schema_version": "2.1",
+        "schema_version": "2.3",
         "detect_interval": 1,
         "embedding_batch_size_max": 16,
         "device": "cpu",
@@ -292,7 +291,7 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         "last_saved_utc": "now", "note": "opened",
         "track_order": [{"shot": 1, "track_id": 0, "order": 0}],
     }
-    Path(run, "status.json").write_text(json.dumps(st, indent=2))
+    Path(run, "status.json").write_text(json.dumps(status, indent=2))
 
     # Try to open with a different video path
     vidB = tmp_path / "B.mp4"
@@ -323,7 +322,6 @@ def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_crop", "i4"),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
     np.savez(emb_sidecar, embeddings=np.zeros((0, 512), dtype=np.float32))
@@ -333,4 +331,4 @@ def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
     Path(run, "status.json").write_text(json.dumps(st))
     mgr = CheckpointManager.open(parent_dir=parent, video_path=vid, options_snapshot={"video_path": str(vid)}, no_resume=False, resume_latest=True)
     with pytest.raises(ResumeSafetyError):
-        mgr.validate_resume_or_raise({"video_path": str(vid), "schema_version": "2.1"}, force=False)
+        mgr.validate_resume_or_raise({"video_path": str(vid), "schema_version": "2.3"}, force=False)

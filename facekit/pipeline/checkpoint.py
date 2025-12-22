@@ -113,8 +113,7 @@ def _atomic_write_bytes(dst: Path, data: bytes) -> None:
     except Exception:
         logging.exception("ckpt._atomic_write_bytes: post-write open/read failed")
 
-    logging.info("ckpt.status post-write %s", _stat_for_log(dst))
-
+    logging.info("ckpt.atomic_write post-write %s", _stat_for_log(dst))
 
 def _atomic_write_text(dst: Path, text: str) -> None:
      _atomic_write_bytes(dst, text.encode("utf-8"))
@@ -442,7 +441,7 @@ class CheckpointManager(TrackingCheckpoint):
 
     def on_shot_done(self) -> None:
         self._shots_done += 1
-        # Ensure the anchor’s row counters include end-of-shot backfill (embeddings/crop links).
+        # Ensure the anchor’s row counters include end-of-shot backfill (embeddings/landmarks links).
         try:
             self.refresh_anchor_row_counts_post_backfill()
         except Exception:
@@ -514,9 +513,9 @@ class CheckpointManager(TrackingCheckpoint):
         src_name = CheckpointManager._src_to_name(ob.source)  # 'detected' / 'tracked' / 'flow'
         src_code = int(src_to_code(src_name))  # <- persist numeric code, not string
 
-        # "has_crop" is implied by either an in-RAM aligned_face or a persisted crop_ref
-        has_crop = 1 if ((getattr(ob, "aligned_face", None) is not None) or bool(getattr(ob, "crop_ref", None))) else 0
-
+        landmarks = getattr(ob, "landmarks", None)
+        # Persist as a simple nested list (or empty)
+        landmarks_val = landmarks.tolist() if isinstance(landmarks, np.ndarray) else (landmarks if landmarks is not None else [])
 
         # Confidence can legitimately be None; in that case use NaN (collector already handles NaN).
         conf_val = getattr(ob, "confidence", None)
@@ -527,12 +526,42 @@ class CheckpointManager(TrackingCheckpoint):
             "bbox_xyxy":  [x1,y1,x2,y2],
             "src":        src_code,          # *** numeric code persisted to sidecar ***
             "conf":       (float(conf_val) if conf_val is not None else float("nan")),
-            # optional fields your collector might accept:
-            "has_crop":   has_crop,
-            "crop_ref":   getattr(ob, "crop_ref", None) or "",
+            "landmarks": landmarks_val,
         }
         return d
     
+    def _snapshot_open_tracks_list(self, aggregator) -> list[dict]:
+        open_list: list[dict] = []
+
+        for track in getattr(aggregator, "tracks", []):
+            if track.is_closed():
+                continue
+
+            last_any = track.last_frame()
+            last_det = track.last_det_frame()
+
+            bbox = None
+            if last_det is not None:
+                for o in reversed(track.observations):
+                    if o.frame_idx == last_det and o.bbox is not None:
+                        bbox = [int(v) for v in o.bbox[:4]]
+                        break
+
+            if bbox is None:
+                lb = track.get_last_bbox()
+                bbox = [int(v) for v in lb[:4]] if lb else [0, 0, 0, 0]
+
+            open_list.append({
+                "shot": int(getattr(track, "shot_id", -1)),
+                "track_id": int(getattr(track, "track_id", -1)),
+                "last_frame": int(last_any) if last_any is not None else -1,
+                "last_det_frame": int(last_det) if last_det is not None else -1,
+                "closed": False,
+                "bbox": bbox,
+            })
+
+        return open_list
+
     def add_observations(self, shot_number: int, frame_idx: int, observations: list[FaceObservation]) -> int:
         """
         Append observations for THIS FRAME into the observations collector.
@@ -597,22 +626,21 @@ class CheckpointManager(TrackingCheckpoint):
                                  shot_number, frame_idx, tid, r)
                     raise TypeError(f"BUG: row without valid 'src' int code: {r!r}")
 
-                # robust has_crop: true if aligned_face already persisted via crop_ref,
-                # or explicit has_crop flag present (fallback).
-                has_crop_flag = 1 if r.get("crop_ref") else int(r.get("has_crop", 0))
-
                 out = {
                     "shot": int(shot_number),
                     "track_id": int(tid),
                     "f": int(r.get("f", frame_idx)),
                     "bbox_xyxy": [float(v) for v in bbox],
                     "src": int(src_val),
-                    "has_crop": has_crop_flag,
                 }
                 if r.get("conf") is not None:
                     out["conf"] = float(r["conf"])
-                if r.get("crop_ref"):
-                    out["crop_ref"] = str(r["crop_ref"])
+
+                landmarks = r.get("landmarks", None)
+                has_landmarks = int(landmarks is not None and landmarks != [])
+                out["has_landmarks"] = has_landmarks
+                out["landmarks"] = (landmarks if has_landmarks else [])
+                
                 out_rows.append(out)
 
             # sanity: every row must have an int 'src'
@@ -695,40 +723,17 @@ class CheckpointManager(TrackingCheckpoint):
         if not callable(find_rows) or not callable(update_emb_idx):
             raise ResumeSafetyError("[ckpt] ObservationsCollector needs find_rows/update_emb_idx.")
 
-        # ---------- diagnostics (unchanged semantics, just tuples-aware) ----------
-        if self.logger.isEnabledFor(logging.DEBUG):
-            diag = self._diagnose_candidates(
-                self._obs,
-                shot=shot_number,
-                track_id=track_id,
-                frame_last=frame_idx_last,
-            )
-            if diag:
-                self.logger.debug(
-                    "link:diag shot=%d tid=%d upto=%d "
-                    "seen=%d det=%d det_unassigned=%d det_crop=%d final=%d "
-                    "filtered(no_crop=%d, assigned=%d, future=%d)",
-                    int(shot_number), int(track_id), int(frame_idx_last),
-                    diag.get("rows_seen", -1), diag.get("rows_det", -1),
-                    diag.get("rows_det_unassigned", -1),
-                    diag.get("rows_det_crop", -1),
-                    diag.get("rows_final_candidates", -1),
-                    diag.get("filtered_no_crop", -1),
-                    diag.get("filtered_assigned", -1),
-                    diag.get("filtered_future", -1),
-                )
-
         # ---------- find candidate obs rows for linking ----------
         candidate_rows = find_rows(
             shot=int(shot_number),
             track_id=int(track_id),
             frame_last=int(frame_idx_last),
             only_unassigned=True,
-            only_with_crop=True,
+            only_with_landmarks=True,
             source=SRC_TO_CODE[Source.DETECTED],
         )
         self.logger.info(
-            "link: candidates=%d (DET+crop, unassigned, ≤%d) for shot=%d tid=%d",
+            "link: candidates=%d (DET+landmarks, unassigned, ≤%d) for shot=%d tid=%d",
             len(candidate_rows), int(frame_idx_last), int(shot_number), int(track_id)
         )
 
@@ -763,11 +768,11 @@ class CheckpointManager(TrackingCheckpoint):
         if len(candidate_rows) < cnt:
             self.logger.error(
                 "link:mismatch fewer candidates than embeddings: candidates=%d < embs=%d "
-                "(shot=%d tid=%d ≤%d). Likely causes: has_crop not flipped, wrong src, or wrong frame_last.",
+                "(shot=%d tid=%d ≤%d). Likely causes: landmarks missing, wrong src, or wrong frame_last.",
                 len(candidate_rows), cnt, int(shot_number), int(track_id), int(frame_idx_last)
             )
             raise ResumeSafetyError(
-                f"[ckpt] fewer DET+crop rows ({len(candidate_rows)}) than embeddings ({cnt}) "
+                f"[ckpt] fewer DET+landmarks rows ({len(candidate_rows)}) than embeddings ({cnt}) "
                 f"for shot={shot_number} track={track_id}."
             )
 
@@ -826,7 +831,6 @@ class CheckpointManager(TrackingCheckpoint):
         )
         return cnt
 
-
     def checkpoint_now(
             self, 
             *, 
@@ -863,7 +867,7 @@ class CheckpointManager(TrackingCheckpoint):
         _dump_npz_atomic(self._obs, self.obs_path)
         _dump_npz_atomic(self._emb, self.emb_path)
         # Capture a compact JSON list of the open tracks at this anchor.
-        self._open_tracks_inline = self._build_open_tracks_list(aggregator, shot_number)
+        self._open_tracks_inline = self._snapshot_open_tracks_list(aggregator)
         self._write_status(note or "checkpoint")
 
     def matches_video(self, video_path: _t.Union[str, Path]) -> bool:
@@ -878,6 +882,69 @@ class CheckpointManager(TrackingCheckpoint):
         if self._emb is not None:
              _dump_npz_atomic(self._emb, self.emb_path)
         self._write_status(note)
+
+    def build_manifest_v2_3_from_obs_sidecar(
+        self,
+        *,
+        obs_sidecar_path: str,
+        emb_sidecar_path: str | None,
+        manifest_path: str,
+    ) -> None:
+        """
+        Deterministic manifest builder that relies ONLY on persisted sidecars.
+        Sorts obs rows by (shot, track_id, f) so each (shot,track) is contiguous,
+        then emits per-track (offset,count) slices into the obs NPZ.
+        """
+        obs_npz_path = Path(obs_sidecar_path)
+        with np.load(obs_npz_path, allow_pickle=False) as z:
+            obs = z["observations"]
+
+        order = np.lexsort((obs["f"], obs["track_id"], obs["shot"]))
+        obs = obs[order]
+
+        # Rewrite the obs sidecar in sorted order so offsets match file contents
+        atomic_write_npz(obs_npz_path, observations=obs)
+
+        # Build slices
+        shots: dict[int, list[dict]] = {}
+        n = obs.shape[0]
+        i = 0
+        while i < n:
+            shot = int(obs["shot"][i])
+            tid  = int(obs["track_id"][i])
+            start = i
+            i += 1
+            while i < n and int(obs["shot"][i]) == shot and int(obs["track_id"][i]) == tid:
+                i += 1
+            count = i - start
+            first_f = int(obs["f"][start])
+            last_f  = int(obs["f"][start + count - 1])
+
+            shots.setdefault(shot, []).append({
+                "track_id": tid,
+                "first_frame": first_f,
+                "last_frame": last_f,
+                "obs_offset": start,
+                "obs_count": count,
+            })
+
+        # stable ordering
+        shot_items = []
+        for shot in sorted(shots.keys()):
+            tracks = sorted(shots[shot], key=lambda t: (t["first_frame"], t["track_id"]))
+            shot_items.append({"shot_id": shot, "face_tracks": tracks})
+
+        manifest = {
+            "schema_version": REQUIRED_SCHEMA_VERSION,
+            "video_path": self.video_path,
+            "obs_sidecar": Path(obs_sidecar_path).name,
+            "emb_sidecar": (Path(emb_sidecar_path).name if emb_sidecar_path else None),
+            "shots": shot_items,
+            "generated_at_utc": _utc_now(),
+        }
+
+        _atomic_write_text(Path(manifest_path), json.dumps(manifest, indent=2))
+
 
     def copy_ckpt_sidecars_to_final(
         self,
@@ -913,6 +980,9 @@ class CheckpointManager(TrackingCheckpoint):
             # Do not crash pipeline completion if export copy fails; just log.
             logging.error("ckpt:export failed: %s", e)
 
+    def _write_status_dict(self, status: dict) -> None:
+        _atomic_write_text(self.status_path, json.dumps(status, indent=2))
+
     def mark_completed(self) -> None:
         """
         Mark the run as completed in status.json. This enables 'resume-for-outputs'
@@ -921,7 +991,7 @@ class CheckpointManager(TrackingCheckpoint):
         status = self.read_status()
         status["completed"] = True
         status["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-        self._write_status(status)
+        self._write_status_dict(status)
         logging.info("ckpt:run marked completed")
 
     @staticmethod
@@ -985,17 +1055,6 @@ class CheckpointManager(TrackingCheckpoint):
         arr = np.load(p, allow_pickle=False)['embeddings']
         return arr
 
-    def debug_emb_by_frame(self, shot: int) -> dict[int, "np.ndarray"]:
-        """
-        Map frame -> embedding vector for a given shot, from emb sidecar.
-        Resume-only helper to fetch vectors by exact frame index.
-        """
-        earr = self._emb_np()
-        mask = (earr['shot'] == int(shot))
-        frames = np.asarray(earr['frame'][mask]).tolist()
-        vecs   = np.asarray(earr['vec'][mask])
-        return {int(f): np.asarray(v, dtype=np.float32) for f, v in zip(frames, vecs)}
-    
     # def get_embeddings_by_frames(self, shot: int, frames: list[int]) -> np.ndarray | None:
     #     """
     #     Return embeddings stacked in the same order as `frames` for a given shot.
@@ -1267,7 +1326,7 @@ class CheckpointManager(TrackingCheckpoint):
             try:
                 emb_rows = emb_collector.load_npz(self.emb_path)
             except Exception:
-                logging.info("ckpt:load obs_collector.load_npz() raised exception (non-strict)")
+                logging.info("ckpt:load emb_collector.load_npz() raised exception (non-strict)")
 
 
         logging.info("ckpt:load obs_rows=%d emb_rows=%d from (%s, %s)",
@@ -1282,49 +1341,6 @@ class CheckpointManager(TrackingCheckpoint):
     
     def anchor_shot_first_frame(self) -> int | None:
         return self._last_det_shot_first_frame
-    
-    def _diagnose_candidates(self, obs, *, shot, track_id, frame_last) -> dict:
-        """
-        Return a breakdown of how many rows are excluded by each filter.
-        Uses obs.to_array() if available; otherwise returns {}.
-        """
-        try:
-            arr = obs.to_array()
-        except Exception:
-            return {}
-
-        out = {}
-        try:
-            det_code = SRC_TO_CODE[Source.DETECTED]
-            m_shot   = (arr["shot"] == int(shot))
-            m_tid    = (arr["track_id"] == int(track_id))
-            m_upto   = (arr["f"] <= int(frame_last))
-            m_det    = (arr["src"] == int(det_code))
-            m_unass  = (arr["emb_idx"] == -1) if "emb_idx" in arr.dtype.names else True
-            if "has_crop" in arr.dtype.names:
-                m_crop = (arr["has_crop"] == 1)
-            else:
-                # Legacy fallback: assume all DET are crop-eligible
-                m_crop = m_det
-
-            base_all = m_shot & m_tid & m_upto
-            out["rows_seen"]          = int(base_all.sum())
-            out["rows_det"]           = int((base_all & m_det).sum())
-            out["rows_det_unassigned"]= int((base_all & m_det & m_unass).sum())
-            out["rows_det_crop"]      = int((base_all & m_det & m_crop).sum())
-            out["rows_final_candidates"] = int((base_all & m_det & m_crop & m_unass).sum())
-
-            # Which filter bites the most? (counts of rows eliminated by each)
-            out["filtered_no_crop"]   = int((base_all & m_det & ~m_crop).sum())
-            out["filtered_assigned"]  = int((base_all & m_det & m_crop & ~m_unass).sum())
-            out["filtered_future"]    = int(((arr["shot"] == int(shot)) &
-                                            (arr["track_id"] == int(track_id)) &
-                                            (arr["f"] > int(frame_last))).sum())
-        except Exception:
-            # Best effort; never break the pipeline for diagnostics
-            pass
-        return out
-
     
     # ---------- run-dir factory ----------
     @classmethod
@@ -1444,6 +1460,26 @@ class CheckpointManager(TrackingCheckpoint):
 
         # Inspect status
         if do_resume:
+            status = {}
+            if mgr.status_path.exists():
+                try:
+                    status = json.loads(mgr.status_path.read_text() or "{}") or {}
+                except Exception as e:
+                    raise ValueError(f"Failed to read status.json for resume: {mgr.status_path}") from e
+            else:
+                # If user asked to resume, but there's no status.json, that's not resumable.
+                # Either downgrade to cold start or raise; your tests expect safety checks,
+                # so raising is typically better.
+                raise FileNotFoundError(f"Cannot resume: missing status.json at {mgr.status_path}")
+
+            # Hard stop: schema mismatch
+            sv = str(status.get("schema_version", ""))
+            if sv != REQUIRED_SCHEMA_VERSION:
+                raise ResumeSafetyError(
+                    f"[resume safety] unsupported checkpoint schema: found {sv!r}, "
+                    f"required {REQUIRED_SCHEMA_VERSION!r}. Please re-run to regenerate checkpoints."
+                )
+
             status_path = mgr.status_path
             obs_sidecar_path = mgr.ckpt_dir / "obs_ckpt.npz"
             emb_sidecar_path = mgr.ckpt_dir / "emb_ckpt.npz"
@@ -1473,29 +1509,34 @@ class CheckpointManager(TrackingCheckpoint):
             have_obs = obs_sidecar_path.exists()
             have_emb = emb_sidecar_path.exists()
 
+            emb_store = str(status.get("emb_store") or "inline").lower()
+            expect_emb = emb_store in ("inline", "sidecar")
+            require_emb_file = expect_emb and int(emb_anchor) > 0
+
+            # Embeddings in ckpt are required if we have evidence of prior progress that
+            # could include completed shots, i.e. obs rows exist before anchor.
+            obs_anchor  = int(status.get("obs_rows_at_last_detection", 0) or 0)
+            emb_anchor  = int(status.get("emb_rows_at_last_detection", 0) or 0)
+
+            have_obs = obs_sidecar_path.exists()
+            have_emb = emb_sidecar_path.exists()
+
             if had_progress:
-                # Anchors or track_order imply we should already have sidecars present (possibly empty).
-                # If anchors > 0, the corresponding sidecar MUST exist.
                 if not have_obs:
+                    raise ResumeSafetyError(...)
+
+                # If checkpoint claims embeddings rows, emb sidecar must exist.
+                if emb_anchor > 0 and not have_emb:
                     raise ResumeSafetyError(
-                        f"ckpt.open: inconsistent checkpoint: obs_anchor={obs_anchor} "
-                        f"but {obs_sidecar_path} is missing."
-                    )
-                if not have_emb:
-                    raise ResumeSafetyError(
-                        f"ckpt.open: inconsistent checkpoint: emb_anchor={emb_anchor} "
+                        f"ckpt.open: inconsistent checkpoint: emb_rows_at_last_detection={emb_anchor} "
                         f"but {emb_sidecar_path} is missing."
                     )
-                # structural sanity 
-                try:
-                    _assert_npz_keys(obs_sidecar_path, ("observations",))
-                except ResumeSafetyError:
-                    # If we’re strict, bubble up. If not strict, continue after logging.
-                    raise
-                try:
+
+                # Structural sanity
+                _assert_npz_keys(obs_sidecar_path, ("observations",))
+                if have_emb:
                     _assert_npz_keys(emb_sidecar_path, ("embeddings",))
-                except ResumeSafetyError:
-                    raise
+
             else:
                 # No progress - missing sidecars normal at the very beginning.
                 logging.debug(
@@ -1907,128 +1948,137 @@ class CheckpointManager(TrackingCheckpoint):
 
     # ---------- embeddings validation helpers ----------
     def _det_stats_for_shot(self, shot_num: int) -> tuple[int, int]:
-        """Returns (det_with_crop, det_with_crop_and_emb) for a given shot."""
-        if not hasattr(self, "obs_collector") or self.obs_collector is None:
+        """Returns (det_with_landmarks, det_with_landmarks_and_emb) for a given shot."""
+        if not getattr(self, "obs_collector", None):
             return (0, 0)
+
         try:
             arr = self.obs_collector.to_array()
         except Exception:
             return (0, 0)
+
         if getattr(arr, "size", 0) == 0:
             return (0, 0)
 
         try:
-            det_code = SRC_TO_CODE[Source.DETECTED]
-            mask_shot = (arr["shot"] == int(shot_num))
-            mask_det  = (arr["src"]  == int(det_code))
-            mask_crop = None
-            if "has_crop" in arr.dtype.names:
-                mask_crop = (arr["has_crop"] == 1)
-            else:
-                # Legacy fallback: assume croppable == all DET (conservative)
-                mask_crop = (arr["src"] == int(det_code))
+            det_code = int(SRC_TO_CODE[Source.DETECTED])
 
-            base = mask_shot & mask_det & mask_crop
-            det_with_crop = int(base.sum())
-            if det_with_crop == 0:
+            # Required columns
+            if "shot" not in arr.dtype.names or "src" not in arr.dtype.names:
                 return (0, 0)
+
+            mask_shot = (arr["shot"] == int(shot_num))
+            mask_det  = (arr["src"] == det_code)
+
+            # Landmark presence mask
+            if "landmarks" in (arr.dtype.names or ()):
+                landmarks = arr["landmarks"]
+
+                # Case A: fixed-shape numeric array field, e.g. dtype float32 with shape (..., 68, 2)
+                # landmarks.ndim >= 2 means there is at least one extra dimension beyond row.
+                if isinstance(landmarks, np.ndarray) and landmarks.ndim >= 2 and np.issubdtype(landmarks.dtype, np.number):
+                    # Mark as present if ANY value is non-zero for that row.
+                    # Collapse all non-row dimensions.
+                    nonzero = np.any(landmarks != 0, axis=tuple(range(1, landmarks.ndim)))
+                    mask_landmarks = nonzero
+
+                # Case B: object array (per-row python objects: None, list, np.ndarray, etc.)
+                elif isinstance(landmarks, np.ndarray) and landmarks.dtype == object:
+                    def _present(x) -> bool:
+                        if x is None:
+                            return False
+                        # numpy array
+                        if isinstance(x, np.ndarray):
+                            return x.size > 0 and np.any(x != 0)
+                        # list/tuple
+                        if isinstance(x, (list, tuple)):
+                            return len(x) > 0
+                        # string/bytes
+                        if isinstance(x, (str, bytes)):
+                            return len(x) > 0 and str(x).strip() not in ("", "[]", "null", "None")
+                        # fallback: truthiness
+                        return True
+
+                    mask_landmarks = np.fromiter((_present(x) for x in landmarks), dtype=bool, count=landmarks.shape[0])
+
+                # Case C: string/bytes array (rare): treat non-empty/non-"[]"/non-"null" as present
+                elif isinstance(landmarks, np.ndarray) and landmarks.dtype.kind in ("U", "S"):
+                    s = landmarks.astype(str)
+                    mask_landmarks = (np.char.strip(s) != "") & (np.char.strip(s) != "[]") & (np.char.strip(s) != "null")
+
+                else:
+                    # Unknown representation: be conservative (treat as not present)
+                    mask_landmarks = np.zeros(arr.shape[0], dtype=bool)
+            else:
+                # If landmarks doesn't exist, you cannot enforce the invariant reliably.
+                raise ResumeSafetyError("[ckpt] observations sidecar missing required 'landmarks' field")
+
+            base = mask_shot & mask_det & mask_landmarks
+            det_with_landmarks = int(base.sum())
+            if det_with_landmarks == 0:
+                return (0, 0)
+
+            if "emb_idx" not in (arr.dtype.names or ()):
+                return (det_with_landmarks, 0)
+
             with_emb = int(((arr["emb_idx"] >= 0) & base).sum())
-            return (det_with_crop, with_emb)        
+            return (det_with_landmarks, with_emb)
+
         except Exception:
-            # Be cautious; prefer to not fail here. The caller enforces policy.
+            # Be cautious; caller enforces policy.
             return (0, 0)
+        
+    def _shots_with_any_rows(self) -> list[int]:
+        try:
+            arr = self.obs_collector.to_array()
+            if getattr(arr, "size", 0) == 0:
+                return []
+            return sorted({int(s) for s in np.asarray(arr["shot"]).tolist()})
+        except Exception:
+            return []
 
     def _validate_resume_embeddings(self, *, anchor_shot: int | None) -> None:
         """
         Policy:
-          - For shots < anchor_shot:
-               * If det_rows == 0: OK (no faces detected → zero embeddings acceptable).
-               * Else require det_rows_with_embeddings == det_rows; otherwise fatal.
-          - For shot == anchor_shot: allow partial/zero (mid-shot resume).
+        - For shots < anchor_shot:
+            * If det_with_landmarks == 0: OK (no embedding-eligible DET rows).
+            * Else require with_embeddings == det_with_landmarks; otherwise fatal.
+        - For shot == anchor_shot: allow partial/zero (mid-shot resume).
         """
-        # Establish the set of shots we know about from track_order (stable across resumes).
         try:
             shots_present = sorted({int(s) for (s, _) in (self._shot_track_to_order or {}).keys()})
         except Exception:
             shots_present = []
 
         if not shots_present:
-            # No tracks yet; nothing to validate.
             logging.info("resume: no shots present in track_order; skipping embeddings validation.")
             return
 
-        # If we don't know the anchor_shot, treat all completed shots as empty set.
-        a_shot = anchor_shot if anchor_shot is not None else None
+        a_shot = int(anchor_shot) if anchor_shot is not None else None
 
         for s in shots_present:
-            if a_shot is not None and s > a_shot:
-                # Future shots (shouldn't exist in track_order yet), skip defensively.
+            if a_shot is None:
                 continue
-            if a_shot is not None and s == a_shot:
-                # Current (interrupted) shot: embeddings may be incomplete; allowed.
-                continue
+            if s >= a_shot:
+                continue  # do NOT enforce on anchor shot or future
 
-            # Completed shots must be consistent: either no DET rows, or full embeddings coverage.
             det_rows, with_emb = self._det_stats_for_shot(s)
             if det_rows == 0:
-                # OK: no detected faces in this shot → zero embeddings acceptable.
-                logging.info("resume: shot=%d has no DET rows; zero embeddings is acceptable.", s)
                 continue
+
             if with_emb < det_rows:
-                # Fatal: we have DET rows but not enough embeddings stored for a *completed* shot.
                 raise ResumeSafetyError(
                     f"resume: embeddings incomplete for completed shot {s}: "
-                    f"det_with_crop=%d={det_rows}, with_embeddings={with_emb}. "
+                    f"det_with_landmarks={det_rows}, with_embeddings={with_emb}. "
                     "This would break deterministic global-ID resolution. "
                     "Re-run prior segment or regenerate checkpoints."
                 )
-            # Otherwise OK.
-            logging.info("resume: shot=%d embeddings coverage OK (det=%d, with_emb=%d).", s, det_rows, with_emb)
-    
-    def _build_open_tracks_list(self, aggregator: ShotFaceTrackAggregatorProtocol, shot_number: int) -> list[dict]:
-        """
-        Each open track MUST expose attributes (not methods):
-            - track_id: int
-            - last_frame_idx: int
-            - last_det_frame_idx: int
-            - last_bbox: tuple/list len>=4 (xyxy), ints preferred
-            - closed: bool
-        The shot number is provided by the caller; we do not read it from the track.
-        """
-        tracks = getattr(aggregator, "tracks", None)
-        if not isinstance(tracks, (list, tuple)):
-            raise TypeError("aggregator.tracks must be a list/tuple")
 
-        out: list[dict] = []
-        for t in tracks:
-            if not hasattr(t, "closed"):
-                raise TypeError("track missing required boolean attribute 'closed'")
-            if t.closed:
-                continue
-
-            # Hard requirements — attributes only.
-            try:
-                track_id = int(t.track_id)
-                last_frame_idx = int(t.last_frame_idx)
-                last_det_frame_idx = int(t.last_det_frame_idx)
-                bb = t.last_bbox
-            except AttributeError as e:
-                raise TypeError(f"track missing required attribute: {e}") from e
-
-            if not isinstance(bb, (list, tuple)) or len(bb) < 4:
-                raise TypeError("track.last_bbox must be a length-4 sequence")
-            x1, y1, x2, y2 = (int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3]))
-
-            out.append({
-                "shot": int(shot_number),
-                "track_id": track_id,
-                "last_frame": last_frame_idx,
-                "last_det_frame": last_det_frame_idx,
-                "closed": False,
-                "bbox": [x1, y1, x2, y2],
-            })
-        return out
-        
+            logging.info(
+                "resume: shot=%d embeddings coverage OK (det_with_landmarks=%d, with_emb=%d).",
+                s, det_rows, with_emb
+            )
+           
     def hydrate_open_tracks_into(self, aggregator) -> int:
         """
         Read status.json['open_tracks'] and rehydrate them into the provided aggregator.

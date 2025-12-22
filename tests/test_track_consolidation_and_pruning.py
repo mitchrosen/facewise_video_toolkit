@@ -20,7 +20,6 @@ def obs(frame_idx: int, bbox, *, src=Source.DETECTED) -> FaceObservation:
         track_id=None,
         embedding=None,
         confidence=None,
-        aligned_face=None,
         landmarks=None,
     )
 

@@ -193,10 +193,7 @@ def _src_to_int(src_any) -> int:
         return int(src_to_code(src_any))
     raise TypeError(f"'src' must be int|str|Source, not {type(src_any).__name__}: {src_any!r}")
 
-def _to_int01(flag) -> int:
-    # normalize truthy → 1, falsy → 0
-    return 1 if bool(flag) else 0
-
+LANDMARKS_SHAPE = (5, 2)
 
 ObsRow = np.dtype([
     ("f", np.int32),                 # absolute frame index
@@ -206,8 +203,7 @@ ObsRow = np.dtype([
     ("src", np.uint8),               # 0=detected,1=tracked,2=flow
     ("conf", np.float32),            # NaN if absent
     ("emb_idx", np.int32),            # -1 if absent
-    ("has_crop", np.uint8),          # 1 if a 112x112 crop exists on disk, else 0
-    ("crop_ref", "U256"),            # path to aligned crop ("" if none)
+    ("landmarks", np.float32, LANDMARKS_SHAPE),  # 5x2 float32; all zeros if absent
 ])
 
 class ObservationsCollector:
@@ -215,7 +211,7 @@ class ObservationsCollector:
     @property
     def columns(self) -> tuple[str, ...]:
         # Must match ObsRow exactly
-        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","has_crop")
+        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","landmarks")
     
     @property
     def schema(self) -> dict:
@@ -238,7 +234,7 @@ class ObservationsCollector:
         count: int | None = None,
         # optional filters (all backward-compatible)
         only_unassigned: bool | None = None,
-        only_with_crop: bool | None = None,
+        only_with_landmarks: bool | None = None,
         source: int | None = None,
         **kwargs,
     ) -> list[tuple[int, int]]:
@@ -248,7 +244,7 @@ class ObservationsCollector:
         AND (emb_idx == -1 if only_unassigned)
         AND (f <= frame_last if provided)
         AND (src == source if provided)
-        AND (valid bbox if only_with_crop)
+        AND (valid landmarks if only_with_landmarks)
         Ordered from newest to oldest (descending frame index).
         Accepts legacy alias `frame_max` via **kwargs.
         """
@@ -263,6 +259,14 @@ class ObservationsCollector:
         def _bbox_valid(bb):
             # bb is shape (4,) as float32: x1,y1,x2,y2
             return float(bb[2]) > float(bb[0]) and float(bb[3]) > float(bb[1])
+        
+        def _landmarks_present(landmarks) -> bool:
+            # landmarks is shape LANDMARKS_SHAPE float32. Treat "all zeros" as absent.
+            try:
+                arr = np.asarray(landmarks, dtype=np.float32)
+                return bool(arr.size) and bool(np.any(arr != 0.0))
+            except Exception:
+                return False
 
         # Walk blocks from newest to oldest
         for b_idx in range(len(self._rows) - 1, -1, -1):
@@ -277,14 +281,8 @@ class ObservationsCollector:
                     continue
                 if source is not None and int(row["src"]) != int(source):
                     continue
-                if only_with_crop:
-                    if "has_crop" in row.dtype.names:
-                        if int(row["has_crop"]) != 1:
-                            continue
-                    else:
-                        # legacy fallback: bbox sanity as proxy
-                        if not _bbox_valid(row["bbox_xyxy"]):
-                            continue
+                if only_with_landmarks and not _landmarks_present(row["landmarks"]):
+                        continue
 
                 out.append((b_idx, r_idx))
                 if want is not None and len(out) >= want:
@@ -406,19 +404,17 @@ class ObservationsCollector:
             src_code =_src_to_int(src_any)
             conf = float(oN["conf"]) if ("conf" in oN and oN["conf"] is not None) else np.nan
 
-            # Normalize crop_ref to a string
-            crop_ref = oN.get("crop_ref") or ""
-            crop_ref = str(crop_ref)
-
-            # has_crop: normalize to 0/1; infer from crop_ref when missing
-            has_crop = oN.get("has_crop", None)
-            if has_crop is None:
-                has_crop = 1 if crop_ref else 0
-            has_crop = _to_int01(has_crop)
-
-            if has_crop:
-                crop_ref = oN.get("crop_ref") or ""
-            crop_ref = str(crop_ref)
+            # landmarks: required for detected rows (contract), optional otherwise.
+            landmarks = oN.get("landmarks", None)
+            if landmarks is None:
+                # store zeros (meaning "absent")
+                landmarks_arr = np.zeros(LANDMARKS_SHAPE, dtype=np.float32)
+            else:
+                landmarks_arr = np.asarray(landmarks, dtype=np.float32)
+                if landmarks_arr.shape != LANDMARKS_SHAPE:
+                    raise ValueError(
+                        f"landmarks wrong shape: expected {LANDMARKS_SHAPE}, got {landmarks_arr.shape} | row={oN!r}"
+                    )
 
             emb_idx = -1
             if emb_idx_fn is not None:
@@ -434,8 +430,7 @@ class ObservationsCollector:
             block[i]["src"] = src_code
             block[i]["conf"] = conf
             block[i]["emb_idx"] = emb_idx
-            block[i]["has_crop"] = has_crop
-            block[i]["crop_ref"] = crop_ref
+            block[i]["landmarks"] = landmarks_arr
 
         offset = self._count
         self._rows.append(block)
@@ -452,6 +447,8 @@ class ObservationsCollector:
         Atomically write observations to an .npz (key: 'observations').
         Always writes a valid (possibly empty) structured array.
         """
+        if self.mode != "sidecar":
+            return {}
 
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +458,9 @@ class ObservationsCollector:
             arr = arr[arr["f"] > int(min_frame_exclusive)]
 
         final_path = out_path if out_path.suffix.lower() == ".npz" else out_path.with_suffix(".npz")
+
+        if self._base > 0 and not self._loaded and final_path.exists():
+            self.load_npz(final_path)
 
         atomic_write_npz(final_path, observations=arr)
 
@@ -476,8 +476,8 @@ class ObservationsCollector:
                 {"name":"src","type":"u1","desc":"0=detected,1=tracked,2=flow"},
                 {"name":"conf","type":"f4","desc":"NaN if absent"},
                 {"name":"emb_idx","type":"i4","desc":"-1 if absent"},
-                {"name":"has_crop","type":"u1","desc":"1 if crop saved"},
-                {"name":"crop_ref","type":"U256","desc":"path to aligned crop or empty"},
+                {"name":"landmarks","type":f"f4[{LANDMARKS_SHAPE[0]}][{LANDMARKS_SHAPE[1]}]",
+                    "desc":"facial landmarks (zeros if absent)"},
             ],
             "count": int(arr.shape[0]),
         }
@@ -581,14 +581,11 @@ class ObservationsCollector:
                 if not np.isnan(conf):
                     d["conf"] = conf
 
-                if "crop_ref" in row.dtype.names:
-                    val = row["crop_ref"]
-                    # handle possible bytes/unicode
-                    if isinstance(val, bytes):
-                        val = val.decode("utf-8", "ignore")
-                    crop_ref = str(val).strip()
-                    if crop_ref:
-                        d["crop_ref"] = crop_ref
+                if "landmarks" in row.dtype.names:
+                    lms = np.asarray(row["landmarks"], dtype=np.float32)
+                    if lms.size and np.any(lms != 0.0):
+                        # output as nested lists for JSON friendliness (if callers want it)
+                        d["landmarks"] = lms.tolist()
 
                 groups.setdefault((s, t), []).append(d)
 
@@ -598,6 +595,57 @@ class ObservationsCollector:
             rows.sort(key=lambda r: r["f"])
             yield (s, t, rows)
 
+    def iter_rows(
+        self,
+        *,
+        frame_max: int | None = None,
+        shot: int | None = None,
+        track_id: int | None = None,
+    ):
+        """
+        Yield rows one-by-one as dicts (flat, not grouped).
+        Order is append order across blocks (which is also the sidecar order).
+        """
+        from facekit.common.obs_consts import CODE_TO_SRC
+
+        for block in self._rows:
+            for row in block:
+                s = int(row["shot"])
+                t = int(row["track_id"])
+                f = int(row["f"])
+
+                if shot is not None and s != int(shot):
+                    continue
+                if track_id is not None and t != int(track_id):
+                    continue
+                if frame_max is not None and f > int(frame_max):
+                    continue
+
+                d = {
+                    "shot": s,
+                    "track_id": t,
+                    "f": f,
+                    "bbox_xyxy": [
+                        float(row["bbox_xyxy"][0]),
+                        float(row["bbox_xyxy"][1]),
+                        float(row["bbox_xyxy"][2]),
+                        float(row["bbox_xyxy"][3]),
+                    ],
+                    "src": CODE_TO_SRC[int(row["src"])],
+                    "emb_idx": int(row["emb_idx"]),
+                }
+
+                conf = float(row["conf"])
+                if not np.isnan(conf):
+                    d["conf"] = conf
+
+                # landmarks (only include if present and non-zero)
+                if "landmarks" in (row.dtype.names or ()):
+                    lms = np.asarray(row["landmarks"], dtype=np.float32)
+                    if lms.size and np.any(lms != 0.0):
+                        d["landmarks"] = lms
+
+                yield d
 
     def to_array(self) -> np.ndarray:
         """Return a single structured array similar to what finalize_sidecar writes."""
@@ -614,12 +662,23 @@ class ObservationsCollector:
         count = len(positions)
         if count == 0:
             return (self._count, 0)  # next write-point as offset, zero count
+        
+        # Convert each (block,row) to a global offset and take min
+        def _global_offset(pos):
+            b_idx, r_idx = pos
+            return sum(self._rows[i].shape[0] for i in range(b_idx)) + r_idx
 
-        # Convert first (block_idx,row_idx) to a global offset.
-        # If you track a running base for each block, use that; otherwise compute:
-        # offset = sum(len(b) for b in self._rows[:first_block_idx]) + first_row_idx
-        first_block_idx, first_row_idx = positions[0]
-        offset = sum(self._rows[i].shape[0] for i in range(first_block_idx)) + first_row_idx
+        offsets = sorted(_global_offset(p) for p in positions)
+        offset = offsets[0]
+        count = len(offsets)
+
+        # enforce contiguity: offsets should be offset, offset+1, ..., offset+count-1
+        if offsets[-1] != offset + count - 1:
+            raise ValueError(
+                f"Non-contiguous rows for (shot={shot}, track_id={track_id}): "
+                f"count={count}, span=[{offset}..{offsets[-1]}]"
+            )
+
         return (int(offset), int(count))
     
     def frame_at_pos(self, pos: tuple[int,int]) -> int:
@@ -673,6 +732,7 @@ class EmbeddingCollector:
         self.dim = dim
         self._embs: List[np.ndarray] = []
         self._base = int(base_offset)
+        self._loaded = False
 
     def _validate_vec(self, vec: np.ndarray | None) -> np.ndarray:
         if vec is None:
@@ -783,6 +843,7 @@ class EmbeddingCollector:
         if self.dim is not None and arr.shape[1] != self.dim:
             raise ValueError(f"EmbeddingCollector.load_npz: dim mismatch {arr.shape[1]} != {self.dim}")
         self._embs.extend(row.copy() for row in arr)
+        self._loaded = True
         return int(arr.shape[0])
 
     def trim_to(self, n: int) -> None:

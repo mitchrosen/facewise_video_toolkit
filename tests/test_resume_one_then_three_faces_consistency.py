@@ -114,8 +114,9 @@ _obs_dtype = np.dtype([
     ("f",          np.int64),
     ("bbox_xyxy",  np.float32, (4,)),
     ("src",        np.int64),   # <- int code via SRC_TO_CODE at dump time
-    ("has_crop",   np.int8),
     ("emb_idx",    np.int64),
+    ("has_landmarks", np.int8),
+    ("landmarks",     np.float32, (5, 2)),  # fixed 5x2 for this test
 ])
 
 class ObsSidecar:
@@ -131,6 +132,7 @@ class ObsSidecar:
                 if "observations" in data.files:
                     arr = data["observations"]
                     has_emb = "emb_idx" in arr.dtype.names
+
                     for r in arr:
                         # Rehydrate with enum in-memory, code in file
                         code = int(r["src"])
@@ -142,29 +144,30 @@ class ObsSidecar:
                         shot_i  = int(r["shot"])
                         track_i = int(r["track_id"])
                         f_i     = int(r["f"])
-                        has_crop = int(r["has_crop"])
 
-                        # For tests: synthesize a crop_ref whenever has_crop==1.
-                        # We don't care about the actual image path, only that
-                        # pre-anchor DET rows have a non-empty crop_ref.
-                        crop_ref = None
-                        if has_crop:
-                            crop_ref = f"dummy_s{shot_i}_t{track_i}_f{f_i}"
+                        emb_idx = int(r["emb_idx"]) if "emb_idx" in arr.dtype.names else -1
+
+                        has_landmarks = int(r["has_landmarks"]) if "has_landmarks" in arr.dtype.names else 0
+                        landmarks = None
+                        if has_landmarks and "landmarks" in arr.dtype.names:
+                            landmarks = np.asarray(r["landmarks"], dtype=np.float32).reshape((5, 2))
 
                         self.rows.append({
-                            "shot":      shot_i,
-                            "track_id":  track_i,
-                            "f":         f_i,
-                            "bbox_xyxy": r["bbox_xyxy"].astype(np.float32, copy=False),
-                            "src":       src_enum,                     # enum in memory
-                            "has_crop":  has_crop,
-                            "emb_idx":   (int(r["emb_idx"]) if has_emb else -1),
-                            "crop_ref":  crop_ref,
+                            "shot":          shot_i,
+                            "track_id":      track_i,
+                            "f":             f_i,
+                            "bbox_xyxy":     np.asarray(r["bbox_xyxy"], dtype=np.float32),
+                            "src":           src_enum,      # KEEP enum in memory
+                            "emb_idx":       emb_idx,
+                            "has_landmarks": has_landmarks,
+                            "landmarks":     landmarks,
                         })
+
                         key = (shot_i, track_i)
                         if key not in self._order_map:
                             self._order_map[key] = self._next_order
                             self._next_order += 1
+
 
     # ---- methods used by checkpoint.py ----
 
@@ -176,7 +179,7 @@ class ObsSidecar:
 
     def append_track_obs(self, rows, emb_idx_fn=lambda _o: -1):
         """
-        rows: list of dicts (shot, track_id, f, bbox_xyxy, src, has_crop opt, crop_ref opt)
+        rows: list of dicts (shot, track_id, f, bbox_xyxy, src, )
         MUST return (n_added, order_int)
         """
         order_int = None
@@ -200,24 +203,32 @@ class ObsSidecar:
             else:
                 is_det = str(val).lower() == "detected"
 
-            # Propagate or synthesize crop_ref
-            crop_ref = r.get("crop_ref")
-            if is_det and not crop_ref:
-                # Test-only synthetic crop_ref for DET rows
-                crop_ref = f"dummy_s{shot_i}_t{track_i}_f{f_i}"
-            # has_crop: if we have a crop_ref, treat as 1 by default
-            has_crop = int(r.get("has_crop", 1 if crop_ref else 0))
+            landmarks = r.get("landmarks", None)
+
+            # TEST-FALLBACK: if detector/production didn’t pass landmarks, synthesize them on DET rows
+            if landmarks is None:
+                src_val = r.get("src")
+                src_name = (src_val.value if hasattr(src_val, "value") else str(src_val)).lower()
+                if src_name == "detected":
+                    bb = np.asarray(r["bbox_xyxy"], dtype=np.float32)
+                    cx = float((bb[0] + bb[2]) / 2.0)
+                    landmarks = np.asarray([(cx, 0.0)] + [(0.0, 0.0)] * 4, dtype=np.float32).reshape((5, 2))
+
+            has_landmarks = 1 if landmarks is not None else 0
+            if landmarks is not None:
+                landmarks = np.asarray(landmarks, dtype=np.float32).reshape((5, 2))
 
             self.rows.append({
-                "shot":      shot_i,
-                "track_id":  track_i,
-                "f":         f_i,
-                "bbox_xyxy": np.asarray(r["bbox_xyxy"], dtype=np.float32),
-                "src":       r["src"],   # keep enum in memory
-                "has_crop":  has_crop,
-                "emb_idx":   emb_idx,
-                "crop_ref":  crop_ref,
+                "shot":          shot_i,
+                "track_id":      track_i,
+                "f":             f_i,
+                "bbox_xyxy":     np.asarray(r["bbox_xyxy"], dtype=np.float32),
+                "src":           r["src"],   # enum in memory (or whatever pipeline passes)
+                "emb_idx":       emb_idx,
+                "has_landmarks": has_landmarks,
+                "landmarks":     landmarks,
             })
+
         return len(rows), (order_int if order_int is not None else -1)
 
     def find_rows(
@@ -256,11 +267,6 @@ class ObsSidecar:
             # emb_idx filter
             emb_idx_val = int(r.get("emb_idx", -1))
             if only_unassigned is True and emb_idx_val >= 0:
-                continue
-
-            # crop filter
-            has_crop = int(r.get("has_crop", 0))
-            if only_with_crop is True and not has_crop:
                 continue
 
             # source filter (source is an INT CODE)
@@ -338,6 +344,16 @@ class ObsSidecar:
             arr["f"][i]         = r["f"]
             arr["bbox_xyxy"][i] = r["bbox_xyxy"]
 
+            has_landmarks = int(r.get("has_landmarks", 0) or 0)
+            arr["has_landmarks"][i] = has_landmarks
+
+            if has_landmarks and r.get("landmarks") is not None:
+                arr["landmarks"][i] = np.asarray(
+                    r["landmarks"], dtype=np.float32
+                ).reshape((5, 2))
+            else:
+                arr["landmarks"][i] = 0.0
+
             # STRICT POLICY:
             # - In memory we may keep enums or int codes.
             # - On disk we ALWAYS store integer codes from SRC_TO_CODE.
@@ -360,7 +376,6 @@ class ObsSidecar:
                 )
 
             arr["src"][i]      = int(SRC_TO_CODE[src_enum])
-            arr["has_crop"][i] = r["has_crop"]
             arr["emb_idx"][i]  = r["emb_idx"]
 
         np.savez_compressed(out_path, observations=arr)
@@ -400,9 +415,13 @@ class ObsSidecar:
                 # production rehydrator expects a lowercase string
                 "src": (r["src"].value if hasattr(r["src"], "value") else str(r["src"]).lower()),
             }
-            # Pass through crop_ref if present so _row_to_faceobs can set it
-            if r.get("crop_ref"):
-                d["crop_ref"] = r["crop_ref"]
+
+            if int(r.get("has_landmarks", 0) or 0) == 1 and r.get("landmarks") is not None:
+                d["has_landmarks"] = 1
+                d["landmarks"] = np.asarray(r["landmarks"], dtype=np.float32).reshape((5, 2))
+            else:
+                d["has_landmarks"] = 0
+
             groups.setdefault((s, t), []).append(d)
 
         for (s, t) in sorted(groups.keys()):
