@@ -1,14 +1,12 @@
 import json
 import numpy as np
 import pytest
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 from fractions import Fraction
 
 from tests.utils.video_mocks import make_pyav_like_frames 
 import facekit.pipeline.track_across_segments as tacs
 from facekit.pipeline.track_across_segments import track_across_segments
-from tests.utils.video_mocks import make_pyav_like_frames
 
 @pytest.fixture
 def dummy_video(tmp_path):
@@ -16,7 +14,40 @@ def dummy_video(tmp_path):
     dummy_path.write_bytes(b"not a real video")
     return str(dummy_path)
 
-def test_track_across_segments_with_mock_av(tmp_path):
+def _install_asserting_aligner(monkeypatch, *, expected_first_x_fn):
+    """
+    Monkeypatch align_face_for_arcface with an assertion-heavy stub.
+
+    expected_first_x_fn(frame_idx) -> float:
+        returns the expected value for landmarks[0][0] for that DET call.
+        (You choose the contract per test: frame-based, call-based, etc.)
+    """
+    import numpy as _np
+
+    def _asserting_align(frame, landmarks, frame_idx=None, source=None, *, return_meta=False):
+        assert frame_idx is not None, "aligner called with frame_idx=None"
+        assert landmarks is not None, "aligner called with landmarks=None"
+        arr = _np.asarray(landmarks, dtype=_np.float32)
+
+        # Accept either (5,2) or (1,5,2) and normalize to (5,2)
+        if arr.shape == (1, 5, 2):
+            arr = arr[0]
+        assert arr.shape == (5, 2), f"expected (5,2) landmarks, got {arr.shape}"
+        assert _np.all(_np.isfinite(arr)), "landmarks contain NaN/Inf"
+
+        # Strong semantic check (not just > 0)
+        exp = float(expected_first_x_fn(frame_idx))
+        got = float(arr[0, 0])
+        assert got == exp, f"landmark corruption: expected arr[0,0]={exp} got {got} (frame_idx={frame_idx})"
+
+        chip = _np.zeros((112, 112, 3), dtype=_np.uint8)
+        if return_meta:
+            return chip, {"frame_idx": frame_idx, "source": source}
+        return chip
+
+    monkeypatch.setattr(tacs, "align_face_for_arcface", _asserting_align, raising=True)
+
+def test_track_across_segments_with_mock_av(tmp_path, monkeypatch):
     dummy_shot_json = tmp_path / "shot_features.json"
     shots = [
         {"shot_number": 1, "first_frame": 0, "last_frame": 2},
@@ -31,15 +62,40 @@ def test_track_across_segments_with_mock_av(tmp_path):
 
         def init_trackers(self, frame, boxes, track_ids=None, *a, **k):
             self.trackers = list(boxes)
-            # Mirror aggregator behavior in this code path: IDs start at 2
-            n = len(self.trackers)
             self.track_ids = list(track_ids) if track_ids is not None else list(range(len(self.trackers)))
 
         def update_trackers(self, frame):
             return {tid: box for tid, box in zip(self.track_ids, self.trackers)}
-        
+
+    class FakeDetector:
+        def __init__(self):
+            self.calls = 0
+
+        def detect_faces_in_frame(self, frame, target_size=640):
+            self.calls += 1
+            boxes = [(10, 10, 50, 50)]
+            # Encode FRAME INDEX (+1) into landmarks[0][0].x (stronger than call count)
+            # NOTE: track_across_segments passes the absolute frame index to aligner as frame_idx.
+            # We don't have frame_idx here, so just encode call count and validate via call count
+            # OR switch to frame_idx encoding by using the aligner meta instead (see below).
+            x = float(self.calls)
+            landmarks = [[(x, 0.0)] + [(0.0, 0.0)] * 4]
+            confidences = [0.99]
+            return boxes, landmarks, confidences
+
+    det = FakeDetector()
+
+    # Expected landmark x equals detector call count *at the time aligner is called*.
+    # Since aligner is invoked on each detection, this should match 1..N in order.
+    align_calls = {"n": 0}
+    def _expected(_frame_idx):
+        align_calls["n"] += 1
+        return float(align_calls["n"])
+
+    _install_asserting_aligner(monkeypatch, expected_first_x_fn=_expected)
+
     with patch("facekit.utils.video_reader.av.open") as mock_av_open, \
-     patch.object(tacs, "FaceTracker", FakeTracker):
+         patch.object(tacs, "FaceTracker", FakeTracker):
         mock_container = MagicMock()
         mock_stream = MagicMock()
         mock_stream.type = "video"
@@ -48,23 +104,15 @@ def test_track_across_segments_with_mock_av(tmp_path):
         mock_container.decode.return_value = make_pyav_like_frames(8)
         mock_av_open.return_value = mock_container
 
-        class FakeDetector:
-            def detect_faces_in_frame(self, frame, target_size=640):
-                boxes = [(10, 10, 50, 50)]
-                landmarks = [[(38, 52), (73, 52), (56, 72), (42, 92), (71, 92)]]
-                confidences = [0.99]
-                return boxes, landmarks, confidences
-
         class FakeEmbedder:
             def get_embedding_batch(self, aligned_faces, batch_size=32):
-                # Shape: (K, 512), float32
                 K = len(aligned_faces)
                 return np.ones((K, 512), dtype=np.float32)
 
         tracks = track_across_segments(
             frame_source="dummy.mp4",
             shot_json_path=str(dummy_shot_json),
-            detector=FakeDetector(),
+            detector=det,
             embedder=FakeEmbedder(),
         )
 
@@ -75,15 +123,26 @@ def test_all_tracks_have_valid_segment_ids(monkeypatch, dummy_video, tmp_path):
     dummy_shot_json = tmp_path / "shot_features.json"
     dummy_shot_json.write_text(json.dumps({"shots": [{"shot_number": 1, "first_frame": 0, "last_frame": 4}]}))
 
+    _calls = {"n": 0}
+
     def fake_detect_faces_in_frame(frame, target_size=640):
+        _calls["n"] += 1
         boxes = [(10, 10, 50, 50)]
-        landmarks = [[(38, 52), (73, 52), (56, 72), (42, 92), (71, 92)]]
+        x = float(_calls["n"])
+        landmarks = [[(x, 0.0)] + [(0.0, 0.0)] * 4]
         confidences = [0.99]
         return boxes, landmarks, confidences
 
     class FakeDetector:
         def detect_faces_in_frame(self, frame, target_size=640):
             return fake_detect_faces_in_frame(frame, target_size)
+        
+    align_calls = {"n": 0}
+    def _expected(_frame_idx):
+        align_calls["n"] += 1
+        return float(align_calls["n"])
+
+    _install_asserting_aligner(monkeypatch, expected_first_x_fn=_expected)
 
     class FakeEmbedder:
         def get_embedding_batch(self, aligned_faces, batch_size=32):
@@ -243,13 +302,31 @@ def test_align_face_returns_none_is_skipped(tmp_path, monkeypatch):
         mock_open.side_effect = lambda *a, **k: make_context()
 
         class FakeDetector:
+            def __init__(self):
+                self.calls = 0
             def detect_faces_in_frame(self, frame, target_size=640):
-                return [(10, 10, 50, 50)], [[(20, 20)] * 5], [0.9]
+                self.calls += 1
+                x = float(self.calls)
+                return [(10, 10, 50, 50)], [[(x, 0.0)] + [(0.0, 0.0)] * 4], [0.9]
 
         # Force align_face_for_arcface to return None on odd calls
         calls = {"n": 0}
-        def fake_align(frame, lm, frame_idx=None, source=None):
+
+        def fake_align(frame, landmarks, frame_idx=None, source=None):
             calls["n"] += 1
+
+            arr = np.asarray(landmarks, dtype=np.float32)
+            if arr.shape == (1, 5, 2):
+                arr = arr[0]
+            assert arr.shape == (5, 2)
+            assert np.all(np.isfinite(arr))
+
+            expected_x = float(calls["n"])
+            actual_x = float(arr[0, 0])
+            assert actual_x == expected_x, (
+                f"expected landmarks[0][0].x={expected_x} but got {actual_x} (align call {calls['n']})"
+            )
+
             return None if calls["n"] % 2 else np.zeros((112, 112, 3), dtype=np.uint8)
 
         monkeypatch.setattr(tacs, "align_face_for_arcface", fake_align)

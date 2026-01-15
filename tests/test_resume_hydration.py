@@ -34,20 +34,31 @@ class DummyAggregator(ShotFaceTrackAggregatorProtocol):
         self.tracks = list(tracks or [])
 
 # ---------- helpers ----------
+def _lm5(f: int):
+    """
+    Produce a valid 5x2 landmark list for DETECTED rows.
+    Keep it deterministic and finite.
+    """
+    x = float(f + 1)
+    return [(x, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]
 
-def mk_obs_block(n, *, shot=3, track_id=7, f_start=0):
+
+def mk_obs_block(n, *, shot=3, track_id=7, f_start=0, src="detected"):
     """Produce n normalized obs dicts suitable for ObservationsCollector.append_track_obs."""
     rows = []
     for i in range(n):
         f = f_start + i
-        rows.append({
+        row = {
             "shot": int(shot),
             "track_id": int(track_id),
             "f": int(f),
             "bbox_xyxy": [10.0, 20.0, 30.0, 40.0],  # valid box
-            "src": "detected",                      # matches VALID_SOURCES / SRC_TO_CODE
+            "src": src,                              # "detected" or "tracked"
             "conf": 0.9,
-        })
+        }
+        if str(src).lower() == "detected":
+            row["landmarks"] = _lm5(f)
+        rows.append(row)
     return rows
 
 def write_status(path, **kw):

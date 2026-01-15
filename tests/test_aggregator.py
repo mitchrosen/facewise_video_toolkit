@@ -21,14 +21,17 @@ def test_single_observation_creates_one_track():
     assert len(tracks) == 1
     assert tracks[0].get_frame_indices() == [0]
 
-def test_same_face_across_multiple_frames():
+def test_preassigned_track_id_extends_existing_track():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
-    obs1 = make_obs(0, (10, 10, 50, 50))
-    obs2 = make_obs(1, (11, 11, 51, 51))
-    aggregator.update_tracks_with_frame(0, [obs1])
-    aggregator.update_tracks_with_frame(1, [obs2])
+    # frame 0 creates track 0
+    aggregator.update_tracks_with_frame(0, [make_obs(0, (10,10,50,50))])
+    # frame 1: caller explicitly assigns to track 0
+    obs = make_obs(1, (11,11,51,51))
+    obs.track_id = 0
+    aggregator.update_tracks_with_frame(1, [obs])
     tracks = aggregator.finalize_tracks()
     assert len(tracks) == 1
+    assert tracks[0].track_id == 0
     assert tracks[0].get_frame_indices() == [0, 1]
 
 def test_different_faces_create_different_tracks():
@@ -51,19 +54,17 @@ def test_multiple_faces_same_frame():
     assert len(tracks) == 2
     assert all([track.get_frame_indices() == [0] for track in tracks])
 
-def test_track_extension_and_creation():
+def test_preassigned_and_unassigned_create_and_extend():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
-    obs1 = make_obs(0, (10, 10, 50, 50))
-    obs2 = make_obs(1, (11, 11, 51, 51))  # Should match obs1
-    obs3 = make_obs(1, (100, 100, 140, 140))  # New face
-
-    aggregator.update_tracks_with_frame(0, [obs1])
-    aggregator.update_tracks_with_frame(1, [obs2, obs3])
-
+    aggregator.update_tracks_with_frame(0, [make_obs(0, (10,10,50,50))])  # creates tid=0
+    obs_extend = make_obs(1, (11,11,51,51))
+    obs_extend.track_id = 0  # caller assigns
+    obs_new = make_obs(1, (100,100,140,140))  # caller leaves unassigned => new track
+    aggregator.update_tracks_with_frame(1, [obs_extend, obs_new])
     tracks = aggregator.finalize_tracks()
     assert len(tracks) == 2
-    lengths = sorted(len(track.observations) for track in tracks)
-    assert lengths == [1, 2]
+    lens = sorted(len(t.observations) for t in tracks)
+    assert lens == [1, 2]
 
 def test_get_tracks_in_frame():
     aggregator = ShotFaceTrackAggregator(shot_number=1)
