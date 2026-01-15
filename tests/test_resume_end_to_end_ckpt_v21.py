@@ -13,6 +13,7 @@ from facekit.output.json_v2 import (
 )
 from facekit.pipeline.track_across_segments import track_across_segments
 from facekit.io.frame_provider import ReaderCoordinator
+from facekit.common.obs_consts import Source, src_to_code
 
 @dataclass
 class SimpleObs:
@@ -63,9 +64,9 @@ class NoCrashDetector(CrashAfterNDetections):
         super().__init__(crash_at=None)
 
 class DummyEmbedder:
-    """Return (K,512) zeros float32 for any K crops."""
-    def get_embedding_batch(self, crops, batch_size=32):
-        K = len(crops or [])
+    """Return (K,512) zeros float32 for any K aligned faces."""
+    def get_embedding_batch(self, aligned_faces, batch_size=32):
+        K = len(aligned_faces or [])
         return np.zeros((K, 512), dtype=np.float32)
 
 # --- Shot JSON helper -------------------------------------------------------
@@ -218,17 +219,51 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
 
 def test_iter_tracks_filters_and_groups(tmp_path: Path):
     oc = ObservationsCollector()
-    # 3 rows: two before 10, one after
+
+    # Minimal valid 5x2 landmarks for DETECTED rows
+    def lm(x: float):
+        return np.asarray(
+            [[x, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            dtype=np.float32,
+        )
+
     rows = [
-        {"shot":1,"track_id":7,"f":5,"bbox_xyxy":[0,0,10,10],"src":"detected"},
-        {"shot":1,"track_id":7,"f":9,"bbox_xyxy":[1,1,11,11],"src":"tracked"},
-        {"shot":1,"track_id":7,"f":12,"bbox_xyxy":[2,2,12,12],"src":"detected"},
+        # DETECTED rows MUST have landmarks under the new contract
+        {
+            "shot": 1,
+            "track_id": 7,
+            "f": 5,
+            "bbox_xyxy": [0, 0, 10, 10],
+            "src": int(src_to_code(Source.DETECTED.value)),
+            "has_landmarks": 1,
+            "landmarks": lm(5.0),
+        },
+        # TRACKED row: landmarks optional
+        {
+            "shot": 1,
+            "track_id": 7,
+            "f": 9,
+            "bbox_xyxy": [1, 1, 11, 11],
+            "src": int(src_to_code(Source.TRACKED.value)),
+        },
+        {
+            "shot": 1,
+            "track_id": 7,
+            "f": 12,
+            "bbox_xyxy": [2, 2, 12, 12],
+            "src": int(src_to_code(Source.DETECTED.value)),
+            "has_landmarks": 1,
+            "landmarks": lm(12.0),
+        },
     ]
+
     oc.append_track_obs(rows, emb_idx_fn=lambda _: -1)
+
     groups_all = list(oc.iter_tracks(frame_max=None))
     groups_10 = list(oc.iter_tracks(frame_max=10))
-    assert len(groups_all) == 1 and groups_all[0][0:2] == (1,7)
-    assert [d["f"] for d in groups_10[0][2]] == [5,9]
+
+    assert len(groups_all) == 1 and groups_all[0][0:2] == (1, 7)
+    assert [d["f"] for d in groups_10[0][2]] == [5, 9]
 
 def test_embeddingcollector_get_many():
     ec = EmbeddingCollector(mode="sidecar", dim=4)
@@ -259,7 +294,8 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_crop", "i4"),
+        ("has_landmarks", "i4"),
+        ("landmarks", "f4", (10,)),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
 
@@ -323,7 +359,8 @@ def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_crop", "i4"),
+        ("has_landmarks", "i4"),
+        ("landmarks", "f4", (10,)),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
     np.savez(emb_sidecar, embeddings=np.zeros((0, 512), dtype=np.float32))

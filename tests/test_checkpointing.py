@@ -27,10 +27,26 @@ class RecordingEmb(RecordingObs): pass
 class DummyTrack:
     def __init__(self, tid, bbox, last_f, last_det, closed, shot_id=6):
         self.track_id = int(tid)
+        self.shot_id = int(shot_id)
+
         self.last_bbox = tuple(int(v) for v in bbox[:4])
         self.last_frame_idx = int(last_f)
         self.last_det_frame_idx = int(last_det)
         self.closed = bool(closed)
+
+    # ---- TrackLike / checkpoint contract (method-based) ----
+    def last_frame(self) -> int:
+        return int(self.last_frame_idx)
+
+    def last_det_frame(self) -> Optional[int]:
+        # In your tests you always provide last_det, but keep this safe.
+        return None if self.last_det_frame_idx is None else int(self.last_det_frame_idx)
+
+    def get_last_bbox(self) -> Optional[Tuple[int, int, int, int]]:
+        return None if self.last_bbox is None else tuple(self.last_bbox)
+
+    def is_closed(self) -> bool:
+        return bool(self.closed)
 
 class DummyAggregator:
     def __init__(self, tracks=None, shot_number=6):
