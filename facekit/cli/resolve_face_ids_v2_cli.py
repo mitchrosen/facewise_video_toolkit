@@ -1,6 +1,8 @@
 import argparse
 import json
-import shutil
+import math
+import numpy as np
+unoirt cv2
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from contextlib import ExitStack
@@ -35,6 +37,8 @@ from facekit.output.json_v2 import (
     ObservationsCollector
 )
 from facekit.errors import ResumeSafetyError
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class SimpleObs:
@@ -75,12 +79,6 @@ def _device(arg_device: str) -> str:
     if arg_device == "cpu":
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-def _atomic_copy(src: Path, dst: Path) -> None:
-    dst = Path(dst)
-    tmp = dst.with_suffix(dst.suffix + ".tmp")
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dst)
 
 def _validate_manifest_dict(
         manifest: dict, 
