@@ -267,19 +267,6 @@ def test_does_not_merge_dissimilar_embeddings():
     assert t1.segment_id != t2.segment_id
     assert counter == 2  # both tracks got unique segments
 
-# def test_preserves_preassigned_segment_id():
-#     aggregator = ShotFaceTrackAggregator(shot_number=0)
-#     t1 = make_track(0, random_embedding(seed=1))
-#     t1.segment_id = 42  # preassigned
-#     t2 = make_track(1, t1._embedding, first_frame=1)
-
-#     aggregator.tracks.extend([t1, t2])
-#     counter = aggregator.resolve_segment_ids(0)
-
-#     # t1 keeps its ID, t2 reuses it
-#     assert t1.segment_id == 42
-#     assert t2.segment_id == 42
-
 def test_segment_id_reuse_on_embedding_similarity():
     aggregator = ShotFaceTrackAggregator(shot_number=0)
     emb = random_embedding(seed=1)

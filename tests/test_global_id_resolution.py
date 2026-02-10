@@ -68,9 +68,11 @@ def test_clusters_get_same_global_id():
     # Cluster A
     emb_a = make_vector(angle_rad=0, seed=1)
     emb_b = make_vector(angle_rad=np.arccos(0.99), seed=2)     # sim ~ 0.99
-    # Cluster B: also tight (> 0.97)
-    emb_c = make_vector(angle_rad=np.arccos(0.975), seed=3)    # sim ~ 0.975
-    emb_d = make_vector(angle_rad=np.arccos(0.972), seed=4)    # sim ~ 0.972
+    # Cluster B: tight internally, but clearly separated from cluster A.
+    # 0.40 / 0.42 rad are ~23° / ~24°, so internal sim is ~0.9998 while
+    # cross-cluster sim to angle 0 stays below 0.95.
+    emb_c = make_vector(angle_rad=0.40, seed=3)
+    emb_d = make_vector(angle_rad=0.42, seed=4)
 
     # Put the two tight pairs in different shots so the resolver is allowed to merge them.
     tracks = [
@@ -99,8 +101,9 @@ def test_threshold_boundary_behavior():
     emb_c = make_vector(angle_rad=np.arccos(0.95), seed=12)  # exactly threshold
     emb_d = make_vector(angle_rad=np.arccos(0.96), seed=13)  # above threshold
 
-    # A and B: below threshold => no merge
-    tracks = [make_track(0, emb_a), make_track(1, emb_b)]
+    # A and B: below threshold => no merge.
+    # Put them in different shots so only the similarity threshold is being tested.
+    tracks = [make_track(0, emb_a, shot_id=0), make_track(1, emb_b, shot_id=1)]
     resolver.resolve_global_ids(tracks, start_id=0)
     assert tracks[0].global_id != tracks[1].global_id
 
@@ -132,7 +135,8 @@ def test_noise_effect_on_merging():
     resolver = GlobalIdentityResolver(embedding_threshold=0.99)
     emb_ref = make_vector(angle_rad=0, seed=100)
     emb_noisy = make_vector(angle_rad=0, noise=0.1, seed=101)
-    tracks = [make_track(0, emb_ref), make_track(1, emb_noisy)]
+    # Different shots so only embedding similarity is under test.
+    tracks = [make_track(0, emb_ref, shot_id=0), make_track(1, emb_noisy, shot_id=1)]
     resolver.resolve_global_ids(tracks, start_id=0)
     assert tracks[0].global_id != tracks[1].global_id
 
@@ -142,9 +146,10 @@ def test_cluster_assignment_in_mixed_scenario():
     # Put the two clusters in different shots; outlier in its own shot.
     t1 = make_track(0, make_vector(angle_rad=0, seed=1),               shot_id=0)
     t2 = make_track(1, make_vector(angle_rad=np.arccos(0.98), seed=2), shot_id=0)
-    # Cluster 2: tight, ~0.95+
-    t3 = make_track(2, make_vector(angle_rad=np.arccos(0.955), seed=3), shot_id=1)
-    t4 = make_track(3, make_vector(angle_rad=np.arccos(0.953), seed=4), shot_id=1)
+    # Cluster 2: tight internally, but clearly separated from cluster 1.
+    # 0.50 / 0.52 rad give internal sim ~0.9998 and cross-cluster sim ~0.88.
+    t3 = make_track(2, make_vector(angle_rad=0.50, seed=3), shot_id=1)
+    t4 = make_track(3, make_vector(angle_rad=0.52, seed=4), shot_id=1)
     # Outlier
     t5 = make_track(4, make_vector(angle_rad=np.arccos(0.0),  seed=5), shot_id=2)
 

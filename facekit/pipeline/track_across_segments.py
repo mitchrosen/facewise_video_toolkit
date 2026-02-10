@@ -12,14 +12,18 @@ from facekit.tracking.face_tracker import FaceTracker
 from facekit.tracking.tracker_validator import TrackerValidator, ValidatorParams
 from facekit.embedding.embedder import FaceEmbedder
 from facekit.embedding.alignment import align_face_for_arcface
+from facekit.embedding.embedding_queue import AlignedFaceEmbeddingQueue
 from facekit.detection.face_detector import FaceDetector
 from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 from facekit.common.obs_consts import Source
+from facekit.utils.geometry import compute_iou 
+
 from facekit.pipeline.resume_rehydrate import (
     ResumePlan,
     _build_resume_plan,
     _validate_shots_are_absolute_and_increasing,
+    bootstrap_runtime_trackers_for_resume_frame,
 )
 from facekit.pipeline.checkpoint_io import (
     _checkpoint_root_dir,
@@ -31,6 +35,24 @@ from facekit.pipeline.checkpoint_io import (
 from facekit.errors import ResumeSafetyError
 
 logger = logging.getLogger(__name__)
+
+def _snapshot_open_tracks_for_status(aggregator, shot_number: int) -> list[dict]:
+    rows: list[dict] = []
+    for t in getattr(aggregator, "tracks", []):
+        try:
+            is_closed = t.is_closed() if callable(getattr(t, "is_closed", None)) else bool(getattr(t, "is_closed", False))
+        except Exception:
+            is_closed = False
+        if is_closed:
+            continue
+        rows.append(
+            {
+                "shot": int(shot_number),
+                "track_id": int(getattr(t, "track_id")),
+            }
+        )
+    rows.sort(key=lambda r: (int(r["shot"]), int(r["track_id"])))
+    return rows
 
 def _init_shot_aggregator(
     *,
@@ -85,8 +107,10 @@ def _init_shot_aggregator(
             Initial segment_id_counter seed for this shot (used at resolve_segment_ids()).
     """
     # Decide starting frame
-    if shot_idx == 0:
-        start_at = max(first, resume_plan.anchor_frame)
+    # Under the embedding-safe-frame contract, resume begins at the frame
+    # *following* the embedding-safe frame.
+    if shot_idx == 0 and resume_plan.is_resume:
+        start_at = max(first, int(resume_plan.anchor_frame) + 1)
     else:
         start_at = first
 
@@ -103,8 +127,14 @@ def _init_shot_aggregator(
             raise ResumeSafetyError(
                 f"empty work-range at resume: start_at={start_at} > shot_last={last} for shot={shot_number}"
             )
+        
+    is_resume_shot = (
+        shot_idx == 0
+        and resume_plan.is_resume
+        and int(shot_number) == int(resume_plan.first_processed_shot_number)
+    )
 
-    # Seeded tracks only for anchor-containing shot
+    # Seeded tracks only for the anchor-containing resume shot.
     seeded_tracks = None
     if (
         shot_idx == 0
@@ -117,6 +147,48 @@ def _init_shot_aggregator(
             if int(getattr(t, "shot_id", -1)) == int(shot_number)
         ]
 
+        # Normalize seeded track lifecycle from checkpoint-declared open ids.
+        # Having pre-resume observations does not, by itself, mean the track was
+        # still open at the embedding-safe boundary.
+        open_tids = set(getattr(resume_plan, "open_track_ids_anchor", frozenset()))
+        for t in seeded_tracks:
+            tid = int(getattr(t, "track_id", -1))
+            if tid in open_tids:
+                if hasattr(t, "mark_open") and callable(getattr(t, "mark_open")):
+                    t.mark_open()
+            else:
+                if hasattr(t, "mark_closed") and callable(getattr(t, "mark_closed")):
+                    t.mark_closed()
+            t.is_active = False
+
+        # Resume-shot seeded tracks should enter resolve_segment_ids() in the same
+        # shot-local state as a cold run: track continuity preserved, but no
+        # preassigned shot-local segment labels.
+        if is_resume_shot:
+            for t in seeded_tracks:
+                setattr(t, "segment_id", None)
+
+        # Preserve only the checkpoint-declared OPEN tracks as open for resume.
+        # A rehydrated track having pre-resume observations does NOT imply it was
+        # still live at the embedding-safe boundary.
+        open_tids = set(getattr(resume_plan, "open_track_ids_anchor", frozenset()))
+        for t in seeded_tracks:
+            tid = int(getattr(t, "track_id", -1))
+            if tid in open_tids:
+                if hasattr(t, "mark_open") and callable(getattr(t, "mark_open")):
+                    t.mark_open()
+            else:
+                if hasattr(t, "mark_closed") and callable(getattr(t, "mark_closed")):
+                    t.mark_closed()
+            t.is_active = False
+
+        # For the resume shot, preserve the warm-start track state but clear any
+        # preassigned segment_id so resolve_segment_ids() sees the same shot-local
+        # input state as a cold run.
+        if is_resume_shot:
+            for t in seeded_tracks:
+                setattr(t, "segment_id", None)
+
     # Build aggregator
     if seeded_tracks:
         aggregator = ShotFaceTrackAggregator(
@@ -127,8 +199,10 @@ def _init_shot_aggregator(
             resume_abs_frame=start_at,
             next_tid_seed=int(resume_plan.trackid_seed_by_shot.get(int(shot_number), 0)),
         )
+
         if checkpoint:
             checkpoint.hydrate_open_tracks_into(aggregator)
+
     else:
         aggregator = ShotFaceTrackAggregator(
             shot_number=shot_number,
@@ -143,25 +217,24 @@ def _init_shot_aggregator(
         and resume_plan.reuse_tid_for_first_shot is not None
         and int(shot_number) == int(resume_plan.first_processed_shot_number)
     ):
-        try:
-            aggregator.set_resume_force_tid(int(resume_plan.reuse_tid_for_first_shot))
-            logging.info(
-                "resume: aggregator will force tid=%d on the next created track in shot=%d",
-                int(resume_plan.reuse_tid_for_first_shot),
-                int(shot_number),
-            )
-        except Exception:
-            logging.exception("resume: failed to set forced tid on aggregator")
+        logging.info(
+            "resume: suppressing forced tid reuse=%d in shot=%d because seeded tracks already exist",
+            int(resume_plan.reuse_tid_for_first_shot),
+            int(shot_number),
+        )
 
     if seeded_tracks:
         logging.info("RESUME: aggregator seeded with %d tracks", len(aggregator.tracks))
         for track in aggregator.tracks:
             last_bbox = getattr(track, "get_last_bbox", lambda: None)()
             logging.info(
-                "RESUME TRACK: tid=%s closed=%s last_frame=%s last_bbox=%s",
-                track.track_id,
+                "RESUME TRACK: shot=%s tid=%s seg=%s first=%s last=%s closed=%s last_bbox=%s",
+                getattr(track, "shot_id", None),
+                getattr(track, "track_id", None),
+                getattr(track, "segment_id", None),
+                (track.first_frame() if hasattr(track, "first_frame") else None),
+                (track.last_frame() if hasattr(track, "last_frame") else None),
                 track.is_closed() if hasattr(track, "is_closed") else None,
-                track.last_frame() if hasattr(track, "last_frame") else None,
                 last_bbox,
             )
 
@@ -169,6 +242,11 @@ def _init_shot_aggregator(
     seg_seed = int(
         resume_plan.segment_id_seed_by_shot.get(int(shot_number), 0)
     ) if resume_plan.segment_id_seed_by_shot else 0
+
+    # For the resume shot, segment-id resolution should begin from the same
+    # shot-local seed as a cold run.
+    if is_resume_shot:
+        seg_seed = 0
 
     logging.info(
         "shot=%d init: aggregator.next_track_id=%d, seed_tid=%d, seg_seed=%d",
@@ -332,34 +410,16 @@ def _collect_aligned_faces_for_embedding(
         #     except Exception:
         #         logging.exception("embed-load: failed to load crop %s", cr)
 
-        # only embed from DETECTED observations (landmarks required)
+        # Only embed from DETECTED observations
         if getattr(obs, "source", None) != Source.DETECTED:
             continue
 
-        landmarks = getattr(obs, "landmarks", None)
-        if landmarks is None:
+        # Skip if already embedded
+        if getattr(obs, "embedding", None) is not None:
             continue
 
-        # Re-read the frame
-        try:
-            frame = frame_provider.get_frame(frame_idx)
-            if frame is None:
-                continue
-        except Exception:
-            logging.exception("embed-collect: failed to re-read frame=%s", frame_idx)
-            continue
-
-        # Align
-        try:
-            aligned = align_face_for_arcface(frame, landmarks, frame_idx, source="embed")
-        except Exception:
-            logging.exception(
-                "embed-collect: align failed track_id=%s frame=%s",
-                getattr(track, "track_id", None),
-                frame_idx,
-            )
-            continue
-
+        # Must already have aligned_face cached
+        aligned = getattr(obs, "aligned_face", None)
         if aligned is None:
             continue
 
@@ -367,9 +427,6 @@ def _collect_aligned_faces_for_embedding(
         frames_for_embed.append(frame_idx)
 
     return aligned_faces, frames_for_embed
-
-from facekit.utils.geometry import compute_iou  # add if not already imported
-
 
 def extend_prev_track_for_overlapping_detection(
     *,
@@ -442,7 +499,94 @@ def extend_prev_track_for_overlapping_detection(
 
     return matched
 
+def _attach_and_persist_embedded_obs(
+    *,
+    embedded_obs: list[FaceObservation],
+    aggregator: ShotFaceTrackAggregator,
+    checkpoint: TrackingCheckpoint | None,
+    shot_number: int,
+    shot_first_frame: int | None,
+    safe_frame_idx: int | None = None,
+) -> None:
+    """
+    For a batch of observations that have just been embedded:
+      - attach embeddings to the aggregator per track_id
+      - persist embeddings per track via _persist_embeddings_for_track
+      - record an embedding-safe anchor after successful persistence (checkpointing only)
 
+    Notes
+    -----
+    The "embedding payload frame" and the "embedding-safe frame" are not always the same.
+    - payload frame: newest frame that actually contributed embeddings in this batch
+    - safe frame: frame whose processing completed the flush/drain boundary
+
+    If `safe_frame_idx` is provided, it is the authoritative embedding-safe frame.
+    Otherwise we fall back to the newest persisted payload frame.
+    """
+    if not embedded_obs:
+        return
+
+    # Group by track_id
+    by_tid: dict[int, list[FaceObservation]] = {}
+    for ob in embedded_obs:
+        tid = getattr(ob, "track_id", None)
+        emb = getattr(ob, "embedding", None)
+        if tid is None or emb is None:
+            continue
+        by_tid.setdefault(int(tid), []).append(ob)
+
+    # Track the newest frame whose embeddings were actually persisted in this batch.
+    max_persisted_frame: int | None = None
+
+    for tid, obs_list in by_tid.items():
+        # Ensure stable ordering by frame index
+        obs_list.sort(key=lambda o: int(o.frame_idx))
+
+        frames_for_embed = [int(o.frame_idx) for o in obs_list]
+        embs = np.stack([np.asarray(o.embedding, dtype=np.float32) for o in obs_list], axis=0)
+
+        aggregator.attach_embeddings(int(tid), embs)
+
+        # Persist per track (if checkpoint enabled)
+        if checkpoint is not None:
+            # Find the actual FaceTrack object for this tid (needed by _persist_embeddings_for_track)
+            track = next((t for t in aggregator.tracks if int(getattr(t, "track_id", -1)) == int(tid)), None)
+            if track is not None:
+                _persist_embeddings_for_track(
+                    checkpoint,
+                    shot_number=shot_number,
+                    track=track,
+                    frames_for_embed=frames_for_embed,
+                    embs=embs,
+                )
+
+                # Track the newest frame whose embeddings were persisted in this batch.
+                if frames_for_embed:
+                    last_f = int(frames_for_embed[-1])
+                    if max_persisted_frame is None or last_f > max_persisted_frame:
+                        max_persisted_frame = last_f
+
+    # Advance the embedding-safe resume anchor once per batch (after successful persistence).
+    # Prefer the explicit boundary-completion frame when provided; otherwise use the newest
+    # payload frame that contributed embeddings.
+    anchor_frame = (
+        int(safe_frame_idx)
+        if safe_frame_idx is not None
+        else (int(max_persisted_frame) if max_persisted_frame is not None else None)
+    )
+    if checkpoint is not None and anchor_frame is not None:
+        try:
+            open_tracks = _snapshot_open_tracks_for_status(aggregator, int(shot_number))
+            checkpoint.mark_embedding_safe(
+                frame_idx=int(anchor_frame),
+                shot_number=int(shot_number),
+                shot_first_frame=(int(shot_first_frame) if shot_first_frame is not None else None),
+                open_tracks=open_tracks,
+                note="embeddings persisted",
+            )
+        except Exception:
+            # Non-fatal: embeddings were already persisted; this only affects resume metadata.
+            logging.exception("track: failed to mark embedding-safe (non-fatal)")
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -454,6 +598,7 @@ def track_across_segments(
     detect_interval: int = 10,
     embedding_batch_size_max: int = 32,
     *,
+    embedding_queue_max_pending: int = 1024,
     checkpoint: TrackingCheckpoint | None = None,
     resume_enabled: bool = True,
 ) -> List[FaceTrack]:
@@ -547,6 +692,9 @@ def track_across_segments(
         _shot_data = json.load(f)
     shots = _shot_data["shots"]
 
+    # # DEBUG
+    # shots = [s for s in shots if int(s["shot_number"]) in [63,64]]
+
     _validate_shots_are_absolute_and_increasing(shots)
 
     with ExitStack() as stack:
@@ -576,6 +724,9 @@ def track_across_segments(
 
         for shot_idx, shot_num in enumerate(shots):
             shot_number = shot_num["shot_number"]
+
+            logger.info(f"shot num: {shot_number}")
+
             first = shot_num["first_frame"]
             last = shot_num["last_frame"]
 
@@ -599,6 +750,18 @@ def track_across_segments(
                 params=ValidatorParams(iou_thresh=iou_thresh),
             )
 
+            embed_q = AlignedFaceEmbeddingQueue(
+                max_batch_size=int(embedding_batch_size_max),
+                max_pending=int(embedding_queue_max_pending)
+            )
+
+            logging.info(
+                "embed_q created: max_batch_size=%d max_pending=%d shot=%d",
+                int(embed_q.max_batch_size),
+                int(embed_q.max_pending),
+                int(shot_number),
+            )
+
             frame_provider.reset_to_frame(int(start_at))
 
             for frame_idx in range(start_at, last + 1):
@@ -617,58 +780,73 @@ def track_across_segments(
 
                 _guard_no_rewind(frame_idx, resume_plan)
 
+                # Resume-specific bootstrap lives in resume_rehydrate.py:
+                # on the first resumed frame of the anchor shot, recreate live
+                # tracker objects from rehydrated OPEN tracks so this frame can
+                # follow the normal tracking-first path.
+                if bootstrap_runtime_trackers_for_resume_frame(
+                    resume_plan=resume_plan,
+                    shot_number=shot_number,
+                    frame_idx=frame_idx,
+                    start_at=start_at,
+                    aggregator=aggregator,
+                    face_tracker=face_tracker,
+                    validator=validator,
+                    frame=frame,
+                ):
+                    tracker_active = True
+
                 observations: List[FaceObservation] = []
 
                 is_scheduled_detect_frame = (frame_idx % detect_interval == 0)
-
+                open_tracks = [t for t in aggregator.tracks if not t.is_closed()]
+                no_open_tracks = (len(open_tracks) == 0)
                 no_tracker = (not tracker_active)
-                no_open_tracks = not any(not t.is_closed() for t in aggregator.tracks)
 
-                # Determine if this is a detection frame
-                do_detection = is_scheduled_detect_frame or no_tracker or no_open_tracks
+                can_try_tracking = (not no_open_tracks) and tracker_active
 
-                if not do_detection:
-                    # Try tracking all existing tracks
-                    tracked_boxes: Dict[int, Tuple[float, float, float, float]] = face_tracker.update_trackers(frame)
-                    basic_fail = (not tracked_boxes) or any(b is None for b in tracked_boxes.values())
+                # Resume/cold parity rule:
+                # - scheduled detection frames always detect
+                # - otherwise, try tracking first if tracking is possible
+                # - only fall back to detection if tracking is not eligible or fails
+                try_tracking = (not is_scheduled_detect_frame) and can_try_tracking
+                do_detection = not try_tracking
 
-                    if (not basic_fail) and validator.validate(tracked_boxes, frame, frame_idx):
-                        for track_id, tb in tracked_boxes.items():
-                            if tb is None:
-                                continue
-                            x, y, w, h = tb
-                            bbox = (int(x), int(y), int(x + w), int(y + h))
-                            observations.append(
-                                FaceObservation(
-                                    frame_idx=frame_idx,
-                                    track_id=track_id,
-                                    bbox=bbox,
-                                    embedding=None,
-                                    confidence=None,
-                                    aligned_face=None,
-                                    source=Source.TRACKED,
+                if try_tracking:
+                        # Try tracking all existing tracks
+                        tracked_boxes: Dict[int, Tuple[float, float, float, float]] = face_tracker.update_trackers(frame)
+                        basic_fail = (not tracked_boxes) or any(b is None for b in tracked_boxes.values())
+
+                        if (not basic_fail) and validator.validate(tracked_boxes, frame, frame_idx):
+                            for track_id, tb in tracked_boxes.items():
+                                if tb is None:
+                                    continue
+                                x, y, w, h = tb
+                                bbox = (int(x), int(y), int(x + w), int(y + h))
+                                observations.append(
+                                    FaceObservation(
+                                        frame_idx=frame_idx,
+                                        track_id=track_id,
+                                        bbox=bbox,
+                                        embedding=None,
+                                        confidence=None,
+                                        aligned_face=None,
+                                        source=Source.TRACKED,
+                                    )
                                 )
-                            )
-                    else:
-                        aggregator.finalize_tracks()
-                        tracker_active = False
-                        do_detection = True
+
+                        else:
+                            aggregator.finalize_tracks()
+                            tracker_active = False
+                            do_detection = True
+                            observations = []
 
                 if do_detection:  # Run detection 
-
-                    do_checkpoint(
-                        checkpoint,
-                        frame_idx=frame_idx,
-                        shot_number=shot_number,
-                        aggregator=aggregator,
-                        shot_first_frame=first,
-                    )
 
                     detections = detector.detect_faces_in_frame(frame)
 
                     if detections:
                         boxes, landmark_lists, confidences = detections
-                        aligned_ok = 0
 
                         # Deterministically order detections
                         order = sorted(
@@ -686,48 +864,68 @@ def track_across_segments(
                         confidences = [confidences[i] for i in order]
 
                         for box, landmarks, confidence in zip(boxes, landmark_lists, confidences):
+                            if landmarks is None:
+                                continue  # treat as "not a detected face"
+
                             bbox = tuple(int(v) for v in box[:4])
+
+                            aligned_face = None
+                            try:
+                                aligned_face = align_face_for_arcface(frame, landmarks)
+                            except Exception:
+                                logging.exception(
+                                    "align: failed to compute aligned_face shot=%d frame=%d bbox=%s",
+                                    int(shot_number),
+                                    int(frame_idx),
+                                    str(bbox),
+                                )
 
                             observations.append(
                                 FaceObservation(
                                     frame_idx=frame_idx,
                                     bbox=bbox,
-                                    track_id=None,                 # aggregator will set
+                                    track_id=None,  # aggregator will set
                                     embedding=None,
                                     confidence=float(confidence) if confidence is not None else None,
-                                    aligned_face=None,             
-                                    landmarks=landmarks,           
+                                    aligned_face=aligned_face,
+                                    landmarks=landmarks,
                                     source=Source.DETECTED,
                                 )
                             )
-                    else:
+
+                        # print(f"Detection frame number: {frame_idx}, num faces: {len(observations)}")
+                    
+                    if not detections or not observations:
                         # no faces this frame; close shot-local tracks
                         aggregator.finalize_tracks()
 
-                if observations and observations[0].source == Source.DETECTED:
-                    dets = []
-                    for ob in observations:
-                        x1, y1, x2, y2 = [int(v) for v in ob.bbox[:4]]
-                        dets.append(
-                            {
-                                "bbox": (x1, y1, x2, y2),
-                                "conf": float(ob.confidence)
-                                if ob.confidence is not None
-                                else None,
-                            }
-                        )
+                    if observations:
+                        dets = []
+                        for ob in observations:
+                            x1, y1, x2, y2 = [int(v) for v in ob.bbox[:4]]
+                            dets.append(
+                                {
+                                    "bbox": (x1, y1, x2, y2),
+                                    "conf": float(ob.confidence)
+                                    if ob.confidence is not None
+                                    else None,
+                                }
+                            )
 
-                if observations and observations[0].source == Source.DETECTED:
-                    _ = extend_prev_track_for_overlapping_detection(
-                        aggregator=aggregator,
-                        detections=observations,
-                        iou_threshold=iou_thresh,
-                    )
+                        _ = extend_prev_track_for_overlapping_detection(
+                            aggregator=aggregator,
+                            detections=observations,
+                            iou_threshold=iou_thresh,
+                            )
+      
+                _ = aggregator.update_tracks_with_frame(frame_idx, observations)
 
-                _ = aggregator.update_tracks_with_frame(
-                    frame_idx, observations
-                    )
-
+                # Persist observations for EVERY processed frame.
+                #
+                # This includes TRACKED observations, which are still needed by the
+                # current resume design to reconstruct pre-resume track history.
+                #
+                # Embedding persistence remains detection-only below.
                 _checkpoint_observations_and_snapshot(
                     checkpoint,
                     shot_number=shot_number,
@@ -735,6 +933,40 @@ def track_across_segments(
                     aggregator=aggregator,
                     resume_plan=resume_plan,
                 )
+
+                if do_detection:
+                    # Enqueue DETECTED observations for embedding now that track_id has
+                    # been assigned and the DET rows for this frame have already been
+                    # checkpointed above.
+                    det_obs = aggregator.observations_at(
+                        frame_idx, source=Source.DETECTED, require_track_id=True
+                    )
+
+                    # Embed with bounded memory, while preserving across-frame batching:
+                    # - Opportunistically flush if we exceed max_pending.
+                    # - ONLY do an end-of-frame flush if we already flushed at least once
+                    #   during this frame (meaning we crossed the pending fence mid-frame).
+                    embedded_obs = []
+                    flushed_during_frame = False
+                    for ob in det_obs:
+                        embed_q.enqueue(ob)
+                        flushed_now = embed_q.maybe_flush(embedder)
+                        if flushed_now:
+                            flushed_during_frame = True
+                            embedded_obs.extend(flushed_now)
+
+                    if flushed_during_frame:
+                        tail = embed_q.flush(embedder)
+                        embedded_obs.extend(tail)
+
+                    _attach_and_persist_embedded_obs(
+                        embedded_obs=embedded_obs,
+                        aggregator=aggregator,
+                        checkpoint=checkpoint,
+                        shot_number=shot_number,
+                        shot_first_frame=int(first),
+                        safe_frame_idx=int(frame_idx),
+                    )
 
                 agg_det = aggregator.observations_at(
                     frame_idx, source=Source.DETECTED, require_track_id=True
@@ -766,72 +998,45 @@ def track_across_segments(
                 if checkpoint:
                     checkpoint.on_frame(frame_idx)
 
-            # ---- end-of-shot embedding pass ----------
+            # ---- end-of-shot embedding drain (queue) ----------
 
-            for track in aggregator.tracks:
-                aligned_faces, frames_for_embed = _collect_aligned_faces_for_embedding(
-                    track,
-                    frame_provider=frame_provider,
-                    # embedding_frame_policy=None  # uses default for now
-                )
-
-                if not aligned_faces:
-                    continue
-
-                embs = embedder.get_embedding_batch(
-                    aligned_faces,
-                    batch_size=embedding_batch_size_max,
-                )
-
-
-                if embs is None:
-                    logging.error(
-                        "embed: embedder returned None for shot=%d tid=%s",
-                        int(shot_number),
-                        str(getattr(track, "track_id", "NA")),
-                    )
-                    continue
-
-
-                if not isinstance(embs, np.ndarray):
-                    raise TypeError(f"Embedder must return np.ndarray, got {type(embs)}")
-            
-                if embs.ndim != 2 or embs.shape[1] != 512:
-                    raise ValueError(
-                        f"Embedder returned invalid array shape {embs.shape}; expected (K,512)"
-                    )
-                if embs.dtype != np.float32:
-                    embs = np.asarray(embs, dtype=np.float32, order="C")
-
-                
-                if len(embs) != len(frames_for_embed):
-                    raise RuntimeError(
-                        f"Embed count/frame mismatch: embs={len(embs)} frames={len(frames_for_embed)} "
-                        f"(shot={shot_number}, tid={track.track_id})"
-                    )
-
-                aggregator.attach_embeddings(track.track_id, embs)
-
-                logging.info(
-                    f"end of shot {shot_number} and {len(embs)} embeddings attached to aggregator"
-                )
-
-                _persist_embeddings_for_track(
-                    checkpoint,
-                    shot_number=shot_number,
-                    track=track,
-                    frames_for_embed=frames_for_embed,
-                    embs=embs,
-                )
+            # Flush any remaining queued aligned faces.
+            embedded_obs = embed_q.flush(embedder)
+            _attach_and_persist_embedded_obs(
+                embedded_obs=embedded_obs,
+                aggregator=aggregator,
+                checkpoint=checkpoint,
+                shot_number=shot_number,
+                shot_first_frame=int(first),
+                safe_frame_idx=int(last),
+            )
 
             aggregator.finalize_tracks()
 
             # Assign segment_id per shot, seeded to continue numbering after any rehydrated tracks
             seed = int(seg_seed)
+
             try:
                 _ = aggregator.resolve_segment_ids(
                     segment_id_counter=seed,
                     embedding_threshold=embedding_thresh,
+                )
+                logging.info(
+                    "shot=%d seg_seed=%d segment_ids_by_range=%s",
+                    int(shot_number),
+                    int(seed),
+                    sorted(
+                        [
+                            (
+                                int(t.first_frame()),
+                                int(t.last_frame()),
+                                int(getattr(t, "track_id", -1)),
+                                getattr(t, "segment_id", None),
+                            )
+                            for t in aggregator.tracks
+                        ],
+                        key=lambda x: (x[0], x[1], x[2]),
+                    ),
                 )
             except RuntimeError as e:
                 logging.error(
@@ -846,6 +1051,8 @@ def track_across_segments(
                 checkpoint.on_shot_done()
 
         _finalize_checkpoint_run(checkpoint)
+
+        logger.info("Done processing video")
 
         return all_tracks
 

@@ -56,8 +56,6 @@ def mk_obs_block(n, *, shot=3, track_id=7, f_start=0, src="detected"):
             "src": src,                              # "detected" or "tracked"
             "conf": 0.9,
         }
-        if str(src).lower() == "detected":
-            row["landmarks"] = _lm5(f)
         rows.append(row)
     return rows
 
@@ -70,11 +68,14 @@ def write_status(path, **kw):
         "tracks_seen": 0,
         "obs_rows": 0,
         "emb_rows": 0,
-        "last_detection_frame": None,
-        "last_detection_shot": None,
-        "last_detection_shot_first_frame": None,
-        "obs_rows_at_last_detection": 0,
-        "emb_rows_at_last_detection": 0,
+
+        # Embedding-safe anchor fields: this is the only durable resume boundary.
+        "last_embedding_safe_frame": None,
+        "last_embedding_safe_shot_number": None,
+        "last_embedding_safe_shot_first_frame": None,
+        "obs_rows_at_last_embedding_safe": 0,
+        "emb_rows_at_last_embedding_safe": 0,
+
         "schema_version": "2.1",
         "detect_interval": 60,
         "embedding_batch_size_max": 256,
@@ -119,11 +120,11 @@ def test_load_and_anchor_collectors_trims_to_detection_boundary(tmp_path: Path):
     # Anchor should trim back to 90/18 and place resume at (frame=67020, shot=6, shot_first=51151)
     write_status(
         status,
-        last_detection_frame=67020,
-        last_detection_shot=6,
-        last_detection_shot_first_frame=51151,
-        obs_rows_at_last_detection=90,
-        emb_rows_at_last_detection=18,
+        last_embedding_safe_frame=67020,
+        last_embedding_safe_shot_number=6,
+        last_embedding_safe_shot_first_frame=51151,
+        obs_rows_at_last_embedding_safe=90,
+        emb_rows_at_last_embedding_safe=18,
     )
 
     # Live collectors start empty (this mimics the new process)
@@ -143,9 +144,7 @@ def test_load_and_anchor_collectors_trims_to_detection_boundary(tmp_path: Path):
     # Anchor exposed via get_resume_anchor()
     anchor = mgr.get_resume_anchor()
     # Backward/forward compatible: allow 2- or 3-tuple
-    assert tuple(anchor[:2]) == (67020, 6)
-    if len(anchor) >= 3:
-        assert anchor[2] == 51151
+    assert anchor == (67020, 6, 51151)
 
 def test_append_after_resume_and_finalize_updates_files(tmp_path: Path):
     # Arrange: create run dir with a smaller anchor (10 obs, 4 emb)
@@ -167,11 +166,11 @@ def test_append_after_resume_and_finalize_updates_files(tmp_path: Path):
 
     write_status(
         status,
-        last_detection_frame=12345,
-        last_detection_shot=3,
-        last_detection_shot_first_frame=1000,
-        obs_rows_at_last_detection=10,
-        emb_rows_at_last_detection=4,
+        last_embedding_safe_frame=12345,
+        last_embedding_safe_shot_number=3,
+        last_embedding_safe_shot_first_frame=1000,
+        obs_rows_at_last_embedding_safe=10,
+        emb_rows_at_last_embedding_safe=4,
     )
 
     # Live collectors (empty)
@@ -251,7 +250,7 @@ def test_v21_writer_uses_hydrated_obs_collector_counts(tmp_path: Path):
     t0 = s0["face_tracks"][0]
     assert t0["obs_count"] == 0 or t0["obs_count"] <= sidecar["count"]  # count may be 0 if obs list on track is empty
 
-def test_checkpoint_now_records_true_shot_first(tmp_path: Path):
+def test_mark_embedding_safe_records_true_shot_first(tmp_path: Path):
     run = tmp_path / "r"; (run / "ckpt").mkdir(parents=True)
     mgr = CheckpointManager(run, video_path="/tmp/video.mp4", resume=True)
 
@@ -262,11 +261,11 @@ def test_checkpoint_now_records_true_shot_first(tmp_path: Path):
     # Simulate a detection at frame 100 within shot #6 whose true first frame was 80,
     # even if we resumed at 95; checkpoint_now must record shot_first_frame=80.
     agg = DummyAggregator([])  # minimal aggregator
-    mgr.checkpoint_now(frame_idx=100, shot_number=6, shot_first_frame=80, note="test", aggregator=agg)
+    mgr.mark_embedding_safe(frame_idx=100, shot_number=6, shot_first_frame=80, note="test")
     st = json.loads((run / "status.json").read_text())
-    assert st["last_detection_frame"] == 100
-    assert st["last_detection_shot"] == 6
-    assert st["last_detection_shot_first_frame"] == 80
+    assert st["last_embedding_safe_frame"] == 100
+    assert st["last_embedding_safe_shot_number"] == 6
+    assert st["last_embedding_safe_shot_first_frame"] == 80
 
 def test_resume_hydrates_open_tracks_snapshot(tmp_path: Path):
     # Seed a run dir with status.json containing open_tracks
@@ -280,9 +279,9 @@ def test_resume_hydrates_open_tracks_snapshot(tmp_path: Path):
 
     write_status(
         run / "status.json",
-        last_detection_frame=1000,
-        last_detection_shot=6,
-        last_detection_shot_first_frame=950,
+        last_embedding_safe_frame=1000,
+        last_embedding_safe_shot_number=6,
+        last_embedding_safe_shot_first_frame=950,
         open_tracks=[
             {
                 "shot": 6,

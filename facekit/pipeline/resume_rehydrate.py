@@ -10,6 +10,222 @@ from facekit.common.obs_consts import Source, code_to_src, SRC_TO_CODE
 from facekit.errors import ResumeSafetyError
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 
+def _emb_head(track: FaceTrack, n: int = 5):
+    try:
+        avg = track.compute_average_embedding()
+        return [round(float(x), 6) for x in avg[:n]]
+    except Exception:
+        return None
+
+def _emb_count(track: FaceTrack):
+    try:
+        embs = getattr(track, "embeddings", None)
+        return len(embs) if embs is not None else 0
+    except Exception:
+        return None
+
+def _log_tracks_emb_brief(label: str, tracks: List[FaceTrack] | None) -> None:
+    try:
+        if not tracks:
+            logging.info("%s: []", label)
+            return
+        rows = []
+        for t in tracks:
+            rows.append((
+                int(getattr(t, "shot_id", -1)),
+                int(t.first_frame()),
+                int(t.last_frame()),
+                int(getattr(t, "track_id", -1)),
+                bool(t.has_embedding()) if hasattr(t, "has_embedding") else None,
+                _emb_count(t),
+                _emb_head(t),
+            ))
+        rows = sorted(rows, key=lambda x: (x[0], x[1], x[2], x[3]))
+        logging.info("%s: %s", label, rows)
+    except Exception:
+        logging.exception("failed to log embedding summaries for %s", label)
+
+def _prepare_tracks_for_resume_runtime(
+    tracks: List[FaceTrack],
+    *,
+    resume_frame: int,
+) -> None:
+    """
+    Normalize rehydrated resume-shot tracks so they are ready to enter the frame loop
+    on a non-detection resume frame.
+
+    Contract:
+      - observations are already restricted to frames strictly before resume_frame
+      - tracks that have any observation before resume_frame should be OPEN
+      - runtime helper fields should reflect the last usable pre-resume observation
+      - no ephemeral image state (e.g. gray ROI) is reconstructed here
+    """
+    for tr in tracks:
+        obs_before_resume = [
+            o for o in getattr(tr, "observations", []) or []
+            if int(getattr(o, "frame_idx", -1)) < int(resume_frame)
+        ]
+
+        if not obs_before_resume:
+            # Nothing durable for this track before resume; keep it inert/open-safe.
+            if hasattr(tr, "mark_open") and callable(getattr(tr, "mark_open")):
+                tr.mark_open()
+            tr.is_active = False
+            if hasattr(tr, "last_gray_roi"):
+                tr.last_gray_roi = None
+            continue
+
+        obs_before_resume.sort(key=lambda o: int(o.frame_idx))
+        last_obs = obs_before_resume[-1]
+
+        # Track should be live/open at resume entry; per-frame activity is recomputed later.
+        if hasattr(tr, "mark_open") and callable(getattr(tr, "mark_open")):
+            tr.mark_open()
+        tr.is_active = False
+
+        # Runtime bbox continuity for tracking-first resume.
+        if getattr(last_obs, "bbox", None) is not None:
+            tr.last_bbox = tuple(int(v) for v in last_obs.bbox[:4])
+
+        # Rebuild landmark continuity from the last DET observation before resume.
+        last_det = None
+        for o in reversed(obs_before_resume):
+            if getattr(o, "source", None) == Source.DETECTED:
+                last_det = o
+                break
+
+        if last_det is not None:
+            tr._last_det_frame_idx = int(last_det.frame_idx)
+            lm = getattr(last_det, "landmarks", None)
+            tr.last_landmarks = None if lm is None else np.asarray(lm, dtype=np.float32)
+            if getattr(last_det, "bbox", None) is not None:
+                tr.last_bbox = tuple(int(v) for v in last_det.bbox[:4])
+        else:
+            tr._last_det_frame_idx = None
+            tr.last_landmarks = None
+
+        # This is ephemeral tracker/image state and should not be resurrected from checkpoint.
+        if hasattr(tr, "last_gray_roi"):
+            tr.last_gray_roi = None
+
+        # Keep legacy helper fields consistent if downstream reads them.
+        if hasattr(tr, "last_frame_idx"):
+            tr.last_frame_idx = int(last_obs.frame_idx)
+        if hasattr(tr, "last_det_frame_idx"):
+            tr.last_det_frame_idx = int(tr._last_det_frame_idx) if tr._last_det_frame_idx is not None else -1
+
+def bootstrap_runtime_trackers_for_resume_frame(
+    *,
+    resume_plan: "ResumePlan",
+    shot_number: int,
+    frame_idx: int,
+    start_at: int,
+    aggregator,
+    face_tracker,
+    validator,
+    frame,
+) -> bool:
+    """
+    Resume-only runtime bootstrap for the *first processed frame* of the
+    anchor-containing shot.
+
+    Goal
+    ----
+    Recreate live tracker objects from rehydrated OPEN tracks so that the
+    first resumed frame can behave like a tracking frame, instead of being
+    forced into a synthetic detection purely because the process restarted.
+
+    Notes
+    -----
+    - This function is intentionally resume-specific and belongs in
+      resume_rehydrate.py rather than in the generic per-frame coordinator.
+    - We do NOT seed validator history here from checkpoint state. The normal
+      first successful validate(...) call on the resumed frame will seed the
+      validator baseline from current-frame tracked boxes, which is already
+      how validator behaves after a fresh bootstrap.
+    """
+    if not (
+        resume_plan.is_resume
+        and int(shot_number) == int(resume_plan.first_processed_shot_number)
+        and int(frame_idx) == int(start_at)
+    ):
+        return False
+
+    # If live trackers already exist, there is nothing to bootstrap.
+    existing = getattr(face_tracker, "trackers", None)
+    if existing:
+        return False
+
+    open_tracks = [
+        t
+        for t in getattr(aggregator, "tracks", []) or []
+        if (
+            not t.is_closed()
+            and int(getattr(t, "track_id", -1)) in set(resume_plan.open_track_ids_anchor or [])
+        )
+    ]
+    if not open_tracks:
+        logging.info(
+            "resume-bootstrap: shot=%d frame=%d no open anchor tracks to seed "
+            "(aggregator_open=%s, allowed_open=%s)",
+            int(shot_number),
+            int(frame_idx),
+            sorted(
+                int(getattr(t, "track_id", -1))
+                for t in (getattr(aggregator, "tracks", []) or [])
+                if not t.is_closed()
+            ),
+            sorted(int(tid) for tid in (resume_plan.open_track_ids_anchor or [])),
+        )
+        return False
+
+    boxes_xywh = []
+    track_ids = []
+    skipped = []
+
+    for tr in sorted(open_tracks, key=lambda t: int(getattr(t, "track_id", -1))):
+        tid = int(getattr(tr, "track_id", -1))
+        bb = tr.get_last_bbox() if hasattr(tr, "get_last_bbox") else None
+        if bb is None or len(bb) < 4:
+            skipped.append((tid, "missing_bbox"))
+            continue
+        x1, y1, x2, y2 = [int(v) for v in bb[:4]]
+        w = int(x2 - x1)
+        h = int(y2 - y1)
+        if w <= 0 or h <= 0:
+            skipped.append((tid, f"nonpositive_box={bb}"))
+            continue
+        boxes_xywh.append((x1, y1, w, h))
+        track_ids.append(tid)
+
+    if not track_ids:
+        logging.warning(
+            "resume-bootstrap: shot=%d frame=%d no valid open-track boxes; skipped=%s",
+            int(shot_number),
+            int(frame_idx),
+            skipped,
+        )
+        return False
+
+    # Ensure validator starts clean; the first successful tracking frame will
+    # seed its own baseline from current-frame tracked boxes.
+    if hasattr(validator, "_clear_baseline"):
+        validator._clear_baseline()
+
+    face_tracker.init_trackers(frame, boxes_xywh, track_ids)
+    live = getattr(face_tracker, "trackers", None) or []
+
+    logging.info(
+        "resume-bootstrap: shot=%d frame=%d seeded %d/%d live trackers tids=%s skipped=%s",
+        int(shot_number),
+        int(frame_idx),
+        len(live),
+        len(track_ids),
+        [int(tid) for tid in track_ids],
+        skipped,
+    )
+    return bool(live)
+
 # ---------- bbox helpers (unchanged) ----------
 def _as_int_bbox(bb) -> tuple[int, int, int, int] | None:
     x1, y1, x2, y2 = bb
@@ -433,6 +649,16 @@ def attach_embeddings_to_tracks(
                 f"{log_prefix}: invalid embedding shape {embs.shape} for (shot={tr.shot_id}, tid={tr.track_id}); "
                 "expected (K,512)"
             )
+        
+        logging.info(
+            "%s: track (shot=%d tid=%d) det_obs=%d emb_rows=%d strict=%s",
+            log_prefix,
+            int(tr.shot_id),
+            int(tr.track_id),
+            len(det_obs),
+            int(embs.shape[0]) if embs is not None else -1,
+            strict,
+        )
 
         # Align by chronological order of DET obs. For resume pre-anchor we expect
         # a 1:1 match (strict). Fail fast if counts differ.
@@ -530,15 +756,22 @@ def rehydrate_tracks(
             log_prefix="rehydrate-completed",
         )
 
-    # 2) anchor shot: always non-strict on embeddings (by design will be mid-shot with no embs yet)
+        _log_tracks_emb_brief("rehydrate-completed after attach", completed_tracks)
+
+    # 2) Resume-shot tracks: these observations are all strictly before the
+    # resume frame (frame_max = anchor_frame - 1), so under the current
+    # embedding-safe contract their DET embeddings should already be durable.
+    # Treat missing embeddings here as a resume-safety problem, not something
+    # to silently allow.
     if anchor_tracks:
         attach_embeddings_to_tracks(
             anchor_tracks,
             emb_lookup=emb_lookup,
             emb_array_lookup=emb_array_lookup,
-            strict=False,
+            strict=bool(strict),
             log_prefix="rehydrate-anchor",
         )
+        _log_tracks_emb_brief("rehydrate-anchor after attach", anchor_tracks)
 
     # 3) Stitch back together in the original order
     return completed_tracks + anchor_tracks
@@ -551,8 +784,10 @@ class ResumePlan:
     Fields
     ------
     anchor_frame :
-        Absolute frame index at which new work must begin. All frames strictly
-        before this are considered "pre-anchor" and must already be persisted.
+        Absolute embedding-safe anchor frame.
+        All frames strictly before this boundary are considered already durable
+        and are rehydrated rather than reprocessed. New frame processing begins
+        at anchor_frame + 1.
     is_resume :
         True if this run is resuming from a previous checkpoint (anchor_frame > 0),
         False for a cold start.
@@ -561,18 +796,25 @@ class ResumePlan:
         (i.e. the shot containing anchor_frame, after trimming the shot list).
     segment_id_seed_by_shot :
         Per-shot seed for segment_id assignment. For shots that were already
-        completed pre-anchor, this is the count of their pre-existing segments;
-        for the anchor shot it is the number of pre-anchor segments.
+        completed before the resume frame, this is max(existing segment_id)+1
+        when known; otherwise it falls back to the count of rehydrated tracks.
+        For the first processed shot it captures the next available
+        shot-local segment id at the resume boundary.
     trackid_seed_by_shot :
         Per-shot seed for track_id allocation. For each shot, this is
-        max(pre-anchor track_id) + 1, so new tracks continue numbering cleanly.
+        max(pre-resume track_id) + 1, so new tracks continue numbering cleanly.
     prior_tracks_anchor :
-        Tracks rehydrated for the anchor-containing shot, limited to frames
-        strictly before anchor_frame. These are used to seed the first shot's
+        Tracks rehydrated for the first processed shot, limited to frames
+        strictly before anchor_frame. These are used to seed that shot's
         aggregator so labels and embeddings remain consistent across runs.
+    open_track_ids_anchor :
+        Track ids within prior_tracks_anchor that were still OPEN at the
+        embedding-safe boundary. This is derived from checkpoint status.json
+        open_tracks and is the source of truth for which seeded resume-shot
+        tracks should remain open/live at resume start.
     reuse_tid_for_first_shot :
         If not None, the specific track_id that should be reused for the first
-        *new* detection track in the anchor shot, to preserve exact parity of
+        *new* detection track in the first processed shot, to preserve exact parity of
         labels at the resume boundary.
     """
     anchor_frame: int
@@ -581,6 +823,7 @@ class ResumePlan:
     segment_id_seed_by_shot: Dict[int, int]
     trackid_seed_by_shot: Dict[int, int]
     prior_tracks_anchor: List[FaceTrack]
+    open_track_ids_anchor: frozenset[int]
     reuse_tid_for_first_shot: Optional[int]
 
 def _resolve_anchor(
@@ -591,7 +834,7 @@ def _resolve_anchor(
     Decide the global resume anchor frame for this run.
 
     Precedence (highest to lowest):
-      1. checkpoint.get_resume_anchor()[0]               # explicit tuple
+      1. checkpoint.get_resume_anchor()[0]               # embedding-safe frame
       2. checkpoint.read_status()['last_detection_frame']
       3. status.json on disk via checkpoint.status_path
       4. checkpoint.last_detection_frame                 # legacy attr/callable
@@ -608,72 +851,27 @@ def _resolve_anchor(
     Returns
     -------
     int
-        The absolute frame index where new work must begin. 0 means cold start.
+        The embedding-safe anchor frame for this run.
+        The caller is responsible for starting new work at anchor + 1.
+        0 means cold start / no anchor.
     """
     if not (resume_enabled and checkpoint):
-        logging.info("resume: disabled or no checkpoint -> anchor=0")
+        logging.info("resume: disabled or no checkpoint -> start=0")
         return 0
 
-    # (1) explicit tuple from get_resume_anchor()
+    # Resume starts at anchor+1.
     try:
         anchors = checkpoint.get_resume_anchor()
-        if anchors is not None and len(anchors) >= 1:
-            logging.info("resume: using get_resume_anchor() -> %r", anchors)
-            return int(anchors[0])
     except Exception:
-        pass
+        anchors = None
 
-    # (2) prefer read_status() → status.json
-    try:
-        rs = getattr(checkpoint, "read_status", None)
-        if callable(rs):
-            status = rs() or {}
-            val = status.get("last_detection_frame")
-            if val is not None:
-                logging.info("resume: using read_status()['last_detection_frame'] -> %r", val)
-                return int(val)
-    except Exception:
-        pass
+    if anchors is None or len(anchors) < 1:
+        logging.info("resume: no embedding-safe anchor -> start=0")
+        return 0
 
-    # (3) direct status.json path if exposed
-    try:
-        status_path = getattr(checkpoint, "status_path", None)
-        if status_path:
-            import os as _os, json as _json
-            if _os.path.exists(status_path):
-                with open(status_path, "r") as f:
-                    status = _json.load(f) or {}
-                val = status.get("last_detection_frame")
-                if val is not None:
-                    logging.info("resume: using status.json file -> %r", val)
-                    return int(val)
-    except Exception:
-        pass
-
-    # (4) legacy callable/attr last_detection_frame
-    try:
-        candidate = getattr(checkpoint, "last_detection_frame", None)
-        val = candidate() if callable(candidate) else candidate
-        if val is not None:
-            logging.info("resume: using legacy last_detection_frame -> %r", val)
-            return int(val)
-    except Exception:
-        pass
-
-    # (5) max observed frame from the obs collector
-    try:
-        collector = getattr(checkpoint, "obs_collector", None)
-        if collector is not None and hasattr(collector, "get_all_frame_indices"):
-            frames_seen = collector.get_all_frame_indices()
-            if frames_seen is not None and len(frames_seen) > 0:
-                max_frame = int(np.max(frames_seen))
-                logging.info("resume: using obs_collector max frame -> %d", max_frame)
-                return max_frame
-    except Exception:
-        pass
-
-    logging.info("resume: no anchor inputs -> anchor=0")
-    return 0
+    safe_f = int(anchors[0])
+    logging.info("resume: embedding-safe anchor=%d", safe_f)
+    return safe_f
 
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     """
@@ -699,47 +897,33 @@ def _assign_segment_ids_for_rehydrated(
     """
     Assign deterministic per-shot segment_id values to rehydrated tracks.
 
-    Primary rule:
-      - If (shot_id, track_id) exists in `track_order`, use that order index as segment_id.
-        This makes segment labeling stable across resumes, independent of tracking dynamics.
-
-    Fallback rule (only if track_order is missing for a particular track):
-      - Use track_id as a deterministic stand-in segment_id.
-
-    Returns:
-      segment_id_seed_by_shot: {shot_id: next_segment_id_seed}
-        where next_seed is max_assigned_segment_id + 1 for that shot (or 0 if none).
++    segment_id MUST be per-shot dense 0..K-1 to match cold-run behavior.
++    track_order is used only to produce a stable ordering, not as the id itself.
     """
-    seed_by_shot: Dict[int, int] = {}
-    max_seg_by_shot: Dict[int, int] = {}
-
+    # group tracks by shot
+    by_shot: Dict[int, List[FaceTrack]] = {}
     for tr in prior_tracks or []:
         shot = int(getattr(tr, "shot_id", -1))
         tid  = int(getattr(tr, "track_id", -1))
         if shot < 0 or tid < 0:
             continue
+        by_shot.setdefault(shot, []).append(tr)
 
-        key = (shot, tid)
-        if key in track_order:
-            seg = int(track_order[key])
-        else:
-            # Deterministic fallback (keeps resume working even if track_order is partial)
-            seg = tid
-            logging.warning(
-                "resume: track_order missing for (shot=%d, tid=%d); "
-                "using fallback segment_id=%d",
-                shot, tid, seg
-            )
+    seed_by_shot: Dict[int, int] = {}
 
-        # Mutate the track in place (expected by downstream segment labeling)
-        setattr(tr, "segment_id", seg)
+    for shot, tracks in by_shot.items():
+        # stable sort key: track_order if present, else track_id as fallback
+        def _k(tr: FaceTrack) -> tuple[int, int]:
+            tid = int(getattr(tr, "track_id", -1))
+            return (int(track_order.get((shot, tid), 10**9)), tid)
 
-        prev = max_seg_by_shot.get(shot, -1)
-        if seg > prev:
-            max_seg_by_shot[shot] = seg
+        tracks_sorted = sorted(tracks, key=_k)
 
-    for shot, max_seg in max_seg_by_shot.items():
-        seed_by_shot[int(shot)] = int(max_seg) + 1 if int(max_seg) >= 0 else 0
+        # assign dense per-shot segment_ids: 0..K-1
+        for seg, tr in enumerate(tracks_sorted):
+            setattr(tr, "segment_id", int(seg))
+
+        seed_by_shot[int(shot)] = int(len(tracks_sorted))
 
     return seed_by_shot
 
@@ -835,7 +1019,7 @@ def _build_resume_plan(
             emb_lookup=emb_lookup,
             emb_array_lookup=emb_array_lookup,
             anchor_shot_id=anchor_shot_num,
-            strict=True,
+            strict=False,
         )
     elif obs_for_rehydrate is not None:
         logging.info("resume: anchor=0 -> cold start; skipping pre-anchor rehydration")
@@ -843,52 +1027,6 @@ def _build_resume_plan(
     else:
         logging.info("resume: no obs_collector on checkpoint; skipping pre-anchor rehydration")
         prior_tracks = []
-
-    # Hard guard: enforce DET↔EMB parity and landmarks presence on pre-anchor DETs
-    for t in prior_tracks or []:
-        shot_id = int(getattr(t, "shot_id", -1))
-        is_completed_shot = shot_id in completed_shot_nums
-        is_anchor_shot = (anchor_shot_num is not None and shot_id == int(anchor_shot_num))
-
-        if not (is_completed_shot or is_anchor_shot):
-            continue
-
-        det_cnt = sum(
-            1
-            for o in (getattr(t, "observations", []) or [])
-            if getattr(o, "source", None) == Source.DETECTED
-            and int(o.frame_idx) <= int(resume_abs_frame - 1)
-        )
-        emb_cnt = len(getattr(t, "embeddings", []) or [])
-
-        if is_completed_shot and det_cnt > 0 and emb_cnt != det_cnt:
-            raise ResumeSafetyError(
-                f"rehydrate: pre-anchor embedding parity failed for (shot={shot_id}, "
-                f"tid={int(getattr(t,'track_id',-1))}): DET={det_cnt} vs EMB={emb_cnt}"
-            )
-
-        for o in getattr(t, "observations", []) or []:
-            if (
-                getattr(o, "source", None) == Source.DETECTED
-                and int(o.frame_idx) <= int(resume_abs_frame - 1)
-            ):
-                lm = getattr(o, "landmarks", None)
-                if lm is None:
-                    raise ResumeSafetyError(
-                        "rehydrate: missing landmarks for pre-anchor DET "
-                        f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}, frame={int(o.frame_idx)})"
-                    )
-                arr = np.asarray(lm, dtype=np.float32)
-                if arr.shape != (5, 2):
-                    raise ResumeSafetyError(
-                        f"rehydrate: landmarks must be (5,2) on pre-anchor DET "
-                        f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}, frame={int(o.frame_idx)}), got {arr.shape}"
-                    )
-                if not np.all(np.isfinite(arr)):
-                    raise ResumeSafetyError(
-                        f"rehydrate: landmarks contain NaN/Inf on pre-anchor DET "
-                        f"(shot={shot_id}, tid={int(getattr(t,'track_id',-1))}, frame={int(o.frame_idx)})"
-                    )
 
     # Split rehydrated tracks into fully completed vs anchor shot
     prior_tracks_completed: List[FaceTrack] = []
@@ -928,16 +1066,15 @@ def _build_resume_plan(
     except Exception:
         logging.exception("resume: failed summarizing seeds")
 
-    # Assign stable segment_ids to rehydrated tracks and compute per-shot seeds
+    # Compute per-shot track_id seeds from all rehydrated tracks.
+    # segment_id assignment is deferred until after we partition anchor-shot
+    # tracks into durable-vs-live state.
     last_tid_by_shot: Dict[int, int] = {}
     try:
         track_order_map = (
             checkpoint.get_track_order()
             if (checkpoint and hasattr(checkpoint, "get_track_order"))
             else {}
-        )
-        segment_id_seed_by_shot = _assign_segment_ids_for_rehydrated(
-            prior_tracks, track_order_map or {}
         )
 
         tmp: Dict[int, int] = {}
@@ -962,13 +1099,14 @@ def _build_resume_plan(
                 last_tid_by_shot[shot] = tid
 
         logging.info(
-            "resume: assigned segment_ids to %d rehydrated tracks; seeds=%s",
+            "resume: computed track_id seeds from %d rehydrated tracks; seeds=%s",
             len(prior_tracks),
-            {k: int(v) for k, v in segment_id_seed_by_shot.items()},
+            {int(k): int(v) for k, v in trackid_seed_by_shot.items()},
         )
+
     except Exception:
         logging.exception(
-            "resume: failed to assign segment_ids to rehydrated tracks; continuing with empty seeds"
+            "resume: failed to compute track_id seeds from rehydrated tracks; continuing with empty seeds"
         )
         segment_id_seed_by_shot = {}
         trackid_seed_by_shot = {}
@@ -985,9 +1123,11 @@ def _build_resume_plan(
         len(prior_tracks_anchor),
     )
 
-    # Trim shots so the first processed shot is the one containing the anchor
-    start_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame)
-    if start_shot_idx >= len(shots):
+    # Trim shots so the first processed shot is the one containing the first
+    # NEW frame of work. For resume runs that is anchor+1; for cold start it is 0.
+    first_new_frame = (int(resume_abs_frame) + 1) if int(resume_abs_frame) > 0 else 0
+    start_shot_idx = _shot_idx_by_abs_frame(shots, first_new_frame)
+    if start_shot_idx > len(shots):
         raise ResumeSafetyError("resume anchor beyond last shot; aborting for safety.")
     shots_trimmed = shots[start_shot_idx:]
 
@@ -997,6 +1137,81 @@ def _build_resume_plan(
         first_processed_shot_number = shots_trimmed[0]["shot_number"]
 
     is_resume = bool(resume_abs_frame > 0)
+
+    open_track_ids_anchor = frozenset()
+    if is_resume and first_processed_shot_number:
+        open_track_ids_anchor = _read_open_track_ids_for_shot(
+            checkpoint,
+            shot_number=int(first_processed_shot_number),
+        )
+
+    # The checkpoint's open_track_ids for the anchor shot are authoritative.
+    #
+    # prior_tracks_anchor currently contains *all* pre-anchor tracks from the
+    # anchor-containing shot, including tracks that had already ended before the
+    # embedding-safe boundary. Those closed-by-anchor tracks must NOT be seeded
+    # back into the live aggregator/runtime, or resume can incorrectly
+    # resurrect them (for example, extending a cold-run track that ended at 111
+    # out to 159 after resume).
+    #
+    # Partition anchor-shot tracks into:
+    #   - closed_by_anchor: historical output only
+    #   - open_at_anchor:   live seeded state for resume continuation
+    closed_anchor_tracks: List[FaceTrack] = []
+    live_anchor_tracks: List[FaceTrack] = []
+    if prior_tracks_anchor:
+        allowed = set(int(tid) for tid in open_track_ids_anchor)
+        for t in prior_tracks_anchor:
+            tid = int(getattr(t, "track_id", -1))
+            if tid in allowed:
+                live_anchor_tracks.append(t)
+            else:
+                closed_anchor_tracks.append(t)
+
+    if closed_anchor_tracks:
+        logging.info(
+            "resume: anchor-shot closed-by-anchor tracks moved directly to outputs: %s",
+            sorted(
+                (int(getattr(t, "shot_id", -1)), int(t.first_frame()), int(t.last_frame()), int(getattr(t, "track_id", -1)))
+                for t in closed_anchor_tracks
+            ),
+        )
+        all_tracks.extend(closed_anchor_tracks)
+
+    # Assign deterministic per-shot segment_ids only to durable historical
+    # tracks. Live anchor-shot tracks are runtime continuation state and must
+    # enter the resumed shot with segment_id=None.
+    try:
+        durable_prior_tracks = list(prior_tracks_completed) + list(closed_anchor_tracks)
+        segment_id_seed_by_shot = _assign_segment_ids_for_rehydrated(
+            durable_prior_tracks, track_order_map or {}
+        )
+        logging.info(
+            "resume: assigned segment_ids to %d durable rehydrated tracks; seeds=%s",
+            len(durable_prior_tracks),
+            {k: int(v) for k, v in segment_id_seed_by_shot.items()},
+        )
+    except Exception:
+        logging.exception(
+            "resume: failed to assign segment_ids to durable rehydrated tracks; continuing with empty seeds"
+        )
+        segment_id_seed_by_shot = {}
+
+    prior_tracks_anchor = live_anchor_tracks
+    for t in prior_tracks_anchor:
+        setattr(t, "segment_id", None)
+
+    # Only tracks that were actually OPEN at the embedding-safe boundary should
+    # be normalized for warm-start runtime tracking.
+    if prior_tracks_anchor and resume_abs_frame > 0:
+        _prepare_tracks_for_resume_runtime(prior_tracks_anchor, resume_frame=resume_abs_frame)
+        logging.info(
+            "resume: anchor-shot live tracks kept for runtime seeding: %s",
+            sorted(
+                (int(getattr(t, "shot_id", -1)), int(t.first_frame()), int(t.last_frame()), int(getattr(t, "track_id", -1)))
+                for t in prior_tracks_anchor
+            ),
+        )
 
     reuse_tid_for_first_shot: Optional[int] = None
     if checkpoint and resume_abs_frame > 0:
@@ -1026,9 +1241,45 @@ def _build_resume_plan(
         segment_id_seed_by_shot=segment_id_seed_by_shot,
         trackid_seed_by_shot=trackid_seed_by_shot,
         prior_tracks_anchor=prior_tracks_anchor,
+        open_track_ids_anchor=open_track_ids_anchor,
         reuse_tid_for_first_shot=reuse_tid_for_first_shot,
     )
     return plan, shots_trimmed
+
+def _read_open_track_ids_for_shot(
+    checkpoint: TrackingCheckpoint | None,
+    *,
+    shot_number: int | None,
+) -> frozenset[int]:
+    """
+    Read the authoritative set of OPEN track_ids for the first processed shot
+    from checkpoint status.json.
+
+    This keeps checkpoint-specific status decoding out of track_across_segments.
+    """
+    if checkpoint is None or shot_number is None:
+        return frozenset()
+
+    try:
+        status = checkpoint.read_status() or {}
+        rows = status.get("open_tracks") or []
+        tids = {
+            int(row["track_id"])
+            for row in rows
+            if int(row.get("shot", -1)) == int(shot_number)
+        }
+        logging.info(
+            "resume: open_track_ids for shot=%s -> %s",
+            shot_number,
+            sorted(tids),
+        )
+        return frozenset(tids)
+    except Exception:
+        logging.exception(
+            "resume: failed reading open_tracks from status.json for shot=%s",
+            shot_number,
+        )
+        return frozenset()
 
 def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: int, anchor_shot: Optional[int]):
     """

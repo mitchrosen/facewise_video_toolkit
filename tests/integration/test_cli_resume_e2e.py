@@ -233,7 +233,6 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(track_mod, "track_across_segments", _wrapped_track)
 
     # ------------------------------ RUN 1 (crash) ------------------------------
-    print("Woo-hoo: RUN 1")
     
     replacement["det"] = _EmitOneThenCrash(crash_at=22)  # ensures obs_rows > 0 before the crash
     argv1 = [
@@ -268,7 +267,7 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     frames_pre = _load_frames_v21(obs_ckpt_path)
 
-    anchor_in_status = status1.get("last_detection_frame")
+    anchor_in_status = status1.get("last_embedding_safe_frame")
     if anchor_in_status is not None:
         anchor_frame = int(anchor_in_status)
     elif frames_pre.size:
@@ -279,7 +278,6 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert 0 <= anchor_frame < total_frames, f"bad anchor_frame={anchor_frame} total={total_frames}"
     pre_anchor_rows = int((frames_pre < anchor_frame).sum()) if frames_pre.size else 0
    # ------------------------------ RUN 2 (resume) -----------------------------
-    print("Woo-hoo: RUN 2")
     replacement["det"] = _EmitOneNoCrash()  # same emission pattern, no crash
     argv2 = [
         "prog",
@@ -312,11 +310,6 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     F_ckpt = _load_frames_v21(ckpt_npz)
     F_final = _load_frames_v21(final_npz)
 
-    print("ckpt pre:", (F_ckpt < 21).sum(), "post:", (F_ckpt >= 21).sum())
-    print("final pre:", (F_final < 21).sum(), "post:", (F_final >= 21).sum())
-
-    u, c = np.unique(F_final, return_counts=True)
-    print("any duplicates in final by frame?", (c > 1).any())
     ##########-----------#############
         
     assert frames2.size > 0, "no observations after resume"
@@ -359,9 +352,6 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     if pre_anchor_rows > 0:
         assert final_frames.size >= pre_anchor_rows, "lost rows after resume"
 
-        logging.info("Wah-Wah:")
-        for frame_idx in final_frames:
-            logging.info(f"frame_idx: {frame_idx}, frame_idx < anchor_frame: {frame_idx < anchor_frame}")
         assert int((final_frames < anchor_frame).sum()) == pre_anchor_rows, \
             "pre-anchor observations not preserved exactly"
     
@@ -379,8 +369,6 @@ def test_cli_resume_exact_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         assert (diffs >= 0).all(), f"frames out of order; first negative @ {np.where(diffs < 0)[0][:5]}"
 
     # ------------------------------ RUN 3 (golden, no crash) ------------------------------
-    print("Woo-hoo: RUN 3")
-
     replacement["det"] = _EmitOneNoCrash()  # must match RUN 2 so sidecars are byte-for-byte comparable
     gold_ckpt = tmp_path / "gold_ckpt"
     gold_ckpt.mkdir()

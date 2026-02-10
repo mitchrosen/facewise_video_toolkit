@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -10,6 +11,7 @@ import sys
 from typing import Literal, List, Optional
 from jsonschema import ValidationError
 from dataclasses import dataclass, field
+from collections import Counter
 import logging
 
 from facekit.io.frame_provider import ReaderCoordinator
@@ -137,6 +139,7 @@ def run_pipeline(args):
         size = fp.size() or (0, 0)
         width, height = int(size[0]), int(size[1])
         total_frames = int(fp.total_frames() or 0)
+        embedding_queue_max_pending = int(getattr(args, "embedding_queue_max_pending", 1024))
 
         # Shots (if not provided, build to a temp file then read back)
         if args.shot_segmentation:
@@ -158,7 +161,10 @@ def run_pipeline(args):
         shot_defs = shot_data.get("shots", [])
 
         # Detector / embedder
-        yolo = load_yolo5face_model(args.detector_model, args.config, device=device)
+        yolo = load_yolo5face_model(args.detector_model, 
+                                    args.config,
+                                    min_face=args.min_face,
+                                    device=device)
         detector = FaceDetector(yolo)
         embedder = FaceEmbedder(args.embedding_model, device=device)
         if hasattr(embedder, "set_max_batch_size"):
@@ -171,6 +177,11 @@ def run_pipeline(args):
             if args.checkpoint_dir
             else CheckpointManager.compute_parent_dir(Path("checkpoints"), video_path)
         )
+
+        no_checkpoint_write = bool(getattr(args, "no_checkpoint_write", False))
+        if no_checkpoint_write:
+            logging.info("checkpoint: output disabled via --no-checkpoint-write (resume input may still be used).")
+
         # ---- collectors ---------------------------------------------------------
         # Single source of truth for the whole run (fresh or resume):
         # These are used by checkpointing during the run AND by the final writers.
@@ -182,6 +193,7 @@ def run_pipeline(args):
             "video_path": str(video_path.resolve()),
             "detect_interval": int(args.detect_interval),
             "embedding_batch_size_max": int(args.embedding_batch_size_max),
+            "embedding_queue_max_pending": embedding_queue_max_pending,
             "device": args.device,
             "emb_store": ("none" if args.emb_store == "none" else args.emb_store),
             "emb_sidecar_path": (str(args.emb_sidecar_path) if args.emb_sidecar_path else None),
@@ -202,6 +214,7 @@ def run_pipeline(args):
             force_new_run=bool(args.new_run),
             run_id=args.checkpoint_run_id,
             resume_latest=bool(args.resume_latest),
+            write_disabled=bool(getattr(args, "no_checkpoint_write", False)),
         )
 
         # Summarize selected run + resume intent
@@ -259,6 +272,7 @@ def run_pipeline(args):
             embedder=embedder,
             detect_interval=int(args.detect_interval),
             embedding_batch_size_max=int(args.embedding_batch_size_max),
+            embedding_queue_max_pending=embedding_queue_max_pending,
             checkpoint=ckpt,
             resume_enabled=_resume_enabled,
         )
@@ -376,6 +390,16 @@ def run_pipeline(args):
             )
 
         else:  # 2.1
+            counts = Counter(int(t.global_id) for t in tracks if getattr(t, 'global_id', None) is not None)
+
+            face_meta = [
+                {
+                    "face_label": f"face_{gid}",
+                    "occurance_count": count
+                }
+                for gid, count in sorted(counts.items())
+            ]
+
             # default observations sidecar path
             obs_path = Path(args.obs_sidecar_path) if args.obs_sidecar_path else video_path.with_suffix(".observations.npz")
 
@@ -450,6 +474,19 @@ def run_pipeline(args):
                 )
                 ckpt.mark_completed()
 
+def positive_int(value: str) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value} is not a valid integer"
+        )
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{value} must be > 0"
+        )
+    return ivalue
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Track faces and resolve global identities across shots (JSON V2 writer)"
@@ -459,8 +496,12 @@ def main() -> None:
                         help="Path to YOLOv5 model weights",)
     parser.add_argument("--embedding-model", default="models/embedding/glintr100_dynamic.onnx",
                         help="Path to ArcFace ONNX model",)
+    parser.add_argument("--embedding-queue-max-pending", type=int, default=1024,
+                        help=("Flush trigger for the embedding queue: flush occurs only when pending >= max_pending. "))
     parser.add_argument("--config", default="models/detector/yolov5n.yaml",
                         help="Path to YOLOv5 model config",)
+    parser.add_argument("--min-face", type=positive_int, default=10,
+                        help=("Setting to YOLOv5 model processor indicating smallest pixel height for valid detected faces"))
     parser.add_argument("--shot-segmentation", default=None, help="Path to shot segmentation JSON (optional)",)
     parser.add_argument("--schema-version", default="2.0", choices=["2.0","2.1"],
                         help = "Manifest schema version to write (default: 2.0).")
@@ -518,6 +559,8 @@ def main() -> None:
                         help="Resume from a specific run id (e.g., run-20250101T010203Z-deadbeef).")
     parser.add_argument("--new-run", action="store_true",
                         help="Force creation of a fresh run directory even if previous runs exist.")    # logging
+    parser.add_argument("--no-checkpoint-write", action="store_true",
+                        help="Do not write any checkpoint artifacts (status.json, snapshots, ckpt sidecars).")
     parser.add_argument("--log", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"])
     parser.add_argument("--log-file", default=None)
 

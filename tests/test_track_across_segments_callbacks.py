@@ -50,6 +50,8 @@ def test_callbacks_invoked(monkeypatch):
             self.emb_calls: List[tuple[int,int,int]] = []  # (shot, track_id, count)
             self.status_path = "/dev/null"
             self.finalized_notes: List[str] = []
+            self.write_disabled = False
+            self.resume_enabled = False
 
 
         # called every processed frame
@@ -128,13 +130,13 @@ def test_callbacks_invoked(monkeypatch):
     assert cp.frames[-1] == 9
     assert len(cp.frames) == 10
 
-    # we should checkpoint at least once (first frame is a detection frame)
-    assert len(cp.checkpoints) >= 1
-    f0, shot0 = cp.checkpoints[0]
-    assert f0 == 0 and shot0 == 1
-
     # end-of-shot callback fired
     assert cp.shots_done == 1
 
+    # run finalization/completion callback fired
+    assert cp.finalized_notes
+    assert cp.finalized_notes[-1] == "completed"
+
     # with empty detections, no tracks are created
     assert cp.new_tracks_total == 0
+    assert tracks == []

@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import textwrap
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from facekit.common.obs_consts import src_to_code, Source
 
 # -------------------- helpers --------------------
 
@@ -38,10 +40,18 @@ def _run_python(shim: Path, *args, ok=(0,), env=None, cwd=None):
 
 def _extract_anchor(stdout: str, stderr: str) -> int:
     txt = stdout + "\n" + stderr
-    m = re.search(r"ANCHOR:(\d+)", txt)
+    m = re.search(r"EMB_SAFE_ANCHOR:(\d+)", txt)
     assert m, f"Could not parse anchor from logs:\n{txt}"
     return int(m.group(1))
 
+def _extract_mark_safe_frames(stdout: str, stderr: str) -> list[int]:
+    txt = stdout + "\n" + stderr
+    m = re.search(r"MARK_SAFE_FRAMES:([0-9,]*)", txt)
+    assert m, f"Could not parse MARK_SAFE_FRAMES from logs:\n{txt}"
+    blob = m.group(1).strip()
+    if not blob:
+        return []
+    return [int(x) for x in blob.split(",") if x.strip()]
 
 def _load_obs_npz(npz_path: Path) -> np.ndarray:
     with np.load(npz_path, allow_pickle=False) as data:
@@ -65,7 +75,6 @@ def _ordered_tracks_json(json_path: Path):
     tracks.sort(key=lambda t: (int(t.get("shot_id", 0)), _ff(t), int(t.get("track_id", 0))))
     return tracks
 
-
 # -------------------- subprocess shim --------------------
 
 SHIM = r'''
@@ -78,6 +87,7 @@ import numpy as np
 
 from facekit.pipeline.checkpoint import CheckpointManager
 from facekit.pipeline.track_across_segments import track_across_segments
+import facekit.pipeline.track_across_segments as _tas_mod
 from facekit.tracking.tracking_resolution import GlobalIdentityResolver
 
 from facekit.output.json_v2 import ObservationsCollector, EmbeddingCollector
@@ -169,12 +179,31 @@ class CrashyCheckpoint:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
+def _force_embed_queue_max_pending(max_pending: int) -> None:
+    """
+    Make the embed queue deterministic for this integration test by forcing max_pending.
 
+    We do NOT want this test to depend on any particular options key name being plumbed
+    through production. We patch the queue constructor used by track_across_segments.
+    """
+    from facekit.embedding.embedding_queue import AlignedFaceEmbeddingQueue as _Q
+
+    class _TestQueue(_Q):
+        def __init__(self, *a, **k):
+            k.setdefault("max_pending", int(max_pending))
+            super().__init__(*a, **k)
+
+    _tas_mod.AlignedFaceEmbeddingQueue = _TestQueue  # type: ignore[attr-defined]
+
+ 
 def _main():
     import argparse
     import facekit.pipeline.track_across_segments as mod
 
     mod.align_face_for_arcface = _det_align
+
+    # Deterministic contract for this test: flush fence is max_pending=7.
+    _force_embed_queue_max_pending(7)
 
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["cold","crash","resume"], required=True)
@@ -193,7 +222,7 @@ def _main():
         "schema_version": "2.1",
         "video_path": str(Path(args.ckpt_dir, "dummy.mp4")),
         "detect_interval": args.detect_interval,
-        "embedding_batch_size_max": 32,
+        "embedding_batch_size_max": 7,
         "device": "cpu",
 
         "emb_store": "sidecar",
@@ -228,6 +257,22 @@ def _main():
     # - resume rehydrates from checkpoint; preloading obs causes duplicates
     mgr.start(obs, emb)
 
+    # Record exactly which frames the pipeline marks as embedding-safe.
+    _mark_safe_frames = []
+    _orig_mark_embedding_safe = getattr(mgr, "mark_embedding_safe", None)
+    if _orig_mark_embedding_safe is not None:
+        def _wrapped_mark_embedding_safe(*a, **k):
+            # Accept either positional or keyword `frame_idx`.
+            if "frame_idx" in k:
+                f = int(k["frame_idx"])
+            elif len(a) >= 1:
+                f = int(a[0])
+            else:
+                f = -1
+            _mark_safe_frames.append(f)
+            return _orig_mark_embedding_safe(*a, **k)
+        mgr.mark_embedding_safe = _wrapped_mark_embedding_safe
+
     fp = SpyFP(total=320)
     det = DummyDetector(fp, shot1_last=102)
 
@@ -245,6 +290,7 @@ def _main():
             checkpoint=mgr,
             detect_interval=args.detect_interval,
             resume_enabled=(args.mode == "resume"),
+            embedding_queue_max_pending=7,
         )
 
         tracks = sorted(tracks, key=lambda t: (int(getattr(t,"shot_id",0)), t.first_frame(), int(getattr(t,"track_id",0))))
@@ -283,11 +329,17 @@ def _main():
 
     try:
         status = mgr.read_status() or {}
-        anchor = int(status.get("last_detection_frame") or 0)
+        anchor = int(status.get("last_embedding_safe_frame") or 0)
     except Exception:
         anchor = 0
 
-    print(f"ANCHOR:{anchor}", flush=True)
+    # Emit the safe-frame marks for the outer test to validate.
+    try:
+        print("MARK_SAFE_FRAMES:" + ",".join(str(x) for x in _mark_safe_frames), flush=True)
+    except Exception:
+        print("MARK_SAFE_FRAMES:", flush=True)
+
+    print(f"EMB_SAFE_ANCHOR:{anchor}", flush=True)
     sys.exit(exit_code)
 
 
@@ -304,11 +356,75 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     Three-phase cold / crash / resume with 1→3 faces.
 
     Contract:
-      - Completed shots must have embeddings persisted for DETECTED frames.
-      - The anchor shot may have no embeddings persisted yet.
+      - Embeddings are persisted in batches (flush occurs when the aligned-face cache reaches
+        embedding_batch_size_max, and possibly at end-of-shot).
+      - For this test we use embedding_batch_size_max=7, and we assume every detection produces a
+        valid aligned faces per every face present in the frame.
+      - For this test, Shot 1 has 1 face per frame, Shot 2 has 3 faces per frame.
+      - Anchor is the last embedding-safe frame.
+      - IMPORTANT:
+        "embedding payload frame" and "embedding-safe frame" are not always the same thing.
+        The embedding payload frame is the newest frame that actually contributed embeddings in the
+        flush/drain batch. The embedding-safe frame is the frame whose processing caused that
+        flush/drain boundary to complete. Once that boundary completes, all embeddings up to the
+        embedding-safe frame are durable.
+      - IMPORTANT: the aligned-face cache is RESET at shot boundaries.
+        At each shot boundary we do a FINAL FLUSH of whatever remains in the cache.
+      - IMPORTANT:
+        The first frame of a new shot is always a detection frame, even when that frame is not
+        aligned to a detect_interval. For this test, the first frame of shot 2 is not aligned
+        with the detection interval.
 
-    Under this contract, anchor is the last *completed-shot* detection frame.
-    Shot 1 detection frames are 0,10,...,100, so expected anchor is 100.
+    With detect_interval=10 and crash at frame 134:
+      - Shot 1 (frames <= 102) has 1 face per detection frame (0..100 step 10): 11 faces.
+        With max_pending=7:
+          * We flush at frame 60 (the 7th face arrives).
+          * 4 remain queued aligned faces (at frames 70,80,90,100) are flushed at the shot boundary.
+        For Shot 1:
+          * frame 60 is both the embedding payload frame and the embedding-safe frame for the first flush
+          * frame 100 is the embedding payload frame for the shot-end drain
+          * frame 102 is the embedding-safe frame for the shot-end drain, because the drain is called
+            while processing the final frame of the shot
+      - Shot 2 begins with an EMPTY cache (reset at shot boundary).
+        With detect_interval=10, the cadence-aligned detection frames before crashing at 134 are:
+        110, 120, 130.
+      - Shot 2 begins on frame 103 which is treated as a detection frame (as happens at every shot boundary).
+        Therefore Shot 2 detection frames before crashing at 134 are: 103, 110, 120, 130.
+
+        Each detection frame in Shot 1 has 1 face.
+        Pending and persisted progression:
+          * after 0  -> 1 pending, 0 total persisted
+          * after 10 -> 2 pending, 0 total persisted
+          * after 20 -> 3 pending, 0 total persisted
+          * after 30 -> 4 pending, 0 total persisted
+          * after 40 -> 5 pending, 0 total persisted
+          * after 50 -> 6 pending, 0 total persisted
+          * at 60 -> 7 pending, flush triggers and persists all 7; queue empty
+                     7 total persisted
+          * after 70 -> 1 pending, 7 total persisted
+          * after 80 -> 2 pending, 7 total persisted
+          * after 90 -> 3 pending, 7 total persisted
+          * after 100 -> 4 pending, 7 total persisted
+          * at shot end (102) -> end-of-shot drain persists remaining 4; queue empty
+                                 embedding payload frame = 100, embedding-safe frame = 102
+                                 11 total persisted
+
+        Each detection frame in Shot 2 has 3 faces.
+        Pending and persisted progression:
+          * after 103 -> 3 pending, 11 total persisted
+          * after 110 -> 6 pending, 11 total persisted
+          * at 120, first face -> 7 pending, flush triggers and persists all 7; queue empty
+                                 embedding payload frame = 120, embedding-safe frame = 120
+                                 18 total persisted
+                    2 more faces remain from that frame -> 2 pending
+                                 end-of-frame drain persists those 2; queue empty
+                                 20 total persisted
+          * after 130 -> 3 pending, 20 total persisted
+          * at 134 -> crash; frame-130 faces are not yet persisted
+                      Final: 20 total persisted
+
+        Therefore the crash-run embedding-safe marks should be [60, 102, 120].
+        The final embedding-safe frame before the crash is 120, with 20 embeddings persisted.
     """
     shim = tmp_path / "run_three_phase.py"
     shim.write_text(SHIM)
@@ -361,19 +477,48 @@ def test_resume_three_phase_isolated(tmp_path: Path):
         "--obs-npz", str(run_obs_npz),
         "--emb-npz", str(run_emb_npz),
         "--out-json", str(crash_json),
-        "--crash-frame", "124",
+        "--crash-frame", "134",
         ok=(0, 1, 2),
         env=_with_repo_env(),
     )
     anchor = _extract_anchor(cp_crash.stdout, cp_crash.stderr)
-    assert anchor == 120, f"expected anchor 120 for crash at frame 124 under completed-shot anchoring, got {anchor}"
+    mark_safe_frames = _extract_mark_safe_frames(cp_crash.stdout, cp_crash.stderr)
+    assert mark_safe_frames, f"expected at least one mark_embedding_safe call, got none.\n{cp_crash.stdout}\n{cp_crash.stderr}"
+
+    # Current contract:
+    # - embedding-safe refers to the frame whose processing completed a flush/drain boundary
+    # - shot 1 contributes safe marks at 60 and 102:
+    #     * 60 when the 7th pending face arrives
+    #     * 102 when the remaining 4 pending faces are drained at shot end
+    # - shot 2 begins at frame 103, which is always treated as a detection frame at shot start
+    # - then scheduled detections occur at 110 and 120
+    # - frame 120 crosses the max_pending=7 flush fence and becomes the last embedding-safe frame
+    #   before the crash at 134
+    assert mark_safe_frames == [60, 102, 120], (
+        f"expected safe marks [60, 102, 120], got {mark_safe_frames}"
+    )
+
+    # Current contract:
+    # Final crash-run anchor remains 120 because shot 2 advances the safe point beyond shot 1.
+    # Note that Shot 1's last embedding payload frame is 100, but its shot-end embedding-safe frame is 102.
+    # - At start of Shot 2 Frame 103 is detected immediately
+    # - then scheduled detections occur at 110 and 120
+    # - frame 120 crosses the max_pending=7 flush fence and becomes the last embedding-safe frame
+    #   before the crash at 134
+    assert max(mark_safe_frames) == 120, (
+        f"expected mark_embedding_safe max frame 120, got {max(mark_safe_frames)}. "
+        f"all={mark_safe_frames} anchor={anchor}"
+    )
+    assert anchor == 120, (
+        f"expected anchor 120, got {anchor}. mark_safe_frames={mark_safe_frames}"
+    )
 
     # ---- Contract check on the crash-run sidecars ----
     obs_pre = _load_obs_npz(run_obs_npz)
     emb_pre = _load_emb_npz(run_emb_npz)
     emb_count_pre = int(emb_pre.shape[0])
 
-    DET_CODE = 0
+    DET_CODE = int(src_to_code(Source.DETECTED.value))
 
     # Shot 1 is completed by anchor, so all its DETECTED rows must have embeddings.
     shot1_det = obs_pre[(obs_pre["shot"] == 1) & (obs_pre["src"] == DET_CODE)]
@@ -384,12 +529,105 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     assert shot1_det.shape[0] == 11, f"expected 11 DET rows for shot1 (single face), got {shot1_det.shape[0]}"
 
     emb_idx = shot1_det["emb_idx"].astype(int)
-    assert np.all(emb_idx >= 0), f"found missing emb_idx on completed-shot DET rows: {emb_idx.tolist()}"
+    # Deterministic invariant for this test:
+    # - With max_pending=7 and 1 face/detection in shot 1:
+    #   * frame 60 triggers the 7th pending -> flush, so 60 is both payload frame and safe frame
+    #   * the remaining 4 (frames 70,80,90,100) flush at shot boundary
+    #   * for that shot-boundary drain, 100 is the embedding payload frame, while 102 is the
+    #     embedding-safe frame because the drain completes while processing the final frame
+    # - Therefore ALL shot1 DET rows must have an embedding pre-crash.
+    assert np.all(emb_idx >= 0), f"found missing emb_idx on shot1 DET rows: {emb_idx.tolist()}"
 
+    # Shot 1 persistence contract:
+    # - flush fence max_pending=7 is reached at frame 60
+    # - the first 7 detection frames therefore persist before frame 70 arrives
+    # - the remaining 4 detection frames (70,80,90,100) persist at the shot boundary drain
+    # - because shot 1 has exactly one face per detection frame, the persisted embedding rows
+    #   referenced by shot-1 DET observations are exactly indices 0..10
+    shot1_emb_idx = shot1_det["emb_idx"].astype(int)
+    assert sorted(shot1_emb_idx.tolist()) == list(range(11)), (
+        "shot1 DET rows should reference exactly the first 11 persisted embeddings "
+        "(one per detection frame from 0 through 100). "
+        f"got {sorted(shot1_emb_idx.tolist())}"
+    )
+    # The persisted embedding payload for shot 1 ends at frame 100, even though the shot-end
+    # embedding-safe mark should be 102 under the current intended contract.
+    assert int(shot1_emb_idx.min()) == 0
+    assert int(shot1_emb_idx.max()) == 10
+
+    # Shot 2 pre-crash contract:
+    # - The new shot starts at frame 103.
+    # - Because the shot begins with no active tracker / no open tracks, the pipeline performs an
+    #   immediate detection at 103 even though 103 is not on the detect_interval cadence.
+    # - With 3 faces per detection frame and max_pending=7:
+    #     103 -> 3 pending
+    #     110 -> 6 pending
+    #     120 -> first face reaches 7, causing a flush; end-of-frame drain persists the other two
+    #            faces from frame 120 as well; for shot 2, payload frame and safe frame are both 120
+    # - Therefore pre-crash DET observation rows in shot 2 may exist for frames 103, 110, 120, 130.
+    # - Frame 130 may appear as a DET observation row because observations can be persisted ahead
+    #   of embedding durability.
+    # - However, only frames 103, 110, and 120 are embedding-safe before the crash.
+    # - Frame 130 observations exist, but their embeddings are not yet persisted/linked.
+
+    # Absolute persisted-embedding count pre-crash:
+    # - shot 1: 11 faces persisted (7 at frame 60 + 4 at shot boundary)
+    # - shot 2 through frame 120: 9 faces persisted (3 @ 103, 3 @ 110, 3 @ 120)
+    # Total = 20
+    assert emb_count_pre == 20, f"expected 20 persisted embeddings pre-crash, got {emb_count_pre}"
+
+    shot2_det = obs_pre[(obs_pre["shot"] == 2) & (obs_pre["src"] == DET_CODE)]
+    shot2_det_frames = sorted(set(int(f) for f in shot2_det["f"].astype(int).tolist()))
+    assert shot2_det_frames == [103, 110, 120, 130], (
+        "unexpected DET frames for shot 2 before crash; "
+        "under the current contract, DET observations may already exist for frame 130 "
+        "even though frame 130 is not yet embedding-safe.\n"
+        f"got {shot2_det_frames}"
+    )
+
+    # Separate persisted-vs-not-yet-persisted by emb_idx linkage.
+    shot2_det_safe = shot2_det[shot2_det["emb_idx"].astype(int) >= 0]
+    shot2_det_unsafe = shot2_det[shot2_det["emb_idx"].astype(int) < 0]
+
+    shot2_det_safe_frames = sorted(set(int(f) for f in shot2_det_safe["f"].astype(int).tolist()))
+    shot2_det_unsafe_frames = sorted(set(int(f) for f in shot2_det_unsafe["f"].astype(int).tolist()))
+
+    assert shot2_det_safe_frames == [103, 110, 120], (
+        "unexpected embedding-safe DET frames for shot 2 before crash; "
+        "only 103, 110, and 120 should have persisted embeddings pre-crash.\n"
+        f"got {shot2_det_safe_frames}"
+    )
+    assert shot2_det_unsafe_frames == [130], (
+        "unexpected non-embedding-safe DET frames for shot 2 before crash; "
+        "frame 130 should exist only as unembedded DET observations at crash time.\n"
+        f"got {shot2_det_unsafe_frames}"
+    )
+
+    assert shot2_det_safe.shape[0] == 9, (
+        f"expected 9 embedding-safe DET rows for shot 2 pre-crash "
+        f"(3 faces x 3 frames: 103, 110, 120), got {shot2_det_safe.shape[0]}"
+    )
+    assert shot2_det_unsafe.shape[0] == 3, (
+        f"expected 3 non-embedding-safe DET rows for frame 130 pre-crash, "
+        f"got {shot2_det_unsafe.shape[0]}"
+    )
+
+    # emb_idx should reference valid embedding rows.
     max_idx = int(emb_idx.max()) if emb_idx.size else -1
+    assert max_idx == 10, f"expected max emb_idx 10 for shot1 (0-based, 11 rows), got {max_idx}"
     assert emb_count_pre > max_idx, (
-        f"embedding sidecar too small for completed-shot DET rows: "
+        f"embedding sidecar too small for shot1 DET rows: "
         f"emb_count={emb_count_pre}, max_emb_idx={max_idx}"
+    )
+
+    # Across both shots, pre-crash persisted embeddings should cover:
+    # - shot 1 frames 0..100 inclusive on the 10-frame cadence (11 embeddings total)
+    # - shot 2 frames 103, 110, 120 with 3 faces each (9 embeddings total)
+    # This also documents why the pre-crash anchor is 120 rather than 130, and why Shot 1's
+    # final embedding payload frame (100) differs from its shot-end embedding-safe frame (102).
+    shot2_max_idx = int(shot2_det["emb_idx"].astype(int).max()) if shot2_det.size else -1
+    assert shot2_max_idx == 19, (
+        f"expected last pre-crash embedding index to be 19, got {shot2_max_idx}"
     )
 
     # ---- C) Resume run (must use the crash-run sidecars) ----
@@ -412,14 +650,29 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     post_obs = _load_obs_npz(run_obs_npz)
     assert post_obs.size > 0, "resume wrote an empty observations sidecar"
 
-    def _post_anchor(trs):
-        return [t for t in trs if int(t["first_frame"]) > anchor]
+    def _post_anchor_segments(trs):
+        out = []
+        for t in trs:
+            first = int(t["first_frame"])
+            last = int(t["last_frame"])
+            if last <= anchor:
+                continue
+            out.append({
+                "shot_id": int(t["shot_id"]),
+                "track_id": int(t["track_id"]),
+                "global_id": int(t["global_id"]),
+                "first_frame": max(first, anchor + 1),
+                "last_frame": last,
+            })
+        out.sort(key=lambda t: (t["shot_id"], t["first_frame"], t["last_frame"], t["track_id"]))
+        return out
 
-    cold_post = _post_anchor(cold_tracks)
-    resume_post = _post_anchor(resume_tracks)
+    cold_post = _post_anchor_segments(cold_tracks)
+    resume_post = _post_anchor_segments(resume_tracks)
 
     assert len(cold_post) == len(resume_post), (
-        f"post-anchor track count drift: cold={len(cold_post)} resume={len(resume_post)} (anchor={anchor})"
+        f"post-anchor segment count drift: cold={len(cold_post)} resume={len(resume_post)} "
+        f"(anchor={anchor}, cold={cold_post}, resume={resume_post})"
     )
 
     for a, b in zip(cold_post, resume_post):

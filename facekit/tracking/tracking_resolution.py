@@ -1,6 +1,7 @@
 import numpy as np
 from typing import Optional, List
 from dataclasses import dataclass
+from typing import Tuple, Dict, Any
 import math
 import torch
 import torch.nn.functional as F
@@ -65,7 +66,48 @@ class GlobalIdentityResolver:
         Returns:
             int: The next available global_id after assignment.
         """
+
         # ---------- helpers ----------
+        def track_key(t: FaceTrack) -> Tuple[int, int, int, int, int]:
+            """
+            Stable key for determinism across cold/resume.
+            Avoid using list indices and track_id.
+            Use track content:
+              - shot_id
+              - segment_id (if present; else large sentinel)
+              - first_frame, last_frame
+              - first bbox (rounded to int pixels) as an additional stable tie-break
+            """
+            shot = int(getattr(t, "shot_id", -1))
+            seg  = getattr(t, "segment_id", None)
+            segk = int(seg) if seg is not None else (1 << 30)
+            try:
+                f0 = int(t.first_frame())
+            except Exception:
+                obs = getattr(t, "observations", None) or []
+                f0 = int(getattr(obs[0], "frame_idx", 1 << 30)) if obs else (1 << 30)
+            try:
+                f1 = int(t.last_frame())
+            except Exception:
+                obs = getattr(t, "observations", None) or []
+                f1 = int(getattr(obs[-1], "frame_idx", -1)) if obs else -1
+
+            # geometry tie-break: first bbox (int pixels), if available
+            x1 = y1 = x2 = y2 = (1 << 30)
+            obs = getattr(t, "observations", None) or []
+            if obs:
+                bb = getattr(obs[0], "bbox", None)
+                if bb is not None and len(bb) == 4:
+                    try:
+                        x1, y1, x2, y2 = (int(round(float(bb[0]))),
+                                          int(round(float(bb[1]))),
+                                          int(round(float(bb[2]))),
+                                          int(round(float(bb[3]))))
+                    except Exception:
+                        pass
+
+            return (shot, segk, f0, f1, x1, y1, x2, y2)
+
         def robust_center(emb_list: List[np.ndarray], cutoff: float = 0.30) -> Optional[np.ndarray]:
             E = np.stack(emb_list).astype(np.float32)
             # row-normalize to unit length
@@ -137,12 +179,7 @@ class GlobalIdentityResolver:
         if self._audit:
             logging.info("GI-AUDIT INPUT: count=%d", len(tracks))
             # Deterministic order for diffs
-            def _key(t):
-                return (int(getattr(t, "shot_id", -1)),
-                        int(getattr(t, "segment_id", 1<<30) if getattr(t, "segment_id", None) is not None else 1<<30),
-                        int(getattr(t, "track_id", -1)),
-                        _tspan(t)[0])
-            for t in sorted(tracks, key=_key):
+            for t in sorted(tracks, key=track_key):
                 s  = int(getattr(t, "shot_id", -1))
                 sg = getattr(t, "segment_id", None)
                 tid= int(getattr(t, "track_id", -1))
@@ -156,27 +193,36 @@ class GlobalIdentityResolver:
 
         # Step 0: Group tracks by (shot_id, segment_id)
         # Fall back to per-track grouping when no segment_id present
-        groups = {}  # key -> dict with: members (indices), all_embs, shot_id, span_start, span_end
-        for i, t in enumerate(tracks):
+        groups: Dict[Any, dict] = {}  # key -> dict with: members (tracks), member_keys, all_embs, shot_id, span_start, span_end
+        for t in tracks:
             shot_id = getattr(t, "shot_id", None)
             shot_face_id = getattr(t, "segment_id", None)
 
             if shot_face_id is None:
-                # fallback to per-track behavior - track missing segment_id
-                key = ("__per_track__", i)
+                # fallback to per-track behavior - use stable key so it is deterministic
+                key = ("__per_track__", track_key(t))
             else:
                 key = (shot_id, shot_face_id)
 
             g = groups.setdefault(key, {
-                "members": [], "all_embs": [], "shot_id": shot_id,
+                "members": [], "member_keys": [], "all_embs": [], "shot_id": shot_id,
                 "span_start": None, "span_end": None
             })
-            g["members"].append(i)
+            g["members"].append(t)
+            g["member_keys"].append(track_key(t))
 
             embs = getattr(t, "embeddings", None)
             if embs:
                 # extend all embeddings for robust averaging
-                g["all_embs"].extend([np.asarray(e, dtype=np.float32) for e in embs])
+                for e in embs:
+                    if e is None:
+                        continue
+                    arr = np.asarray(e, dtype=np.float32)
+                    if arr.ndim != 1:
+                        continue
+                    if not np.isfinite(arr).all():
+                        continue
+                    g["all_embs"].append(arr)
 
             # accumulate span
             s0 = first_frame(t); s1 = last_frame(t)
@@ -185,12 +231,19 @@ class GlobalIdentityResolver:
                 g["span_end"]   = s1 if g["span_end"]   is None else max(g["span_end"],   s1)
             
         if self._audit:
-            for key, g in sorted(groups.items(), key=lambda kv: (
-                -1 if kv[0][0] == "__per_track__" else int(kv[0][0]),
-                -1 if kv[0][0] == "__per_track__" else (int(kv[0][1]) if kv[0][1] is not None else (1<<30))
-            )):
+            def _group_sort_key(item):
+                key, g = item
                 if key[0] == "__per_track__":
-                    logging.info("GI-GROUP: per_track idx=%d members=%s", int(key[1]), g["members"])
+                    # put per-track groups after real (shot, seg) groups; stable by the embedded track_key tuple
+                    return (1, key[1])
+                shot_id, seg_id = key
+                shot_sort = int(shot_id) if shot_id is not None else -1
+                seg_sort  = int(seg_id)  if seg_id  is not None else (1 << 30)
+                return (0, shot_sort, seg_sort)
+
+            for key, g in sorted(groups.items(), key=_group_sort_key):
+                if key[0] == "__per_track__":
+                    logging.info("GI-GROUP: per_track key=%s members=%s", key[1], g["members"])
                 else:
                     logging.info("GI-GROUP: shot=%d seg=%s members=%s span=[%s..%s] embs=%d",
                                  int(g["shot_id"]) if g["shot_id"] is not None else -1,
@@ -205,7 +258,19 @@ class GlobalIdentityResolver:
         starts = []
         ends = []
 
-        for key, g in groups.items():
+        def _rep_group_sort_key(item):
+            key, g = item
+            if key[0] == "__per_track__":
+                # key[1] is already a stable track_key tuple
+                return (1, key[1])
+            shot_id, seg_id = key
+            shot_sort = int(shot_id) if shot_id is not None else -1
+            seg_sort  = int(seg_id)  if seg_id  is not None else (1 << 30)
+            # add min member key for extra determinism if you ever get duplicate (shot, seg) keys by mistake
+            min_member = min(g["member_keys"]) if g["member_keys"] else (1<<30,)*5
+            return (0, shot_sort, seg_sort, min_member)
+
+        for key, g in sorted(groups.items(), key=_rep_group_sort_key):
             if g["all_embs"]:
                 rep = robust_center(g["all_embs"])
                 if rep is None:
@@ -229,7 +294,8 @@ class GlobalIdentityResolver:
            return start_id
         
         # Map: group index -> member track indices
-        group_members = [groups[k]["members"] for k in group_keys]
+        group_members = [groups[k]["members"] for k in group_keys]          # List[List[FaceTrack]]
+        group_member_keys = [groups[k]["member_keys"] for k in group_keys]  # List[List[track_key]]
 
         # Step 2: Compute similarities among group reps
         emb_tensor = torch.tensor(np.stack(reps), dtype=torch.float32, device=self.device)
@@ -248,20 +314,17 @@ class GlobalIdentityResolver:
             for j in range(i + 1, m):
                 s = row[j]
                 if s + tol >= emb_threshold:
-                    # stable ordering by original smallest track index in each group, then by other
-                    # (helps determinism in ID numbering)                    
-                    lo = min(group_members[i]) if group_members[i] else 10**9
-                    hi = min(group_members[j]) if group_members[j] else 10**9
-                    if lo > hi:
-                        lo, hi = hi, lo
+                    # stable ordering by smallest stable track_key in each group
+                    lo = min(group_member_keys[i]) if group_member_keys[i] else (1<<30,)*8
+                    hi = min(group_member_keys[j]) if group_member_keys[j] else (1<<30,)*8
+                    if lo > hi: lo, hi = hi, lo
                     edges.append((s, i, j, lo, hi))
 
-        edges.sort(key=lambda x: (-x[0], x[3], x[4]))  # similarity desc, then stable tiebreak
+        edges.sort(key=lambda x: (-float(x[0]), x[3], x[4]))  # similarity desc, then stable tiebreak
         if self._audit:
             logging.info("GI-EDGES: threshold=%.3f candidates=%d", emb_threshold, len(edges))
             for s, i, j, lo, hi in edges:
-                logging.info("GI-EDGE: sim=%.4f i=%d j=%d tiebreak=(%d,%d)", float(s), i, j, lo, hi)
-
+                logging.info("GI-EDGE: sim=%.4f i=%d j=%d tiebreak=(%s,%s)", float(s), i, j, lo, hi)
 
         # Step 3: Union-Find (Disjoint Set) with must-not-link constraint
         parent = list(range(m))
@@ -285,7 +348,7 @@ class GlobalIdentityResolver:
             # ---- must-not-link: forbid merging if any same-shot intervals overlap ----
             spans_a = comp_spans[ra]
             spans_b = comp_spans[rb]
-            shared_shots = set(spans_a.keys()) & set(spans_b.keys())
+            shared_shots = (set(spans_a.keys()) & set(spans_b.keys())) - {-1}
 
             if shared_shots:
 
@@ -343,31 +406,26 @@ class GlobalIdentityResolver:
             return earliest
 
         # Stable ordering: earliest frame, then smallest member track index in the component
-        def comp_tiebreak(nodes: List[int]) -> int:
-            # choose the smallest original track index present in this component
-            return min(min(group_members[gi]) for gi in nodes if group_members[gi])
+        def comp_tiebreak(nodes: List[int]) -> Tuple[int, int, int, int, int]:
+            # choose the smallest stable key present in this component
+            # (now independent of transient track_id)
+            return min(min(group_member_keys[gi]) for gi in nodes if group_member_keys[gi])
         components = sorted(
             root_to_nodes.values(),
             key=lambda nodes: (comp_earliest_frame(nodes), comp_tiebreak(nodes))
         )
-
-        # Validate inputs: each track must have observations
-        for t in tracks:
-            obs = getattr(t, "observations", None)
-            if not obs:
-                raise ValueError("GlobalIdentityResolver: track has no observations")
  
         gid_assignments = []  # for audit dump
         for comp in components:
             for local_idx in comp:
-                for tr_idx in group_members[local_idx]:   
-                    tracks[tr_idx].global_id = start_id
+                for tr in group_members[local_idx]:
+                    tr.global_id = start_id
                     gid_assignments.append((start_id,
-                        int(getattr(tracks[tr_idx], "shot_id", -1)),
-                        int(getattr(tracks[tr_idx], "segment_id", -1) if getattr(tracks[tr_idx], "segment_id", None) is not None else -1),
-                        int(getattr(tracks[tr_idx], "track_id", -1)),
-                        _tspan(tracks[tr_idx])[0],
-                        _tspan(tracks[tr_idx])[1],
+                        int(getattr(tr, "shot_id", -1)),
+                        int(getattr(tr, "segment_id", -1) if getattr(tr, "segment_id", None) is not None else -1),
+                        int(getattr(tr, "track_id", -1)),
+                        _tspan(tr)[0],
+                        _tspan(tr)[1],
                     ))
             start_id += 1
         if self._audit:
@@ -378,17 +436,18 @@ class GlobalIdentityResolver:
 
         # Step 5: Assign unique IDs to tracks without embeddings
         # (Rare: groups existed but had zero embs; or tracks with no embs at all)
-        assigned = {idx for members in group_members for idx in members}
+        assigned = {id(t) for members in group_members for t in members}
         # Assign leftovers (tracks without any group rep / embeddings) AFTER components, by earliest frame
-        leftovers = [(i, t) for i, t in enumerate(tracks) if i not in assigned]
-        def _first_abs_frame_track(t: FaceTrack) -> int:
+        leftovers = [t for t in tracks if id(t) not in assigned]
+        def _leftover_sort_key(t: FaceTrack):
             try:
-                return int(t.first_frame())
+                f0 = int(t.first_frame())
             except Exception:
                 obs = getattr(t, "observations", None) or []
-                return int(getattr(obs[0], "frame_idx", 1 << 30)) if obs else (1 << 30)
-        leftovers.sort(key=lambda it: _first_abs_frame_track(it[1]))
-        for _, t in leftovers:
+                f0 = int(getattr(obs[0], "frame_idx", 1 << 30)) if obs else (1 << 30)
+            return (f0, track_key(t))
+        leftovers.sort(key=_leftover_sort_key)
+        for t in leftovers:
             t.global_id = start_id
             start_id += 1
 
