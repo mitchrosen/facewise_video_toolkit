@@ -87,7 +87,8 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
     # ------------------------------
     # 4) Detector / embedder stubs
     # ------------------------------
-    def fake_load_yolo5face_model(detector_model, config, device=None):
+    def fake_load_yolo5face_model(detector_model, config, *, device=None, min_face=10, **kwargs):
+
         class DummyYOLO:
             pass
         return DummyYOLO()
@@ -138,7 +139,16 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
 
     class FakeCheckpointManager:
         @staticmethod
-        def open(parent_dir, video_path, options_snapshot, no_resume, force_new_run, run_id, resume_latest):
+        def open(
+            parent_dir,
+            video_path,
+            options_snapshot,
+            no_resume,
+            force_new_run,
+            run_id,
+            resume_latest,
+            **kwargs,
+        ):
             return FakeCheckpoint(parent_dir / "fake-run")
 
     monkeypatch.setattr(cli, "CheckpointManager", FakeCheckpointManager)
@@ -156,6 +166,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         embedding_thresh=0.7,
         detect_interval=10,
         embedding_batch_size_max=32,
+        embedding_queue_max_pending=1024,
         checkpoint=None,
         resume_enabled=True,
     ):
@@ -230,6 +241,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         detector_model="dummy-detector.pt",
         embedding_model="dummy-emb.onnx",
         config="dummy-config.yaml",
+        min_face=10,
         shot_segmentation=str(shot_json_path),
         schema_version="2.1",
         schema_dir=None,
@@ -241,6 +253,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         post_min_track_len=70,
         post_iou_threshold=0.2,
         embedding_batch_size_max=32,
+        embedding_queue_max_pending=1024,
         device="cpu",
         emb_store="sidecar",
         emb_sidecar_path=None,

@@ -10,3 +10,7 @@ __pycache__/
 *.log
 *.idea/
 *.ipynb_checkpoints/
+
+# large test videos (kept local)
+/tests/assets/videos/hot-to-go.mp4
+/tests/assets/videos/53-man-roster-decisions.mp4

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Literal, Union, Callable
+from typing import cast
 from pathlib import Path
 import numpy as np
 import json
@@ -42,6 +43,25 @@ def _bbox_to_center_size_xyxy(bbox: XYXY) -> Tuple[float, float, float, float]:
     w = (x2 - x1)
     h = (y2 - y1)
     return cx, cy, w, h
+
+def _clip_bbox_xyxy(
+    b: Tuple[float, float, float, float], W: int, H: int
+) -> Tuple[float, float, float, float]:
+    """
+    Clip bbox to frame bounds for summary statistics only.
+    Raw per-frame bboxes remain untouched.
+    """
+    x1, y1, x2, y2 = b
+    x1 = max(0.0, min(float(W), x1))
+    x2 = max(0.0, min(float(W), x2))
+    y1 = max(0.0, min(float(H), y1))
+    y2 = max(0.0, min(float(H), y2))
+    # Ensure correct ordering after clipping
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return (x1, y1, x2, y2)
 
 def _normalize(cx: float, cy: float, w: float, h: float, W: int, H: int, as_percent: bool) -> Tuple[float,float,float,float]:
     if not W or not H:
@@ -206,9 +226,6 @@ ObsRow = np.dtype([
     ("src", np.uint8),
     ("conf", np.float32),
     ("emb_idx", np.int32),
-
-    ("has_landmarks", np.uint8),            # 1 iff landmarks_flat10 is valid
-    ("landmarks_flat10", np.float32, (10,)) # [x1,y1,...,x5,y5] in ArcFace order
 ])
 
 class ObservationsCollector:
@@ -216,7 +233,7 @@ class ObservationsCollector:
     @property
     def columns(self) -> tuple[str, ...]:
         # Must match ObsRow exactly
-        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx","has_landmarks","landmarks_flat10")
+        return ("f","shot","track_id","bbox_xyxy","src","conf","emb_idx")
     
     @property
     def schema(self) -> dict:
@@ -225,10 +242,19 @@ class ObservationsCollector:
     def __init__(self) -> None:
         self._rows: List[np.ndarray] = []   # list of (k,) structured arrays
         self._count: int = 0
+        # Cache for deterministic "sidecar order" view:
+        # sidecar order is track-contiguous: (shot, track_id, frame)
+        self._sorted_cache: np.ndarray | None = None
+        self._slice_index: dict[tuple[int, int], tuple[int, int]] | None = None
+
+    def _invalidate_index(self) -> None:
+        self._sorted_cache = None
+        self._slice_index = None
 
     def reset(self) -> None:
         self._rows.clear()
         self._count = 0
+        self._invalidate_index()
 
     def find_rows(
         self,
@@ -239,7 +265,6 @@ class ObservationsCollector:
         count: int | None = None,
         # optional filters
         only_unassigned: bool | None = None,
-        only_with_landmarks: bool | None = None,
         source: int | None = None,
         **kwargs,
     ) -> list[tuple[int, int]]:
@@ -249,7 +274,6 @@ class ObservationsCollector:
         AND (emb_idx == -1 if only_unassigned)
         AND (f <= frame_last if provided)
         AND (src == source if provided)
-        AND (has_landmarks == 1 if only_with_landmarks)
 
         Ordering:
         Rows are returned newest→oldest (descending frame index), based on current storage order.
@@ -283,13 +307,6 @@ class ObservationsCollector:
                     continue
                 if source is not None and int(row["src"]) != int(source):
                     continue
-                if only_with_landmarks:
-                    if "has_landmarks" in row.dtype.names:
-                        if int(row["has_landmarks"]) != 1:
-                            continue
-                    else:
-                        # legacy checkpoints without landmarks field cannot satisfy this filter
-                        continue
 
                 out.append((b_idx, r_idx))
                 if want is not None and len(out) >= want:
@@ -411,16 +428,6 @@ class ObservationsCollector:
             src_code =_src_to_int(src_any)
             conf = float(row["conf"]) if ("conf" in row and row["conf"] is not None) else np.nan
 
-            # --- Landmarks (strict) ---
-            has_landmarks, lm_flat10 = CheckpointManager._landmarks_to_flat10(row)
-
-            # DETECTED rows must have landmarks
-            det_code = int(src_to_code(Source.DETECTED.value))
-            if int(src_code) == det_code and has_landmarks != 1:
-                raise ValueError(
-                    f"append_track_obs: DETECTED row missing landmarks "
-                    f"(shot={shot}, track_id={int(row['track_id'])}, f={f})"
-                )
             emb_idx = -1
             if emb_idx_fn is not None:
                 try:
@@ -435,13 +442,68 @@ class ObservationsCollector:
             block[i]["src"] = src_code
             block[i]["conf"] = conf
             block[i]["emb_idx"] = emb_idx
-            block[i]["has_landmarks"] = int(has_landmarks)
-            block[i]["landmarks_flat10"] = lm_flat10
 
         offset = self._count
         self._rows.append(block)
         self._count += k
+        self._invalidate_index()
         return (offset, k)
+    
+    def _sorted_array_for_sidecar(self) -> np.ndarray:
+        """
+        Return all collected rows, deterministically ordered for writing sidecars
+        and computing obs_offset/obs_count slices:
+          primary: shot
+          secondary: track_id
+          tertiary: frame index
+        """
+        if self._sorted_cache is not None:
+            return self._sorted_cache
+
+        arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        if arr.size == 0:
+            self._sorted_cache = arr
+            return arr
+
+        # lexsort uses last key as primary, so order keys reversed:
+        # primary shot, then track_id, then frame => keys (f, track_id, shot)
+        idx = np.lexsort((arr["f"], arr["track_id"], arr["shot"]))
+        arr_sorted = arr[idx].copy()
+        self._sorted_cache = arr_sorted
+        return arr_sorted
+
+    def _build_slice_index(self) -> dict[tuple[int, int], tuple[int, int]]:
+        """
+        Build mapping (shot, track_id) -> (offset, count) in the deterministic
+        sidecar ordering.
+        """
+        if self._slice_index is not None:
+            return self._slice_index
+
+        arr = self._sorted_array_for_sidecar()
+        out: dict[tuple[int, int], tuple[int, int]] = {}
+        if arr.size == 0:
+            self._slice_index = out
+            return out
+
+        # Single pass because arr is already grouped by (shot, track_id)
+        cur_key: tuple[int, int] | None = None
+        start = 0
+        for i in range(arr.shape[0]):
+            key = (int(arr["shot"][i]), int(arr["track_id"][i]))
+            if cur_key is None:
+                cur_key = key
+                start = i
+                continue
+            if key != cur_key:
+                out[cur_key] = (int(start), int(i - start))
+                cur_key = key
+                start = i
+        if cur_key is not None:
+            out[cur_key] = (int(start), int(arr.shape[0] - start))
+
+        self._slice_index = out
+        return out
 
     def finalize_sidecar(
         self,
@@ -457,7 +519,7 @@ class ObservationsCollector:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        arr = self._sorted_array_for_sidecar()
         if min_frame_exclusive is not None and arr.size:
             arr = arr[arr["f"] > int(min_frame_exclusive)]
 
@@ -477,8 +539,6 @@ class ObservationsCollector:
                 {"name":"src","type":"u1","desc":"0=detected,1=tracked,2=flow"},
                 {"name":"conf","type":"f4","desc":"NaN if absent"},
                 {"name":"emb_idx","type":"i4","desc":"-1 if absent"},
-                {"name":"has_landmarks","type":"u1","desc":"1 if landmarks_flat10 is valid"},
-                {"name":"landmarks_flat10","type":"f4[10]","desc":"[x1,y1,...,x5,y5] ArcFace order"},
             ],
             "count": int(arr.shape[0]),
         }
@@ -490,7 +550,7 @@ class ObservationsCollector:
         min_frame_exclusive: int | None = None,
     ) -> str:
         final = Path(out_path).with_suffix(".npz")
-        arr = np.concatenate(self._rows, axis=0) if self._rows else np.empty(0, dtype=ObsRow)
+        arr = self._sorted_array_for_sidecar()
         if min_frame_exclusive is not None and arr.size:
             arr = arr[arr["f"] > int(min_frame_exclusive)]
         atomic_write_npz(final, observations=arr)
@@ -509,6 +569,7 @@ class ObservationsCollector:
             return 0
         self._rows.append(arr.copy())
         self._count += int(arr.shape[0])
+        self._invalidate_index()
         return int(arr.shape[0])
 
     def count(self) -> int:
@@ -536,6 +597,7 @@ class ObservationsCollector:
                 self._rows[-1] = last[:keep].copy()
                 cur = n
         self._count = cur
+        self._invalidate_index()
 
     def iter_tracks(
         self,
@@ -582,12 +644,6 @@ class ObservationsCollector:
                 if not np.isnan(conf):
                     d["conf"] = conf
 
-                # Landmarks: expose both has_landmarks + landmarks_flat10 (as Python list)
-                if "has_landmarks" in row.dtype.names:
-                    d["has_landmarks"] = int(row["has_landmarks"])
-                    if int(row["has_landmarks"]) == 1 and "landmarks_flat10" in row.dtype.names:
-                        d["landmarks_flat10"] = [float(x) for x in row["landmarks_flat10"]]
-
                 groups.setdefault((s, t), []).append(d)
 
         # sort rows within each group by frame, then yield once per group
@@ -605,21 +661,14 @@ class ObservationsCollector:
     def slice_for_track(self, shot: int, track_id: int) -> tuple[int, int]:
         """
         Return (offset, count) for all rows in this collector belonging to (shot, track_id).
-        Assumes rows for a (shot,track) are contiguous in append order.
+        Offsets are in the deterministic sidecar ordering: (shot, track_id, frame).
         """
-        # Reuse your existing row finder:
-        positions = self.find_rows(shot=int(shot), track_id=int(track_id))
-        count = len(positions)
-        if count == 0:
-            return (self._count, 0)  # next write-point as offset, zero count
+        idx = self._build_slice_index()
+        key = (int(shot), int(track_id))
+        if key not in idx:
+            return (0, 0)
+        return idx[key]
 
-        # Convert first (block_idx,row_idx) to a global offset.
-        # If you track a running base for each block, use that; otherwise compute:
-        # offset = sum(len(b) for b in self._rows[:first_block_idx]) + first_row_idx
-        first_block_idx, first_row_idx = positions[0]
-        offset = sum(self._rows[i].shape[0] for i in range(first_block_idx)) + first_row_idx
-        return (int(offset), int(count))
-    
     def frame_at_pos(self, pos: tuple[int,int]) -> int:
         b_idx, r_idx = pos
         return int(self._rows[b_idx]["f"][r_idx])
@@ -644,7 +693,7 @@ class ObservationsCollector:
                 new_count += int(sub.shape[0])
         self._rows = kept_blocks
         self._count = new_count
-
+        self._invalidate_index()
 
 class EmbeddingCollector:
     """
@@ -910,6 +959,9 @@ def build_v2_manifest_from_tracks(
                 avg_bbox = (xs1, ys1, xs2, ys2)
             else:
                 avg_bbox = (0.0, 0.0, 0.0, 0.0)
+
+            # Track drift can push avg bbox outside frame; clip summary bbox.
+            avg_bbox = _clip_bbox_xyxy(avg_bbox, W, H) if (W and H) else avg_bbox
             cx, cy, w, h = _bbox_to_center_size_xyxy(avg_bbox)
             cx, cy, w, h = _normalize(cx, cy, w, h, W, H, cfg.normalize_to_percent)
 
@@ -1127,6 +1179,19 @@ def build_v2_1_manifest_from_tracks(
     NOTE: This function has no side effects (does not write files).
     """
 
+    # Schema 2.1 contract: per-track rows live in an observations sidecar, so
+    # obs_offset/obs_count must be computed from an ObservationsCollector.
+    #
+    # If obs_collector is missing, emitting (0,0) silently produces invalid manifests
+    # (all slices point at nothing) and breaks downstream consumers.
+    if obs_collector is None:
+        # Allow truly-empty track lists (e.g. graphics-only passes) without requiring a collector.
+        if tracks:
+            raise ValueError(
+                "Schema 2.1 writer requires obs_collector to compute obs_offset/obs_count "
+                "(pass ObservationsCollector, or use schema 2.0 / a different output mode)."
+            )
+
     # Coerce embeddings inline->sidecar in 2.1 to keep model simple
     if emb_collector and getattr(emb_collector, "mode", None) == "inline":
         emb_collector.mode = "sidecar"
@@ -1163,6 +1228,9 @@ def build_v2_1_manifest_from_tracks(
                 avg_bbox = (xs1, ys1, xs2, ys2)
             else:
                 avg_bbox = (0.0, 0.0, 0.0, 0.0)
+
+            # Track drift can push avg bbox outside frame; clip summary bbox.
+            avg_bbox = _clip_bbox_xyxy(avg_bbox, W, H) if (W and H) else avg_bbox
             cx, cy, w, h = _bbox_to_center_size_xyxy(avg_bbox)
             cx, cy, w, h = _normalize(cx, cy, w, h, W, H, cfg.normalize_to_percent)
 
@@ -1177,15 +1245,10 @@ def build_v2_1_manifest_from_tracks(
             is_static = std_c < cfg.static_stddev_thresh_pct
 
             # Offload per-frame obs to sidecar and store slice
-            if obs_collector is None:
-                obs_offset, obs_count = (0, 0)
-            else:
-                shot_val = int(getattr(t, "shot_id", shot_number))
-                track_val = int(getattr(t, "track_id", -1))
-                obs_offset, obs_count = obs_collector.slice_for_track(
-                    shot_val, track_val
-                )
-                
+            shot_val = int(getattr(t, "shot_id", shot_number))
+            track_val = int(getattr(t, "track_id", -1))
+            obs_offset, obs_count = obs_collector.slice_for_track(shot_val, track_val)
+
             tracks.append({
                 "first_frame": int(f0),
                 "last_frame": int(f1),

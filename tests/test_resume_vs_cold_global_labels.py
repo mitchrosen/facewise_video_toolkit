@@ -189,9 +189,10 @@ def test_straight_through_vs_resume_same_global_labels(tmp_path: Path, monkeypat
     Contract:
       (1) DETECTED observations always carry valid (5,2) landmarks
       (2) On resume, DETECTED landmarks remain semantically correct (arr[0,0]=frame_idx+1)
-          for frames strictly after the resume anchor.
-      (3) Global IDs for tracks strictly after the anchor match between cold and resume
-          when re-resolved from the same seed on the post-anchor slices.
+          for frames strictly after the embedding-safe frame.
+      (3) Global IDs derived from work strictly after the embedding-safe frame
+          match between cold and resume when re-resolved from the same seed on
+          the post-safe slices.
     """
     anchor = 180
     shots = tmp_path / "shots.json"
@@ -268,13 +269,17 @@ def test_straight_through_vs_resume_same_global_labels(tmp_path: Path, monkeypat
     resume_ckpt_dir.mkdir(parents=True, exist_ok=True)
     (resume_ckpt_dir / "obs_ckpt.npz").write_bytes(cold_obs.read_bytes())
 
-    # Force the resume anchor
-    ckpt_resume.get_resume_anchor = lambda: (anchor,)
+    # Force the resume boundary to the embedding-safe frame.
+    # The embedding-safe frame is inclusive, so resumed work starts at frame+1.
+    ckpt_resume.get_resume_anchor = lambda: (anchor, 2, 103)
 
-    # (Optional consistency hints for logging)
-    ckpt_resume._last_det_frame = anchor
-    ckpt_resume._last_det_shot = 2
-    ckpt_resume._last_det_shot_first_frame = 103
+    # Optional consistency hints using embedding-safe semantics.
+    if hasattr(ckpt_resume, "_last_embedding_safe_frame"):
+        ckpt_resume._last_embedding_safe_frame = anchor
+    if hasattr(ckpt_resume, "_last_embedding_safe_shot"):
+        ckpt_resume._last_embedding_safe_shot = 2
+    if hasattr(ckpt_resume, "_last_embedding_safe_shot_first_frame"):
+        ckpt_resume._last_embedding_safe_shot_first_frame = 103
 
     resume_tracks = track_across_segments(
         frame_source=SpyFP(total=320),
@@ -286,8 +291,8 @@ def test_straight_through_vs_resume_same_global_labels(tmp_path: Path, monkeypat
     )
     resume_tracks = _ordered(resume_tracks)
 
-    # Contract check: post-anchor DET landmarks encode frame_idx+1
-    post_anchor_det_seen = False
+    # Contract check: post-safe DET landmarks encode frame_idx+1
+    post_safe_det_seen = False
     for t in resume_tracks:
         for o in getattr(t, "observations", []):
             if not _is_detected(o):
@@ -295,33 +300,56 @@ def test_straight_through_vs_resume_same_global_labels(tmp_path: Path, monkeypat
             f = int(o.frame_idx)
             if f <= anchor:
                 continue
-            post_anchor_det_seen = True
+            post_safe_det_seen = True
             arr = _lm5x2(o)
             expected = float(f + 1)
             assert float(arr[0, 0]) == expected, (
                 f"Resume landmark corruption at frame {f}: "
                 f"expected arr[0,0]={expected}, got {arr[0,0]}"
             )
-    assert post_anchor_det_seen, "expected at least one post-anchor DET observation in resume run"
+    assert post_safe_det_seen, "expected at least one post-safe DET observation in resume run"
 
-    # -------------------- Global ID contract (post-anchor) --------------------
-    def _post_anchor(trs, a):
-        return [t for t in trs if t.first_frame() > a]
+    # -------------------- Global ID contract (post-safe) --------------------
+    def _clone_post_safe_portion(track, safe_frame: int):
+        obs = [o for o in getattr(track, "observations", []) if int(o.frame_idx) > int(safe_frame)]
+        if not obs:
+            return None
 
-    cold_post = _ordered(_post_anchor(cold_tracks, anchor))
-    resm_post = _ordered(_post_anchor(resume_tracks, anchor))
+        clone = type(track)(
+            shot_id=int(getattr(track, "shot_id", -1)),
+            track_id=int(getattr(track, "track_id", -1)),
+            segment_id=getattr(track, "segment_id", None),
+            global_id=getattr(track, "global_id", None),
+            observations=list(obs),
+        )
 
-    # Resolve IDs on post-anchor slices with same seed
+        clone.embeddings = [
+            o.embedding for o in obs if getattr(o, "embedding", None) is not None
+        ]
+        return clone
+
+    def _post_safe_tracks(trs, safe_frame: int):
+        out = []
+        for t in trs:
+            clipped = _clone_post_safe_portion(t, safe_frame)
+            if clipped is not None:
+                out.append(clipped)
+        return out
+
+    cold_post = _ordered(_post_safe_tracks(cold_tracks, anchor))
+    resm_post = _ordered(_post_safe_tracks(resume_tracks, anchor))
+
+    # Resolve IDs on post-safe slices with same seed
     GlobalIdentityResolver().resolve_global_ids(cold_post, start_id=0)
     GlobalIdentityResolver().resolve_global_ids(resm_post, start_id=0)
 
     assert len(cold_post) == len(resm_post), (
-        f"post-anchor (> {anchor}) track count differs: cold={len(cold_post)} resume={len(resm_post)}"
+        f"post-safe (> {anchor}) track count differs: cold={len(cold_post)} resume={len(resm_post)}"
     )
 
     for a, b in zip(cold_post, resm_post):
         assert a.global_id == b.global_id, (
-            "global label drift post-anchor (> anchor): "
+            "global label drift post-safe (> embedding-safe frame): "
             f"cold gid={a.global_id} vs resume gid={b.global_id} "
             f"at shot={getattr(a, 'shot_id', None)} frame={a.first_frame()}"
         )

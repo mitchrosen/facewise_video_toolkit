@@ -109,24 +109,14 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
     )
 
     anchor = 30
-    ckpt._last_det_frame = anchor
-    ckpt._last_det_shot = 1
-    ckpt._last_det_shot_first_frame = 0
+    ckpt._last_emb_safe_frame = anchor
+    ckpt._last_emb_safe_shot = 1
+    ckpt._last_emb_safe_shot_first_frame = 0
 
     # ---- wire collectors exactly like prod ----
     oc = ObservationsCollector()
     embc = EmbeddingCollector(mode="sidecar", dim=512)
     ckpt.start(oc, embc, options_snapshot=opts)
-
-    # ---- pre-anchor DETECTED row with valid landmarks ----
-    lm = np.asarray(
-        [[11.0, 0.0],
-         [0.0, 0.0],
-         [0.0, 0.0],
-         [0.0, 0.0],
-         [0.0, 0.0]],
-        dtype=np.float32,
-    )
 
     oc.append_track_obs(
         [{
@@ -135,8 +125,6 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
             "f": 10,
             "bbox_xyxy": [0, 0, 10, 10],
             "src": "detected",
-            "has_landmarks": 1,
-            "landmarks": lm,
         }],
         emb_idx_fn=lambda _: -1,
     )
@@ -165,13 +153,13 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
 
     # ---- assertions ----
 
-    # A) rehydrate called once with anchor-1
+    # A) rehydrate called once strictly before the anchor; resume starts at anchor+1
     assert called["count"] == 1
     _, fm, to = called["args"]
     assert fm == anchor - 1
     assert isinstance(to, dict) and to
 
     # B) seek + start at anchor
-    assert ("reset", anchor) in fp.ops
-    first_after = fp.first_next_after_reset(anchor)
-    assert first_after == anchor
+    assert ("reset", anchor + 1) in fp.ops
+    first_after = fp.first_next_after_reset(anchor + 1)
+    assert first_after == anchor + 1

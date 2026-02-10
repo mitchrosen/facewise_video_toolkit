@@ -4,11 +4,26 @@ import logging
 
 from facekit.tracking.aggregator import ShotFaceTrackAggregator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
+from facekit.errors import ResumeSafetyError
 from facekit.common.obs_consts import Source
 from facekit.pipeline.resume_rehydrate import ResumePlan
 from facekit.tracking.face_structures import FaceTrack, FaceObservation
 
 logger = logging.getLogger(__name__)
+
+def _resume_enabled(checkpoint: object) -> bool:
+    return bool(getattr(checkpoint, 'resume_enabled', False))
+
+def _write_enabled(checkpoint: object) -> bool:
+    return not bool(getattr(checkpoint, 'write_disabled', False))
+
+def _checkpoint_active(checkpoint: object) -> bool:
+    """Whether the checkpoint object should participate in this run at all.
+
+    - If resume is enabled, we may still need in-memory guards even when writes are disabled.
+    - If writes are enabled, we obviously need it.
+    """
+    return _resume_enabled(checkpoint) or _write_enabled(checkpoint)
 
 def _checkpoint_root_dir(checkpoint) -> Path | None:
     """
@@ -119,8 +134,9 @@ def do_checkpoint(
     shot_first_frame :
         Absolute first frame of this shot (for status/debug).
     """
-    if not checkpoint:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
         return
+    
     try:
         checkpoint.checkpoint_now(
             frame_idx=frame_idx,
@@ -131,7 +147,6 @@ def do_checkpoint(
         )
     except Exception:
         logger.exception("checkpoint: failed to persist at detect frame %s", frame_idx)
-
 
 def _checkpoint_observations_and_snapshot(
     checkpoint: TrackingCheckpoint | None,
@@ -165,8 +180,26 @@ def _checkpoint_observations_and_snapshot(
     resume_plan :
         ResumePlan with anchor_frame for the anchor special case.
     """
-    if not checkpoint:
+    if not checkpoint or not _checkpoint_active(checkpoint):
         return
+    
+    # Resume guard (runtime-only): during a resumed run we may have *disk residue*
+    # for shots before the anchor, but we should never be *producing new* observations
+    # for frames earlier than the resume anchor within the anchor shot.
+    if _resume_enabled(checkpoint):
+        try:
+            anchor = checkpoint.get_resume_anchor()
+        except Exception:
+            anchor = None
+        if anchor is not None:
+            anchor_frame = int(anchor[0])
+            anchor_shot  = int(anchor[1])
+            if (anchor_shot is not None) and (int(shot_number) == int(anchor_shot)) and (int(frame_idx) < int(anchor_frame)):
+                raise ResumeSafetyError(
+                    "[ckpt] resume boundary violation: attempted to record observations "
+                    f"for frame {int(frame_idx)} before anchor {int(anchor_frame)} "
+                    f"in anchor_shot {int(anchor_shot)}"
+                )
 
     frame_obs_objs = aggregator.observations_at(frame_idx, require_track_id=True)
     if (not frame_obs_objs) and (frame_idx == resume_plan.anchor_frame):
@@ -232,7 +265,8 @@ def _checkpoint_observations_and_snapshot(
         checkpoint.add_observations(shot_number, frame_idx, frame_obs_objs)
 
     try:
-        if getattr(checkpoint, "snapshots_ready", False):
+        if (not bool(getattr(checkpoint, "write_disabled", False)) 
+            and getattr(checkpoint, "snapshots_ready", False)):
             checkpoint.write_checkpoint_snapshot(
                 name=f"detect-{shot_number}-{frame_idx}",
                 payload={
@@ -254,13 +288,14 @@ def _persist_embeddings_for_track(
 ) -> None:
     """
     Persist per-frame embeddings for a single track into the checkpoint sidecar.
+      - If resume is enabled, we  enforce resume-safety guards (boundary + no-double-write).
+      - If writes are enabled, we enforce artifact-integrity rules
+        before calling checkpoint.add_embeddings().
+     """
+    if not checkpoint or not _checkpoint_active(checkpoint):
+        return
 
-    B2 contract enforced here:
-      - embeddings may ONLY be written for DETECTED frames
-      - DETECTED frames must have valid landmarks
-      - (optional) refuse to overwrite an existing embedding for the same frame
-    """
-    if checkpoint is None or embs is None or int(getattr(embs, "shape", (0,))[0]) == 0:
+    if embs is None or int(getattr(embs, "shape", (0,))[0]) == 0:
         logging.info(f"end of shot {shot_number} and NO embeddings added to checkpoint")
         return
 
@@ -271,79 +306,79 @@ def _persist_embeddings_for_track(
 
     shot_i = int(shot_number)
     tid_i = int(track.track_id)
-
-    # ------------------------------------------------------------------
-    # Embeddings may ONLY be written for DETECTED
-    # frames AND those DETECTED frames must have landmarks.
-    # ------------------------------------------------------------------
     max_f = max(int(f) for f in frames_for_embed)
 
-    # 1) DETECTED frames up to max_f
+    resume_enabled = _resume_enabled(checkpoint)
+    write_enabled = _write_enabled(checkpoint)
+
+    # ------------------------------------------------------------------
+    # Resume-only guards: these are about correctness when continuing from
+    # existing in-memory (rehydrated) state
+    # ------------------------------------------------------------------
+
+    if resume_enabled:
+        try:
+            anchor = checkpoint.get_resume_anchor()
+        except Exception:
+            anchor = None
+
+        if anchor is not None:
+            anchor_frame = anchor[0]
+            anchor_shot = anchor[1]
+            # In a resumed run, we should never be producing *new* embeddings for shots
+            # strictly before the anchor shot.
+            if (anchor_shot is not None) and (shot_i < int(anchor_shot)):
+                raise ResumeSafetyError(
+                    "[ckpt] resume boundary violation: attempted to record embeddings "
+                    f"for pre-anchor shot (shot={shot_i} < anchor_shot={int(anchor_shot)}) "
+                    f"track={tid_i}"
+                )
+
+        # Refuse to "double-write" a frame's embedding that already exists in the
+        # rehydrated ledger. This catches subtle resume boundary bugs.
+        already = set(
+            int(f) for f in checkpoint.get_emb_frames_for_track(shot_i, tid_i, frame_max=max_f)
+         )
+        
+        overwrite_frames = [int(f) for f in frames_for_embed if int(f) in already]
+        if overwrite_frames:
+            raise ResumeSafetyError(
+                "[ckpt] refusing to overwrite existing per-frame embeddings (resume-safety): "
+                f"shot={shot_i} track={tid_i} frames={overwrite_frames}"
+            )
+
+    # If writes are disabled, we stop here after enforcing resume guards.
+    if not write_enabled:
+        return
+
+    # ------------------------------------------------------------------
+    # Persist-only guards: artifact integrity rules for what we write.
+    # ------------------------------------------------------------------
+
+    # Contract: We only require that a DETECTED obs exists
+    # for the frame(s) being embedded.
+    #
     det_frames = set(
-        checkpoint.get_det_frames_with_landmarks_for_track(
-            shot_i,
-            tid_i,
-            frame_max=max_f,
-        )
+        int(f) for f in checkpoint.get_det_frames_for_track(shot_i, tid_i, frame_max=max_f)
     )
 
-    # 2) DETECTED+LANDMARKS frames up to max_f
-    #    (This assumes your checkpoint can answer this. If it can't yet,
-    #     see "Minimal supporting API" below.)
-    det_landmark_frames = set(
-        int(f)
-        for f in checkpoint.get_det_frames_with_landmarks_for_track(
-            shot_i,
-            tid_i,
-            frame_max=max_f,
-        )
-    )
+    bad_missing_det = [int(f) for f in frames_for_embed if int(f) not in det_frames]
 
-    # 3) Every requested frame must be in det_frames
-    bad_not_detected = [int(f) for f in frames_for_embed if int(f) not in det_frames]
-    if bad_not_detected:
+    if bad_missing_det:
         raise ValueError(
-            "[ckpt] refusing to persist embeddings for non-DETECTED frames: "
-            f"shot={shot_i} track={tid_i} bad_frames={bad_not_detected} "
-            f"det_frames_up_to_{max_f}={sorted(det_frames)}"
+            "[ckpt] refusing to persist embeddings for frames without a DETECTED obs: "
+            f"shot={shot_i} track={tid_i} bad_frames={bad_missing_det} "
+            f"detected_up_to_{max_f}={sorted(det_frames)}"
         )
 
-    # 4) Every requested frame must be in det_landmark_frames
-    bad_missing_landmarks = [
-        int(f) for f in frames_for_embed if int(f) not in det_landmark_frames
-    ]
-    if bad_missing_landmarks:
-        raise ValueError(
-            "[ckpt] refusing to persist embeddings for DETECTED frames without landmarks: "
-            f"shot={shot_i} track={tid_i} bad_frames={bad_missing_landmarks} "
-            f"detected_with_landmarks_up_to_{max_f}={sorted(det_landmark_frames)}"
-        )
-
-    # ------------------------------------------------------------------
-    # Refuse to overwrite if we already have an embedding stored
-    # for that frame. This prevents silent double-writes on resume logic.
-    # ------------------------------------------------------------------
-    already = set(
-        int(f)
-        for f in checkpoint.get_emb_frames_for_track(
-            shot_i,
-            tid_i,
-            frame_max=max_f,
-        )
-    )
-    overwrite_frames = [int(f) for f in frames_for_embed if int(f) in already]
-    if overwrite_frames:
-        raise ValueError(
-            "[ckpt] refusing to overwrite existing per-frame embeddings: "
-            f"shot={shot_i} track={tid_i} frames={overwrite_frames}"
-        )
-
+    # Persist and link one frame at a time. If any call fails, DO NOT advance
+    # the embedding-safe anchor.
     for f_idx, vec in zip(frames_for_embed, embs):
         checkpoint.add_embeddings(
-            shot_i,
-            tid_i,
-            int(f_idx),
-            np.asarray(vec, dtype=np.float32).reshape(1, -1),
+            shot_number=int(shot_number),
+            track_id=int(tid_i),
+            frame_idx_last=int(f_idx),
+            embs=np.asarray(vec, dtype=np.float32).reshape(1, -1),
         )
 
     logging.info(
@@ -363,8 +398,9 @@ def _finalize_checkpoint_run(checkpoint: TrackingCheckpoint | None) -> None:
     checkpoint :
         Optional TrackingCheckpoint; if None, this is a no-op.
     """
-    if not checkpoint:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
         return
+
     checkpoint.finalize(note="final video flush")
     checkpoint.mark_completed()
 

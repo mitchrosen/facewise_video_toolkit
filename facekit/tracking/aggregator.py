@@ -18,6 +18,20 @@ from facekit.tracking.face_structures import FaceTrack, FaceObservation
 from facekit.utils.geometry import compute_iou
 from facekit.common.obs_consts import Source
 
+def _emb_head(track, n: int = 5):
+    try:
+        avg = track.compute_average_embedding()
+        return [round(float(x), 6) for x in avg[:n]]
+    except Exception:
+        return None
+
+def _emb_count(track):
+    try:
+        embs = getattr(track, "embeddings", None)
+        return len(embs) if embs is not None else 0
+    except Exception:
+        return None
+
 BBox = Tuple[int, int, int, int]
 
 @runtime_checkable
@@ -512,6 +526,9 @@ class ShotFaceTrackAggregator:
 
         for i, current in enumerate(sorted_tracks):
             best_match, best_score = None, -1.0
+            strong_candidates = []
+            relaxed_candidates = []
+
 
             # Pass 1a: Look for earlier non-overlapping tracks
             for t in sorted_tracks[:i]:
@@ -520,8 +537,22 @@ class ShotFaceTrackAggregator:
                         raise RuntimeError(f"Track {t.track_id} missing embedding")
                     score = embedding_similarity(current.compute_average_embedding(),
                                                 t.compute_average_embedding())
+                    try:
+                        strong_candidates.append(
+                            (
+                                int(t.first_frame()),
+                                int(t.last_frame()),
+                                int(getattr(t, "track_id", -1)),
+                                getattr(t, "segment_id", None),
+                                float(score),
+                            )
+                        )
+                    except Exception:
+                        pass
                     if score >= embedding_threshold and score > best_score:
                         best_match, best_score = t, score
+
+
 
             # Pass 1b: If no strong match, consider earlier tracks within gap and IoU
             if best_match is None:
@@ -535,13 +566,70 @@ class ShotFaceTrackAggregator:
                             if iou >= iou_threshold:
                                 score = embedding_similarity(current.compute_average_embedding(),
                                                             t.compute_average_embedding())
+                                
+                                try:
+                                    relaxed_candidates.append(
+                                        (
+                                            int(t.first_frame()),
+                                            int(t.last_frame()),
+                                            int(getattr(t, "track_id", -1)),
+                                            getattr(t, "segment_id", None),
+                                            float(iou),
+                                            float(score),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+
                                 if score >= relaxed_embedding_threshold and score > best_score:
                                     best_match, best_score = t, score
+
+            try:
+                logging.info(
+                    "resolve_segment_ids: shot=%d "
+                    "current=(%d,%d,tid=%d,emb_count=%s,avg_head=%s) "
+                    "strong_candidates=%s relaxed_candidates=%s chosen=%s chosen_score=%s",
+                    int(self.shot_number),
+                    int(current.first_frame()),
+                    int(current.last_frame()),
+                    int(getattr(current, "track_id", -1)),
+                    _emb_count(current),
+                    _emb_head(current),
+                    strong_candidates,
+                    relaxed_candidates,
+                    (
+                        None if best_match is None else
+                        (
+                            int(best_match.first_frame()),
+                            int(best_match.last_frame()),
+                            int(getattr(best_match, "track_id", -1)),
+                            getattr(best_match, "segment_id", None),
+                            _emb_count(best_match),
+                            _emb_head(best_match),
+                        )
+                    ),
+                    (None if best_match is None else float(best_score)),
+                )
+            except Exception:
+                logging.exception("resolve_segment_ids debug logging failed")
 
             # Assign segment_id
             if best_match:
                 current.segment_id = best_match.segment_id
             else:
+
+                try:
+                    logging.info(
+                        "resolve_segment_ids: shot=%d current=(%d,%d,tid=%d) assigned_new_segment_id=%d",
+                        int(self.shot_number),
+                        int(current.first_frame()),
+                        int(current.last_frame()),
+                        int(getattr(current, "track_id", -1)),
+                        int(segment_id_counter),
+                    )
+                except Exception:
+                    logging.exception("resolve_segment_ids new-id debug logging failed")
+
                 current.segment_id = segment_id_counter
                 segment_id_counter += 1
 

@@ -473,10 +473,10 @@ def fill_short_gaps_within_shot_and_merge(
             # Also remove from our local ordered list; keep left at same index
             ordered.pop(i + 1)
 
-            # occupied should now include the new frames too (for later groups it matters);
-            # simplest is to update just those frames and right frames.
-            for f in left.get_frame_indices():
-                occupied[int(f)] = occupied.get(int(f), 0)  # ensure present (already 0 for gap frames)
+            # Update occupancy for the newly injected gap frames so later merges
+            # cannot "double-inject" into the same frames.
+            for f in range(int(gap_start), int(gap_end) + 1):
+                occupied[int(f)] = max(occupied.get(int(f), 0), 1)
 
             # Do not i += 1; there may be another consecutive track to merge into the same left
             continue
@@ -583,7 +583,7 @@ def inject_interpolated_gap_no_skips(
         except Exception:
             pass
 
-        left.add_observation(obs)
+        left.add_observation(obs, allow_closed=True)
 
     _normalize_track_order(left)
 
@@ -612,7 +612,7 @@ def merge_right_into_left(left: FaceTrack, right: FaceTrack) -> None:
         except Exception:
             pass
 
-        left.add_observation(obs)
+        left.add_observation(obs, allow_closed=True)
 
     _normalize_track_order(left)
 

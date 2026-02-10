@@ -180,11 +180,14 @@ def _read_status_anchor(run_root: Path) -> int:
     )
     import json
     status = json.loads(status_path.read_text() or "{}")
-    assert "last_detection_frame" in status, (
-        f"status.json missing last_detection_frame\n"
+    
+    assert int(status["last_embedding_safe_frame"]) == 180, (
+        f"status.json anchor drift: expected 180, got {status.get('last_embedding_safe_frame')}"
+         f"status.json path: {status_path}\n"
+         f"status keys: {sorted(status.keys())}\n"
         f"status.json:\n{status_path.read_text()}"
     )
-    return int(status.get("last_detection_frame") or 0)
+    return int(status.get("last_embedding_safe_frame") or 0)
 
 
 def _find_status_json_under_run_root(run_root: Path) -> Path:
@@ -333,6 +336,7 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
         "--output-global-json", str(out_json),
         "--detect-interval", "1",
         "--embedding-batch-size-max", "16",
+        "--embedding-queue-max-pending", "16",
         "--emb-store", "none",
         "--obs-sidecar-path", str(obs_sidecar),
         "--checkpoint-dir", str(ckpt_parent),
@@ -357,14 +361,22 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
             f"ckpt_parent tree:\n{_list_tree_for_debug(ckpt_parent)}"
         )
     status1 = json.loads(_find_status_json_under_run_root(run_root1).read_text())
-    # Single source of truth for resume anchor
-    anchor = int(status1.get("last_detection_frame") or 0)
-    assert 0 <= anchor < total_frames, f"bad anchor_frame={anchor} total={total_frames}"
-    # Pre-anchor baseline comes from RUN 1’s checkpoint, not the shared sidecar.
+    # Single source of truth for resume is the embedding-safe frame.
+    embedding_safe_frame = status1.get("last_embedding_safe_frame")
+    assert embedding_safe_frame is not None, (
+        f"missing last_embedding_safe_frame in status.json (keys={sorted(status1.keys())})"
+    )
+    embedding_safe_frame = int(embedding_safe_frame)
+    assert 0 <= embedding_safe_frame < total_frames, (
+        f"bad embedding_safe_frame={embedding_safe_frame} total={total_frames}"
+    )
+    resume_frame = embedding_safe_frame + 1
+
+    # Baseline through the embedding-safe frame comes from RUN 1's checkpoint, not the shared sidecar.
     obs_ckpt1 = (run_root1 / "ckpt" / "obs_ckpt.npz")
     assert obs_ckpt1.exists(), f"missing {obs_ckpt1}"
     frames_pre_ckpt = _load_frames_v21(obs_ckpt1)
-    pre_rows = int((frames_pre_ckpt < anchor).sum()) if frames_pre_ckpt.size else 0
+    pre_rows = int((frames_pre_ckpt <= embedding_safe_frame).sum()) if frames_pre_ckpt.size else 0
 
     # ---------------- RUN 2 (resume) ----------------
     cp2 = _run_python(
@@ -382,13 +394,15 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
     frames2 = final_cols["frame"].astype(int)
     assert frames2.size > 0, "no observations after resume"
 
-    # Pre-anchor preserved exactly
-    assert int((frames2 < anchor).sum()) == pre_rows, \
-        f"pre-anchor rows changed: had {pre_rows}, now {(frames2 < anchor).sum()} (anchor={anchor})"
-    # No rewind: first appended row >= anchor
+    # Rows through the embedding-safe frame are preserved exactly.
+    assert int((frames2 <= embedding_safe_frame).sum()) == pre_rows, \
+        f"rows through embedding-safe frame changed: had {pre_rows}, " \
+        f"now {(frames2 <= embedding_safe_frame).sum()} " \
+        f"(embedding_safe_frame={embedding_safe_frame})"
+    # Resume begins at the frame following the embedding-safe frame.
     if frames2.size > pre_rows:
-        assert frames2[pre_rows] >= anchor, \
-            f"first appended row is before anchor: frames2[{pre_rows}]={frames2[pre_rows]} < {anchor}"
+        assert int(frames2[pre_rows]) == resume_frame, \
+            f"resume started at {int(frames2[pre_rows])}, expected {resume_frame}"
 
     # Per-(shot,track) monotonic + no duplicates
     shot2 = final_cols["shot_id"].astype(int)
@@ -403,13 +417,6 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
     uniq = np.unique(triples, axis=0)
     assert uniq.shape[0] == triples.shape[0], "duplicate (shot,track,frame) records after resume"
 
-    # Validate first resumed frame is exactly at anchor
-    if frames2.size:
-        idxs = np.where(frames2 >= anchor)[0]
-        if idxs.size:
-            assert int(frames2[idxs.min()]) == anchor, (
-                f"resume started at {int(frames2[idxs.min()])}, expected {anchor}"
-            )    
     if frames2.size > 1:
         diffs = np.diff(frames2)
         assert (diffs >= 0).all(), "frames out of order in final sidecar"
