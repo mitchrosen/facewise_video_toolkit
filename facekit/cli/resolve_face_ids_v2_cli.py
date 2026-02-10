@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -171,6 +172,11 @@ def run_pipeline(args):
             if args.checkpoint_dir
             else CheckpointManager.compute_parent_dir(Path("checkpoints"), video_path)
         )
+
+        no_checkpoint_write = bool(getattr(args, "no_checkpoint_write", False))
+        if no_checkpoint_write:
+            logging.info("checkpoint: output disabled via --no-checkpoint-write (resume input may still be used).")
+
         # ---- collectors ---------------------------------------------------------
         # Single source of truth for the whole run (fresh or resume):
         # These are used by checkpointing during the run AND by the final writers.
@@ -202,6 +208,7 @@ def run_pipeline(args):
             force_new_run=bool(args.new_run),
             run_id=args.checkpoint_run_id,
             resume_latest=bool(args.resume_latest),
+            write_disabled=bool(getattr(args, "no_checkpoint_write", False)),
         )
 
         # Summarize selected run + resume intent
@@ -518,6 +525,8 @@ def main() -> None:
                         help="Resume from a specific run id (e.g., run-20250101T010203Z-deadbeef).")
     parser.add_argument("--new-run", action="store_true",
                         help="Force creation of a fresh run directory even if previous runs exist.")    # logging
+    parser.add_argument("--no-checkpoint-write", action="store_true",
+                        help="Do not write any checkpoint artifacts (status.json, snapshots, ckpt sidecars).")
     parser.add_argument("--log", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"])
     parser.add_argument("--log-file", default=None)
 

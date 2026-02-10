@@ -138,7 +138,16 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
 
     class FakeCheckpointManager:
         @staticmethod
-        def open(parent_dir, video_path, options_snapshot, no_resume, force_new_run, run_id, resume_latest):
+        def open(
+            parent_dir,
+            video_path,
+            options_snapshot,
+            no_resume,
+            force_new_run,
+            run_id,
+            resume_latest,
+            **kwargs,
+        ):
             return FakeCheckpoint(parent_dir / "fake-run")
 
     monkeypatch.setattr(cli, "CheckpointManager", FakeCheckpointManager)

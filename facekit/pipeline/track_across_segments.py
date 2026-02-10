@@ -547,6 +547,9 @@ def track_across_segments(
         _shot_data = json.load(f)
     shots = _shot_data["shots"]
 
+    # # DEBUG
+    # shots = [s for s in shots if int(s["shot_number"]) in [63,64]]
+
     _validate_shots_are_absolute_and_increasing(shots)
 
     with ExitStack() as stack:
@@ -576,6 +579,9 @@ def track_across_segments(
 
         for shot_idx, shot_num in enumerate(shots):
             shot_number = shot_num["shot_number"]
+
+            print(f"shot num: {shot_number}")
+
             first = shot_num["first_frame"]
             last = shot_num["last_frame"]
 
@@ -653,6 +659,7 @@ def track_across_segments(
                         aggregator.finalize_tracks()
                         tracker_active = False
                         do_detection = True
+                        observations = []
 
                 if do_detection:  # Run detection 
 
@@ -668,7 +675,6 @@ def track_across_segments(
 
                     if detections:
                         boxes, landmark_lists, confidences = detections
-                        aligned_ok = 0
 
                         # Deterministically order detections
                         order = sorted(
@@ -686,6 +692,9 @@ def track_across_segments(
                         confidences = [confidences[i] for i in order]
 
                         for box, landmarks, confidence in zip(boxes, landmark_lists, confidences):
+                            if landmarks is None:
+                                continue  # treat as "not a detected face"
+
                             bbox = tuple(int(v) for v in box[:4])
 
                             observations.append(
@@ -700,29 +709,31 @@ def track_across_segments(
                                     source=Source.DETECTED,
                                 )
                             )
-                    else:
+
+                        # print(f"Detection frame number: {frame_idx}, num faces: {len(observations)}")
+                    
+                    if not detections or not observations:
                         # no faces this frame; close shot-local tracks
                         aggregator.finalize_tracks()
 
-                if observations and observations[0].source == Source.DETECTED:
-                    dets = []
-                    for ob in observations:
-                        x1, y1, x2, y2 = [int(v) for v in ob.bbox[:4]]
-                        dets.append(
-                            {
-                                "bbox": (x1, y1, x2, y2),
-                                "conf": float(ob.confidence)
-                                if ob.confidence is not None
-                                else None,
-                            }
-                        )
+                    if observations:
+                        dets = []
+                        for ob in observations:
+                            x1, y1, x2, y2 = [int(v) for v in ob.bbox[:4]]
+                            dets.append(
+                                {
+                                    "bbox": (x1, y1, x2, y2),
+                                    "conf": float(ob.confidence)
+                                    if ob.confidence is not None
+                                    else None,
+                                }
+                            )
 
-                if observations and observations[0].source == Source.DETECTED:
-                    _ = extend_prev_track_for_overlapping_detection(
-                        aggregator=aggregator,
-                        detections=observations,
-                        iou_threshold=iou_thresh,
-                    )
+                        _ = extend_prev_track_for_overlapping_detection(
+                            aggregator=aggregator,
+                            detections=observations,
+                            iou_threshold=iou_thresh,
+                            )
 
                 _ = aggregator.update_tracks_with_frame(
                     frame_idx, observations
@@ -846,6 +857,8 @@ def track_across_segments(
                 checkpoint.on_shot_done()
 
         _finalize_checkpoint_run(checkpoint)
+
+        print("Done processing video")
 
         return all_tracks
 

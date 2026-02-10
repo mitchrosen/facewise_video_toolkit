@@ -119,8 +119,9 @@ def do_checkpoint(
     shot_first_frame :
         Absolute first frame of this shot (for status/debug).
     """
-    if not checkpoint:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
         return
+    
     try:
         checkpoint.checkpoint_now(
             frame_idx=frame_idx,
@@ -165,7 +166,7 @@ def _checkpoint_observations_and_snapshot(
     resume_plan :
         ResumePlan with anchor_frame for the anchor special case.
     """
-    if not checkpoint:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
         return
 
     frame_obs_objs = aggregator.observations_at(frame_idx, require_track_id=True)
@@ -260,7 +261,10 @@ def _persist_embeddings_for_track(
       - DETECTED frames must have valid landmarks
       - (optional) refuse to overwrite an existing embedding for the same frame
     """
-    if checkpoint is None or embs is None or int(getattr(embs, "shape", (0,))[0]) == 0:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
+        return
+
+    if embs is None or int(getattr(embs, "shape", (0,))[0]) == 0:
         logging.info(f"end of shot {shot_number} and NO embeddings added to checkpoint")
         return
 
@@ -363,8 +367,9 @@ def _finalize_checkpoint_run(checkpoint: TrackingCheckpoint | None) -> None:
     checkpoint :
         Optional TrackingCheckpoint; if None, this is a no-op.
     """
-    if not checkpoint:
+    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
         return
+
     checkpoint.finalize(note="final video flush")
     checkpoint.mark_completed()
 

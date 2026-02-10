@@ -252,12 +252,18 @@ class CheckpointManager(TrackingCheckpoint):
     @property
     def run_id(self) -> str:
         return self.root.name
+    
+    def _writes_disabled(self) -> bool:
+        """Whether checkpoint output writes are disabled for this run."""
+        return bool(getattr(self, "write_disabled", False))
+ 
 
     def __init__(self,
                  root_dir: Union[str, Path],
                  *,
                  video_path: Union[str, Path],
-                 resume: bool = True) -> None:
+                 resume: bool = True,
+                 write_disabled: bool = False) -> None:
         
         # Paths
         self.root = Path(root_dir)
@@ -279,6 +285,9 @@ class CheckpointManager(TrackingCheckpoint):
         self._shot_track_to_order: dict[tuple[int,int], int] = {}
         self._next_track_order: int = 0
         self._anchor_frame: int | None = None
+
+        # Output writes (status.json, snapshots, sidecars)
+        self.write_disabled = bool(write_disabled)
 
         # Counters
         self._frames_done = 0
@@ -437,6 +446,9 @@ class CheckpointManager(TrackingCheckpoint):
         self._tracks_seen += int(n)
 
     def on_shot_done(self) -> None:
+        if self._writes_disabled():
+            return
+
         self._shots_done += 1
         # Ensure the anchor’s row counters include end-of-shot backfill.
         try:
@@ -481,6 +493,9 @@ class CheckpointManager(TrackingCheckpoint):
 
     def on_frame(self, frame_idx: int) -> None:
         # Called for every processed frame (0-based)
+        if self._writes_disabled():
+            return
+
         self._frames_done = int(frame_idx) + 1
 
     @staticmethod
@@ -852,6 +867,9 @@ class CheckpointManager(TrackingCheckpoint):
         - (Optionally) write emb_ckpt-<frame>.npz if an API is available.
         - Update status.json with last_detection_frame/shot metadata.
         """
+        if self._writes_disabled():
+            return
+
         if self._obs is None or self._emb is None:
             return
 
@@ -883,6 +901,9 @@ class CheckpointManager(TrackingCheckpoint):
         return bool(status and str(status.get("video_path")) == str(video_path))
 
     def finalize(self, note: str = "final") -> None:
+        if self._writes_disabled():
+            return
+
         # Ensure sidecars exist even if no detection checkpoint happened.
         if self._obs is not None:
             _dump_npz_atomic(self._obs, self.obs_path)
@@ -903,6 +924,9 @@ class CheckpointManager(TrackingCheckpoint):
         Embeddings are also copied verbatim.
         Safe no-ops if a given source file doesn't exist or a target path is None.
         """
+        if self._writes_disabled():
+            return
+        
         try:
             if obs_sidecar_path:
                 src = self.ckpt_dir / "obs_ckpt.npz"
@@ -929,6 +953,9 @@ class CheckpointManager(TrackingCheckpoint):
         Mark the run as completed in status.json. This enables 'resume-for-outputs'
         semantics without adding any special CLI switches.
         """
+        if self._writes_disabled():
+            return
+        
         status = self.read_status()
         status["completed"] = True
         status["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -1424,6 +1451,7 @@ class CheckpointManager(TrackingCheckpoint):
         run_id: str | None = None,
         resume_latest: bool = False,
         force_new_run: bool = False,
+        write_disabled: bool = False,
     ) -> "CheckpointManager":
         """
         Create or select a checkpoint run directory and return a configured CheckpointManager.
@@ -1511,7 +1539,7 @@ class CheckpointManager(TrackingCheckpoint):
             (run_dir / "ckpt").mkdir(parents=True, exist_ok=True)
             (run_dir / "status.json").unlink(missing_ok=True)
 
-        mgr = cls(run_dir, video_path=video_path, resume=do_resume)
+        mgr = cls(run_dir, video_path=video_path, resume=do_resume, write_disabled=write_disabled)
         mgr._cfg = dict(options_snapshot or {})
 
         # Helpful debug logging for presence/sizes of checkpoint sidecars
@@ -2124,6 +2152,8 @@ class CheckpointManager(TrackingCheckpoint):
      
     # ---------- internals ----------
     def _write_status(self, note: str) -> None:
+        if self._writes_disabled():
+            return
         # derive a stable, ordered list from the dict
         shot_track_order_list = track_order_dict_to_list(self._shot_track_to_order)
 
