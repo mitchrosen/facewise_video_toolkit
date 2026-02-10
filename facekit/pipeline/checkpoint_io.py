@@ -166,7 +166,7 @@ def _checkpoint_observations_and_snapshot(
     resume_plan :
         ResumePlan with anchor_frame for the anchor special case.
     """
-    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
+    if not checkpoint:
         return
 
     frame_obs_objs = aggregator.observations_at(frame_idx, require_track_id=True)
@@ -233,7 +233,8 @@ def _checkpoint_observations_and_snapshot(
         checkpoint.add_observations(shot_number, frame_idx, frame_obs_objs)
 
     try:
-        if getattr(checkpoint, "snapshots_ready", False):
+        if (not bool(getattr(checkpoint, "write_disabled", False)) 
+            and getattr(checkpoint, "snapshots_ready", False)):
             checkpoint.write_checkpoint_snapshot(
                 name=f"detect-{shot_number}-{frame_idx}",
                 payload={
@@ -261,7 +262,7 @@ def _persist_embeddings_for_track(
       - DETECTED frames must have valid landmarks
       - (optional) refuse to overwrite an existing embedding for the same frame
     """
-    if not checkpoint or bool(getattr(checkpoint, "write_disabled", False)):
+    if not checkpoint:
         return
 
     if embs is None or int(getattr(embs, "shape", (0,))[0]) == 0:
