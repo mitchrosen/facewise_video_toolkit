@@ -167,7 +167,8 @@ def test_cli_e2e_realVideo(tmp_path: Path):
     results_dir = tests_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    video_name = "hot-to-go"
+    video_name = "53-man-roster-decisions"
+    # video_name = "hot-to-go"
     # video_name = "OGsTest_10sec_snippet"
 
     print(f"Video: {video_name}")
@@ -209,7 +210,7 @@ def test_cli_e2e_realVideo(tmp_path: Path):
         "--no-resume",                    # ensure fresh run
         "--new-run",
         "--no-checkpoint-write", 
-        "--log", "DEBUG",
+        "--log", "INFO",
     ]
     print("Running COLD ----------------------")
     cold_log = _run(cold_cmd, env=env, log_prefix="cold")

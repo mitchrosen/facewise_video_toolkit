@@ -273,18 +273,11 @@ class CheckpointManager(TrackingCheckpoint):
 
         logging.info("ckpt.paths: root=%s ckpt_dir=%s status_path=%s", self.root, self.ckpt_dir, self.status_path)
 
-
         self.obs_path    = Path(self.ckpt_dir, "obs_ckpt.npz")
         self.emb_path    = Path(self.ckpt_dir, "emb_ckpt.npz")
 
         # Create dirs when missing
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resume
-        self.resume_enabled = bool(resume)
-        self._shot_track_to_order: dict[tuple[int,int], int] = {}
-        self._next_track_order: int = 0
-        self._anchor_frame: int | None = None
 
         # Output writes (status.json, snapshots, sidecars)
         self.write_disabled = bool(write_disabled)
@@ -300,12 +293,23 @@ class CheckpointManager(TrackingCheckpoint):
         self._pending_det_shot_first: int | None = None
         self._pending_det_reason: str | None = None
 
+        # Resume
+        self.resume_enabled = bool(resume)
+        self._shot_track_to_order: dict[tuple[int,int], int] = {}
+        self._next_track_order: int = 0
+        self._anchor_frame: int | None = None
+
         # Detection anchors
         self._last_det_frame: int | None = None
         self._last_det_shot: int | None = None
         self._obs_rows_at_det: int = 0
         self._emb_rows_at_det: int = 0
         self._last_det_shot_first_frame: int | None = None
+
+        # Resume-time anchor (immutable once the run starts).
+        self._resume_anchor_frame: int | None = None
+        self._resume_anchor_shot: int | None = None
+        self._resume_anchor_shot_first_frame: int | None = None
 
         # Collector pointers (set via `start`)
         self._obs = None  # ObservationsCollector
@@ -381,6 +385,22 @@ class CheckpointManager(TrackingCheckpoint):
             except Exception:
                 # Non-fatal: resume can still proceed without these hints.
                 pass
+
+            # Freeze resume anchor exactly once at the beginning of a resumed run.
+            # This must NOT change during the rest of the run.
+            if self.resume_enabled and self._resume_anchor_frame is None:
+                try:
+                    last_detection_frame = status.get("last_detection_frame")
+                    last_detection_shot = status.get("last_detection_shot")
+                    last_detection_shot_first_frame = status.get("last_detection_shot_first_frame")
+                    if last_detection_frame is not None:
+                        self._resume_anchor_frame = int(last_detection_frame)
+                    if last_detection_shot is not None:
+                        self._resume_anchor_shot = int(last_detection_shot)
+                    if last_detection_shot_first_frame is not None:
+                        self._resume_anchor_shot_first_frame = int(last_detection_shot_first_frame)
+                except Exception:
+                    pass
 
             try:
                 prev_open_tracks = status.get("open_tracks")
@@ -973,6 +993,17 @@ class CheckpointManager(TrackingCheckpoint):
         when available. If status.json exists, prefer it. Otherwise, fall back
         to in-memory attributes that may be set during tests.
         """
+
+        # If resuming, use resume anchor (immutable for the run).
+        if self.resume_enabled:
+            resume_anchor_frame = self._resume_anchor_frame
+            if resume_anchor_frame is not None:
+                return (
+                    int(resume_anchor_frame),
+                    int(self._resume_anchor_shot) if self._resume_anchor_shot is not None else None,
+                    int(self._resume_anchor_shot_first_frame) if self._resume_anchor_shot_first_frame is not None else None
+                )
+
         # 1) Prefer status.json (single source of truth)
         try:
             if self.status_path and self.status_path.exists():
