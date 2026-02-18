@@ -159,7 +159,10 @@ def run_pipeline(args):
         shot_defs = shot_data.get("shots", [])
 
         # Detector / embedder
-        yolo = load_yolo5face_model(args.detector_model, args.config, device=device)
+        yolo = load_yolo5face_model(args.detector_model, 
+                                    args.config,
+                                    min_face=args.min_face,
+                                    device=device)
         detector = FaceDetector(yolo)
         embedder = FaceEmbedder(args.embedding_model, device=device)
         if hasattr(embedder, "set_max_batch_size"):
@@ -457,6 +460,19 @@ def run_pipeline(args):
                 )
                 ckpt.mark_completed()
 
+def positive_int(value: str) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value} is not a valid integer"
+        )
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{value} must be > 0"
+        )
+    return ivalue
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Track faces and resolve global identities across shots (JSON V2 writer)"
@@ -468,6 +484,8 @@ def main() -> None:
                         help="Path to ArcFace ONNX model",)
     parser.add_argument("--config", default="models/detector/yolov5n.yaml",
                         help="Path to YOLOv5 model config",)
+    parser.add_argument("--min-face", type=positive_int, default=10,
+                        help=("Setting to YOLOv5 model processor indicating smallest pixel height for valid detected faces"))
     parser.add_argument("--shot-segmentation", default=None, help="Path to shot segmentation JSON (optional)",)
     parser.add_argument("--schema-version", default="2.0", choices=["2.0","2.1"],
                         help = "Manifest schema version to write (default: 2.0).")

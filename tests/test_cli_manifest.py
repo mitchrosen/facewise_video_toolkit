@@ -87,7 +87,8 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
     # ------------------------------
     # 4) Detector / embedder stubs
     # ------------------------------
-    def fake_load_yolo5face_model(detector_model, config, device=None):
+    def fake_load_yolo5face_model(detector_model, config, *, device=None, min_face=10, **kwargs):
+
         class DummyYOLO:
             pass
         return DummyYOLO()
@@ -239,6 +240,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         detector_model="dummy-detector.pt",
         embedding_model="dummy-emb.onnx",
         config="dummy-config.yaml",
+        min_face=10,
         shot_segmentation=str(shot_json_path),
         schema_version="2.1",
         schema_dir=None,
