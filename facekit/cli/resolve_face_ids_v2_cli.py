@@ -11,6 +11,7 @@ import sys
 from typing import Literal, List, Optional
 from jsonschema import ValidationError
 from dataclasses import dataclass, field
+from collections import Counter
 import logging
 
 from facekit.io.frame_provider import ReaderCoordinator
@@ -386,6 +387,16 @@ def run_pipeline(args):
             )
 
         else:  # 2.1
+            counts = Counter(int(t.global_id) for t in tracks if getattr(t, 'global_id', None) is not None)
+
+            face_meta = [
+                {
+                    "face_label": f"face_{gid}",
+                    "occurance_count": count
+                }
+                for gid, count in sorted(counts.items())
+            ]
+
             # default observations sidecar path
             obs_path = Path(args.obs_sidecar_path) if args.obs_sidecar_path else video_path.with_suffix(".observations.npz")
 
