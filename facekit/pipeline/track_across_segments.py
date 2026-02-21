@@ -12,10 +12,13 @@ from facekit.tracking.face_tracker import FaceTracker
 from facekit.tracking.tracker_validator import TrackerValidator, ValidatorParams
 from facekit.embedding.embedder import FaceEmbedder
 from facekit.embedding.alignment import align_face_for_arcface
+from facekit.embedding.embedding_queue import AlignedFaceEmbeddingQueue
 from facekit.detection.face_detector import FaceDetector
 from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 from facekit.common.obs_consts import Source
+from facekit.utils.geometry import compute_iou 
+
 from facekit.pipeline.resume_rehydrate import (
     ResumePlan,
     _build_resume_plan,
@@ -332,34 +335,16 @@ def _collect_aligned_faces_for_embedding(
         #     except Exception:
         #         logging.exception("embed-load: failed to load crop %s", cr)
 
-        # only embed from DETECTED observations (landmarks required)
+        # Only embed from DETECTED observations
         if getattr(obs, "source", None) != Source.DETECTED:
             continue
 
-        landmarks = getattr(obs, "landmarks", None)
-        if landmarks is None:
+        # Skip if already embedded
+        if getattr(obs, "embedding", None) is not None:
             continue
 
-        # Re-read the frame
-        try:
-            frame = frame_provider.get_frame(frame_idx)
-            if frame is None:
-                continue
-        except Exception:
-            logging.exception("embed-collect: failed to re-read frame=%s", frame_idx)
-            continue
-
-        # Align
-        try:
-            aligned = align_face_for_arcface(frame, landmarks, frame_idx, source="embed")
-        except Exception:
-            logging.exception(
-                "embed-collect: align failed track_id=%s frame=%s",
-                getattr(track, "track_id", None),
-                frame_idx,
-            )
-            continue
-
+        # Must already have aligned_face cached
+        aligned = getattr(obs, "aligned_face", None)
         if aligned is None:
             continue
 
@@ -367,9 +352,6 @@ def _collect_aligned_faces_for_embedding(
         frames_for_embed.append(frame_idx)
 
     return aligned_faces, frames_for_embed
-
-from facekit.utils.geometry import compute_iou  # add if not already imported
-
 
 def extend_prev_track_for_overlapping_detection(
     *,
@@ -442,7 +424,51 @@ def extend_prev_track_for_overlapping_detection(
 
     return matched
 
+def _attach_and_persist_embedded_obs(
+    *,
+    embedded_obs: list[FaceObservation],
+    aggregator: ShotFaceTrackAggregator,
+    checkpoint: TrackingCheckpoint | None,
+    shot_number: int,
+) -> None:
+    """
+    For a batch of observations that have just been embedded:
+      - attach embeddings to the aggregator per track_id
+      - persist embeddings per track via _persist_embeddings_for_track
+    """
+    if not embedded_obs:
+        return
 
+    # Group by track_id
+    by_tid: dict[int, list[FaceObservation]] = {}
+    for ob in embedded_obs:
+        tid = getattr(ob, "track_id", None)
+        emb = getattr(ob, "embedding", None)
+        if tid is None or emb is None:
+            continue
+        by_tid.setdefault(int(tid), []).append(ob)
+
+    for tid, obs_list in by_tid.items():
+        # Ensure stable ordering by frame index
+        obs_list.sort(key=lambda o: int(o.frame_idx))
+
+        frames_for_embed = [int(o.frame_idx) for o in obs_list]
+        embs = np.stack([np.asarray(o.embedding, dtype=np.float32) for o in obs_list], axis=0)
+
+        aggregator.attach_embeddings(int(tid), embs)
+
+        # Persist per track (if checkpoint enabled)
+        if checkpoint is not None:
+            # Find the actual FaceTrack object for this tid (needed by _persist_embeddings_for_track)
+            track = next((t for t in aggregator.tracks if int(getattr(t, "track_id", -1)) == int(tid)), None)
+            if track is not None:
+                _persist_embeddings_for_track(
+                    checkpoint,
+                    shot_number=shot_number,
+                    track=track,
+                    frames_for_embed=frames_for_embed,
+                    embs=embs,
+                )
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -454,6 +480,7 @@ def track_across_segments(
     detect_interval: int = 10,
     embedding_batch_size_max: int = 32,
     *,
+    embedding_queue_max_pending: int = 1024,
     checkpoint: TrackingCheckpoint | None = None,
     resume_enabled: bool = True,
 ) -> List[FaceTrack]:
@@ -605,6 +632,11 @@ def track_across_segments(
                 params=ValidatorParams(iou_thresh=iou_thresh),
             )
 
+            embed_q = AlignedFaceEmbeddingQueue(
+                max_batch_size=int(embedding_batch_size_max),
+                max_pending=int(embedding_queue_max_pending)
+            )
+
             frame_provider.reset_to_frame(int(start_at))
 
             for frame_idx in range(start_at, last + 1):
@@ -697,15 +729,26 @@ def track_across_segments(
 
                             bbox = tuple(int(v) for v in box[:4])
 
+                            aligned_face = None
+                            try:
+                                aligned_face = align_face_for_arcface(frame, landmarks)
+                            except Exception:
+                                logging.exception(
+                                    "align: failed to compute aligned_face shot=%d frame=%d bbox=%s",
+                                    int(shot_number),
+                                    int(frame_idx),
+                                    str(bbox),
+                                )
+
                             observations.append(
                                 FaceObservation(
                                     frame_idx=frame_idx,
                                     bbox=bbox,
-                                    track_id=None,                 # aggregator will set
+                                    track_id=None,  # aggregator will set
                                     embedding=None,
                                     confidence=float(confidence) if confidence is not None else None,
-                                    aligned_face=None,             
-                                    landmarks=landmarks,           
+                                    aligned_face=aligned_face,
+                                    landmarks=landmarks,
                                     source=Source.DETECTED,
                                 )
                             )
@@ -738,6 +781,23 @@ def track_across_segments(
                 _ = aggregator.update_tracks_with_frame(
                     frame_idx, observations
                     )
+                
+                # Enqueue DETECTED observations for embedding now that track_id has been assigned.
+                det_obs = aggregator.observations_at(
+                    frame_idx, source=Source.DETECTED, require_track_id=True
+                )
+                for ob in det_obs:
+                    # Only if aligned_face exists and embedding missing (queue enforces both)
+                    embed_q.enqueue(ob)
+
+                # Flush in bounded batches as we go (mid-shot)
+                embedded_obs = embed_q.maybe_flush(embedder)
+                _attach_and_persist_embedded_obs(
+                    embedded_obs=embedded_obs,
+                    aggregator=aggregator,
+                    checkpoint=checkpoint,
+                    shot_number=shot_number,
+                )
 
                 _checkpoint_observations_and_snapshot(
                     checkpoint,
@@ -777,63 +837,16 @@ def track_across_segments(
                 if checkpoint:
                     checkpoint.on_frame(frame_idx)
 
-            # ---- end-of-shot embedding pass ----------
+            # ---- end-of-shot embedding drain (queue) ----------
 
-            for track in aggregator.tracks:
-                aligned_faces, frames_for_embed = _collect_aligned_faces_for_embedding(
-                    track,
-                    frame_provider=frame_provider,
-                    # embedding_frame_policy=None  # uses default for now
-                )
-
-                if not aligned_faces:
-                    continue
-
-                embs = embedder.get_embedding_batch(
-                    aligned_faces,
-                    batch_size=embedding_batch_size_max,
-                )
-
-
-                if embs is None:
-                    logging.error(
-                        "embed: embedder returned None for shot=%d tid=%s",
-                        int(shot_number),
-                        str(getattr(track, "track_id", "NA")),
-                    )
-                    continue
-
-
-                if not isinstance(embs, np.ndarray):
-                    raise TypeError(f"Embedder must return np.ndarray, got {type(embs)}")
-            
-                if embs.ndim != 2 or embs.shape[1] != 512:
-                    raise ValueError(
-                        f"Embedder returned invalid array shape {embs.shape}; expected (K,512)"
-                    )
-                if embs.dtype != np.float32:
-                    embs = np.asarray(embs, dtype=np.float32, order="C")
-
-                
-                if len(embs) != len(frames_for_embed):
-                    raise RuntimeError(
-                        f"Embed count/frame mismatch: embs={len(embs)} frames={len(frames_for_embed)} "
-                        f"(shot={shot_number}, tid={track.track_id})"
-                    )
-
-                aggregator.attach_embeddings(track.track_id, embs)
-
-                logging.info(
-                    f"end of shot {shot_number} and {len(embs)} embeddings attached to aggregator"
-                )
-
-                _persist_embeddings_for_track(
-                    checkpoint,
-                    shot_number=shot_number,
-                    track=track,
-                    frames_for_embed=frames_for_embed,
-                    embs=embs,
-                )
+            # Flush any remaining queued aligned faces.
+            embedded_obs = embed_q.flush(embedder)
+            _attach_and_persist_embedded_obs(
+                embedded_obs=embedded_obs,
+                aggregator=aggregator,
+                checkpoint=checkpoint,
+                shot_number=shot_number,
+            )
 
             aggregator.finalize_tracks()
 
@@ -843,6 +856,23 @@ def track_across_segments(
                 _ = aggregator.resolve_segment_ids(
                     segment_id_counter=seed,
                     embedding_threshold=embedding_thresh,
+                )
+                logging.info(
+                    "shot=%d seg_seed=%d segment_ids_by_range=%s",
+                    int(shot_number),
+                    int(seed),
+                    sorted(
+                        [
+                            (
+                                int(t.first_frame()),
+                                int(t.last_frame()),
+                                int(getattr(t, "track_id", -1)),
+                                getattr(t, "segment_id", None),
+                            )
+                            for t in aggregator.tracks
+                        ],
+                        key=lambda x: (x[0], x[1], x[2]),
+                    ),
                 )
             except RuntimeError as e:
                 logging.error(

@@ -699,47 +699,33 @@ def _assign_segment_ids_for_rehydrated(
     """
     Assign deterministic per-shot segment_id values to rehydrated tracks.
 
-    Primary rule:
-      - If (shot_id, track_id) exists in `track_order`, use that order index as segment_id.
-        This makes segment labeling stable across resumes, independent of tracking dynamics.
-
-    Fallback rule (only if track_order is missing for a particular track):
-      - Use track_id as a deterministic stand-in segment_id.
-
-    Returns:
-      segment_id_seed_by_shot: {shot_id: next_segment_id_seed}
-        where next_seed is max_assigned_segment_id + 1 for that shot (or 0 if none).
+    segment_id MUST be per-shot dense 0..K-1 to match cold-run behavior.
+    track_order is used only to produce a stable ordering, not as the id itself.
     """
-    seed_by_shot: Dict[int, int] = {}
-    max_seg_by_shot: Dict[int, int] = {}
-
+    # group tracks by shot
+    by_shot: Dict[int, List[FaceTrack]] = {}
     for tr in prior_tracks or []:
         shot = int(getattr(tr, "shot_id", -1))
         tid  = int(getattr(tr, "track_id", -1))
         if shot < 0 or tid < 0:
             continue
+        by_shot.setdefault(shot, []).append(tr)
 
-        key = (shot, tid)
-        if key in track_order:
-            seg = int(track_order[key])
-        else:
-            # Deterministic fallback (keeps resume working even if track_order is partial)
-            seg = tid
-            logging.warning(
-                "resume: track_order missing for (shot=%d, tid=%d); "
-                "using fallback segment_id=%d",
-                shot, tid, seg
-            )
+    seed_by_shot: Dict[int, int] = {}
 
-        # Mutate the track in place (expected by downstream segment labeling)
-        setattr(tr, "segment_id", seg)
+    for shot, tracks in by_shot.items():
+        # stable sort key: track_order if present, else track_id as fallback
+        def _k(tr: FaceTrack) -> tuple[int, int]:
+            tid = int(getattr(tr, "track_id", -1))
+            return (int(track_order.get((shot, tid), 10**9)), tid)
 
-        prev = max_seg_by_shot.get(shot, -1)
-        if seg > prev:
-            max_seg_by_shot[shot] = seg
+        tracks_sorted = sorted(tracks, key=_k)
 
-    for shot, max_seg in max_seg_by_shot.items():
-        seed_by_shot[int(shot)] = int(max_seg) + 1 if int(max_seg) >= 0 else 0
+        # assign dense per-shot segment_ids: 0..K-1
+        for seg, tr in enumerate(tracks_sorted):
+            setattr(tr, "segment_id", int(seg))
+
+        seed_by_shot[int(shot)] = int(len(tracks_sorted))
 
     return seed_by_shot
 
