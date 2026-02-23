@@ -20,6 +20,13 @@ KEEP_SUBPROCESS_LOGS = os.environ.get("KEEP_E2E_LOGS", "").strip() in {"1", "tru
 
 # ---- helpers ---------------------------------------------------------------
 
+def _print_segment_id_lines(cp, label: str):
+    text = (cp.stdout or "") + "\n" + (cp.stderr or "")
+    lines = [ln for ln in text.splitlines() if "segment_ids" in ln or "seg_seed=" in ln]
+    print(f"\n[{label}] segment-id lines ({len(lines)}):")
+    for ln in lines[-50:]:
+        print(ln)
+        
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -86,7 +93,9 @@ def _ordered_tracks(js):
 
     tracks.sort(key=lambda t: (
         int(t["shot_id"]),
-        int(t["first_frame"])
+        int(t["first_frame"]),
+        int(t.get("last_frame", -1)),
+        str(t.get("face_label") or ""),
     ))
     return tracks
 
@@ -181,6 +190,7 @@ def test_resume_equivalence_full_e2e(tmp_path: Path):
     ]
     print("Running COLD ----------------------")
     cold_log = _run(cold_cmd, env=env, log_prefix="cold")
+    _print_segment_id_lines(cold_log, "COLD")
     # print("COLD logs ----------------------")
     # print(cold_log.stdout)
     # print(cold_log.stderr)
@@ -286,10 +296,13 @@ if __name__ == "__main__":
     names = set(arr.dtype.names or [])
     print("obs dtype names:", sorted(names))
 
-    has_lm_field = any(n in names for n in ("landmarks", "lms", "lm", "landmarks_5pt"))
+    has_lm_field = any(n in names for n in ("landmarks", "lms", "lm", "landmarks_5pt", "landmarks_flat10"))
     if has_lm_field:
         # pick the first matching field name
-        lm_name = next(n for n in ("landmarks", "lms", "lm", "landmarks_5pt") if n in names)
+        lm_name = next(
+            n for n in ("landmarks", "lms", "lm", "landmarks_5pt", "landmarks_flat10")
+            if n in names
+        )        
         lms = arr[lm_name]
         # Heuristic: landmarks array should be finite for DET rows (shape varies by storage)
         # We'll just check "not all zeros" on DET rows.
@@ -338,6 +351,7 @@ if __name__ == "__main__":
     ]
     print("Running RESUME ---------------------")
     resume_log = _run(resume_cmd, env=env)
+    _print_segment_id_lines(resume_log, "RESUME")
     # print("RESUME logs ---------------------")
     # print(resume_log.stdout)
     # print(resume_log.stderr)
@@ -399,8 +413,22 @@ if __name__ == "__main__":
     assert not missing_cold, f"cold: face_metadata missing labels: {sorted(missing_cold)}"
     assert not missing_resume, f"resume: face_metadata missing labels: {sorted(missing_resume)}"
 
-    # Compare track-by-track (ordered by our deterministic _ordered_tracks)
-    for a, b in zip(cold_tracks, resume_tracks):
+    # Compare track-by-track by identity key (shot, first, last)
+    def _track_identity_key(t: dict) -> tuple[int, int, int]:
+        return (int(t["shot_id"]), int(t["first_frame"]), int(t["last_frame"]))
+
+    cold_by_key = {_track_identity_key(t): t for t in cold_tracks}
+    resume_by_key = {_track_identity_key(t): t for t in resume_tracks}
+
+    assert set(cold_by_key.keys()) == set(resume_by_key.keys()), (
+        "Track identity keys differ.\n"
+        f"Only in cold:   {sorted(set(cold_by_key) - set(resume_by_key))}\n"
+        f"Only in resume: {sorted(set(resume_by_key) - set(cold_by_key))}\n"
+    )
+
+    for key in sorted(cold_by_key.keys()):
+        a = cold_by_key[key]
+        b = resume_by_key[key]
         # Compare structural fields
         print(f"a fields = {a}")
         print(f"b fields = {b}")
@@ -420,8 +448,9 @@ if __name__ == "__main__":
         )
 
         assert a["face_label"] == b["face_label"], (
-            f"face_label drift: cold={a['face_label']} resume={b['face_label']} "
-            f"(key={_track_identity_key(a)})"
+            f"face_label drift: cold={a['face_label']} resume={b['face_label']} (key={key})\n"
+            f"cold track:   {a}\n"
+            f"resume track: {b}"
         )
         
         # ---- canonical compare for v2.1 globalID JSON ----

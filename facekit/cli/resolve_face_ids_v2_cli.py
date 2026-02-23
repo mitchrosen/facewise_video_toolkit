@@ -192,6 +192,8 @@ def run_pipeline(args):
             "video_path": str(video_path.resolve()),
             "detect_interval": int(args.detect_interval),
             "embedding_batch_size_max": int(args.embedding_batch_size_max),
+            "embedding_queue_max_pending": int(args.embedding_queue_max_pending),
+            "embedding_queue_max_pending": int(getattr(args, "embedding_queue_max_pending", 1024)),
             "device": args.device,
             "emb_store": ("none" if args.emb_store == "none" else args.emb_store),
             "emb_sidecar_path": (str(args.emb_sidecar_path) if args.emb_sidecar_path else None),
@@ -270,6 +272,7 @@ def run_pipeline(args):
             embedder=embedder,
             detect_interval=int(args.detect_interval),
             embedding_batch_size_max=int(args.embedding_batch_size_max),
+            embedding_queue_max_pending=int(args.embedding_queue_max_pending),
             checkpoint=ckpt,
             resume_enabled=_resume_enabled,
         )
@@ -493,6 +496,8 @@ def main() -> None:
                         help="Path to YOLOv5 model weights",)
     parser.add_argument("--embedding-model", default="models/embedding/glintr100_dynamic.onnx",
                         help="Path to ArcFace ONNX model",)
+    parser.add_argument("--embedding-queue-max-pending", type=int, default=1024,
+                        help=("Flush trigger for the embedding queue: flush occurs only when pending >= max_pending. "))
     parser.add_argument("--config", default="models/detector/yolov5n.yaml",
                         help="Path to YOLOv5 model config",)
     parser.add_argument("--min-face", type=positive_int, default=10,

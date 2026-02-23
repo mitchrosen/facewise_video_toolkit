@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Tuple
 from datetime import datetime, timezone
 import json
 import os
@@ -190,7 +191,6 @@ def _assert_npz_keys(npz_path: Path, required_keys: tuple[str, ...], *, strict: 
         if strict:
             raise ResumeSafetyError(msg)
         logging.info("ckpt:non-strict: %s", msg)
-        
 
 @dataclass
 class CheckpointStatus:
@@ -209,6 +209,7 @@ class CheckpointStatus:
     last_detection_shot_first_frame: int | None
     obs_rows_at_last_detection: int
     emb_rows_at_last_detection: int
+
     # configuration snapshot (for safe resume)
     schema_version: str
     detect_interval: int
@@ -227,6 +228,13 @@ class CheckpointStatus:
     track_order: list[dict] | None = None
     open_tracks: list | None = None
 
+    # restart anchor (embedding-safe boundary)
+    last_embedding_safe_frame: int | None = None
+    last_embedding_safe_shot_number: int | None = None
+    last_embedding_safe_shot_first_frame: int | None = None
+    obs_rows_at_last_embedding_safe: int = 0
+    emb_rows_at_last_embedding_safe: int = 0
+ 
     # misc
     note: str = ""
 
@@ -306,6 +314,13 @@ class CheckpointManager(TrackingCheckpoint):
         self._emb_rows_at_det: int = 0
         self._last_det_shot_first_frame: int | None = None
 
+        # Embedding-safe anchors
+        self._last_emb_safe_frame: int | None = None
+        self._last_emb_safe_shot: int | None = None
+        self._last_emb_safe_shot_first_frame: int | None = None
+        self._obs_rows_at_emb_safe: int = 0
+        self._emb_rows_at_emb_safe: int = 0
+
         # Resume-time anchor (immutable once the run starts).
         self._resume_anchor_frame: int | None = None
         self._resume_anchor_shot: int | None = None
@@ -327,6 +342,37 @@ class CheckpointManager(TrackingCheckpoint):
     def _is_pre_anchor(self, frame_idx: int) -> bool:
         a = self._anchor_frame
         return self.resume_enabled and a is not None and int(frame_idx) < int(a)
+    
+    @staticmethod
+    def _status_anchor_fields(status: dict) -> Tuple[str, int | None, int | None, int | None, int, int]:
+        """
+        Choose the resume anchor fields from status.json.
+
+        Returns:
+          (kind, frame, shot, shot_first_frame, obs_rows_anchor, emb_rows_anchor)
+
+        Embedding-safe ONLY:
+          - If last_embedding_safe_frame is present -> use embedding-safe anchor.
+          - Else -> no anchor ("none"). Detection anchors are intentionally ignored.
+        """
+        last_embedding_safe_frame = status.get("last_embedding_safe_frame")
+        if last_embedding_safe_frame is None:
+            return ("none", None, None, None, 0, 0)
+
+        frame = int(last_embedding_safe_frame)
+        shot = status.get("last_embedding_safe_shot_number")
+        shot_first = status.get("last_embedding_safe_shot_first_frame")
+        obs_rows = int(status.get("obs_rows_at_last_embedding_safe", 0) or 0)
+        emb_rows = int(status.get("emb_rows_at_last_embedding_safe", 0) or 0)
+
+        return (
+            "embedding_safe",
+            frame,
+            (int(shot) if shot is not None else None),
+            (int(shot_first) if shot_first is not None else None),
+            obs_rows,
+            emb_rows,
+        )
 
     # ---------- public API ----------
 
@@ -362,26 +408,27 @@ class CheckpointManager(TrackingCheckpoint):
 
             # ---- Pre-hydrate detection anchors BEFORE the first write ----
             try:
-                if self._last_det_frame is None:
-                    last_det_frame = status.get("last_detection_frame")
-                    if last_det_frame is not None:
-                        self._last_det_frame = int(last_det_frame)
-                if self._last_det_shot is None:
-                    last_det_shot = status.get("last_detection_shot")
-                    if last_det_shot is not None:
-                        self._last_det_shot = int(last_det_shot)
-                if self._last_det_shot_first_frame is None:
-                    last_det_shot_first_frame = status.get("last_detection_shot_first_frame")
-                    if last_det_shot_first_frame is not None:
-                        self._last_det_shot_first_frame = int(last_det_shot_first_frame)
-                if not self._obs_rows_at_det:
-                    last_det_obs_rows = status.get("obs_rows_at_last_detection")
-                    if last_det_obs_rows is not None:
-                        self._obs_rows_at_det = int(last_det_obs_rows)
-                if not self._emb_rows_at_det:
-                    last_det_emb_rows = status.get("emb_rows_at_last_detection")
-                    if last_det_emb_rows is not None:
-                        self._emb_rows_at_det = int(last_det_emb_rows)
+                # --- Pre-hydrate embedding-safe anchors (Design B) ---
+                if self._last_emb_safe_frame is None:
+                    v = status.get("last_embedding_safe_frame")
+                    if v is not None:
+                        self._last_emb_safe_frame = int(v)
+                if self._last_emb_safe_shot is None:
+                    v = status.get("last_embedding_safe_shot_number")
+                    if v is not None:
+                        self._last_emb_safe_shot = int(v)
+                if self._last_emb_safe_shot_first_frame is None:
+                    v = status.get("last_embedding_safe_shot_first_frame")
+                    if v is not None:
+                        self._last_emb_safe_shot_first_frame = int(v)
+                if not self._obs_rows_at_emb_safe:
+                    v = status.get("obs_rows_at_last_embedding_safe")
+                    if v is not None:
+                        self._obs_rows_at_emb_safe = int(v)
+                if not self._emb_rows_at_emb_safe:
+                    v = status.get("emb_rows_at_last_embedding_safe")
+                    if v is not None:
+                        self._emb_rows_at_emb_safe = int(v)
             except Exception:
                 # Non-fatal: resume can still proceed without these hints.
                 pass
@@ -390,15 +437,18 @@ class CheckpointManager(TrackingCheckpoint):
             # This must NOT change during the rest of the run.
             if self.resume_enabled and self._resume_anchor_frame is None:
                 try:
-                    last_detection_frame = status.get("last_detection_frame")
-                    last_detection_shot = status.get("last_detection_shot")
-                    last_detection_shot_first_frame = status.get("last_detection_shot_first_frame")
-                    if last_detection_frame is not None:
-                        self._resume_anchor_frame = int(last_detection_frame)
-                    if last_detection_shot is not None:
-                        self._resume_anchor_shot = int(last_detection_shot)
-                    if last_detection_shot_first_frame is not None:
-                        self._resume_anchor_shot_first_frame = int(last_detection_shot_first_frame)
+                    kind, frame, shot, shot_first, _od, _ed = self._status_anchor_fields(status)
+                    if frame is not None:
+                        self._resume_anchor_frame = int(frame)
+                    if shot is not None:
+                        self._resume_anchor_shot = int(shot)
+                    if shot_first is not None:
+                        self._resume_anchor_shot_first_frame = int(shot_first)
+
+                    logging.info(
+                        "ckpt.start: froze resume anchor (%s) frame=%s shot=%s shot_first=%s",
+                        kind, frame, shot, shot_first,
+                    )
                 except Exception:
                     pass
 
@@ -896,11 +946,16 @@ class CheckpointManager(TrackingCheckpoint):
         obs_count = self._obs.count()
         emb_count = self._emb.count()
  
+        # Always update in-memory bookkeeping, even if writes are disabled.
+        # (write_disabled means "no disk I/O", not "skip anchors in RAM")
         self._last_det_frame = int(frame_idx)
         self._last_det_shot = int(shot_number)
         self._last_det_shot_first_frame = (int(shot_first_frame) if shot_first_frame is not None else None)
         self._obs_rows_at_det = max(0, obs_count)
         self._emb_rows_at_det = max(0, emb_count)
+
+        if self._writes_disabled():
+            return
 
         logging.info(
             "ckpt:anchor set @ frame=%d shot=%d shot_first=%s "
@@ -914,6 +969,43 @@ class CheckpointManager(TrackingCheckpoint):
         # Capture a compact JSON list of the open tracks at this anchor.
         self._open_tracks_inline = self._build_open_tracks_list(aggregator, shot_number)
         self._write_status(note or "checkpoint")
+
+    def mark_embedding_safe(
+        self,
+        *,
+        frame_idx: int,
+        shot_number: int | None = None,
+        shot_first_frame: int | None = None,
+        note: str = "embedding safe",
+    ) -> None:
+        """
+          Record the latest frame such that:
+            - all DET observations strictly < (or <=, depending on your policy) this frame
+              that require embeddings have had their embeddings persisted+linked.
+
+        This is the *resume anchor* when present.
+        """
+        if self._writes_disabled():
+            return
+
+        self._last_emb_safe_frame = int(frame_idx)
+        self._last_emb_safe_shot = (int(shot_number) if shot_number is not None else None)
+        self._last_emb_safe_shot_first_frame = (int(shot_first_frame) if shot_first_frame is not None else None)
+
+        if self._obs is not None:
+            try:
+                self._obs_rows_at_emb_safe = int(self._obs.count())
+            except Exception:
+                pass
+        if self._emb is not None:
+            try:
+                self._emb_rows_at_emb_safe = int(self._emb.count())
+            except Exception:
+                pass
+
+        if self._writes_disabled():
+            return
+        self._write_status(note)
 
     def matches_video(self, video_path: Union[str, Path]) -> bool:
         """Return True if the stored checkpoint was created for this video path."""
@@ -989,9 +1081,9 @@ class CheckpointManager(TrackingCheckpoint):
     # ---------- resume helpers ----------
     def get_resume_anchor(self):
         """
-        Return (last_detection_frame, last_detection_shot, last_detection_shot_first_frame)
-        when available. If status.json exists, prefer it. Otherwise, fall back
-        to in-memory attributes that may be set during tests.
+        Return (anchor_frame, anchor_shot, anchor_shot_first_frame)
+        when available. If status.json exists, it is the only source of truth.
+        If no embedding-safe anchor exists in status.json, returns None.
         """
 
         # If resuming, use resume anchor (immutable for the run).
@@ -1009,21 +1101,11 @@ class CheckpointManager(TrackingCheckpoint):
             if self.status_path and self.status_path.exists():
                 import json
                 st = json.loads(self.status_path.read_text() or "{}")
-                frame = st.get("last_detection_frame")
-                shot = st.get("last_detection_shot")
-                shot_first_frame = st.get("last_detection_shot_first_frame")
+                kind, frame, shot, shot_first, _od, _ed = self._status_anchor_fields(st)
                 if frame is not None:
-                    return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
+                    return int(frame), (int(shot) if shot is not None else None), (int(shot_first) if shot_first is not None else None)
         except Exception:
             pass
-
-        # 2) Fall back to in-memory fields (used by tests)
-        frame = getattr(self, "_last_det_frame", None)
-        shot = getattr(self, "_last_det_shot", None)
-        shot_first_frame = getattr(self, "_last_det_shot_first_frame", None)
-        if frame is not None:
-            # Ensure ints; return triple (shot_first may be None)
-            return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
 
         return None
     
@@ -1807,17 +1889,16 @@ class CheckpointManager(TrackingCheckpoint):
             return loaded_obs, loaded_emb
 
         # ---- Trim to anchor (use the same status dict) ----
-        orig_od = int(status.get("obs_rows_at_last_detection", 0) or 0)
-        orig_ed = int(status.get("emb_rows_at_last_detection", 0) or 0)
-        lf = status.get("last_detection_frame")   # may be None
-        ls = status.get("last_detection_shot")    # may be None
-        lfirst = status.get("last_detection_shot_first_frame")
+        kind, frame, shot, shot_first, orig_od, orig_ed = self._status_anchor_fields(status)
 
-        self._last_det_frame = (int(lf) if lf is not None else None)
-        self._last_det_shot  = (int(ls) if ls is not None else None)
-        self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
-        self._obs_rows_at_det = int(orig_od)
-        self._emb_rows_at_det = int(orig_ed)
+        lf = frame
+        ls = shot
+        lfirst = shot_first
+        self._last_emb_safe_frame = (int(lf) if lf is not None else None)
+        self._last_emb_safe_shot  = (int(ls) if ls is not None else None)
+        self._last_emb_safe_shot_first_frame = (int(lfirst) if lfirst is not None else None)
+        self._obs_rows_at_emb_safe = int(orig_od)
+        self._emb_rows_at_emb_safe = int(orig_ed)
 
         if orig_od == 0 and orig_ed == 0:
             logging.info(
@@ -1918,7 +1999,7 @@ class CheckpointManager(TrackingCheckpoint):
                         logging.exception("ckpt:frame-trim fallback failed; continuing with row-anchors only.")
 
                 # Cache for downstream logs
-                self._last_det_frame = anchor_frame_int
+                self._last_emb_safe_frame = anchor_frame_int
             else:
                 logging.info("ckpt:frame-trim skipped (no last_detection_frame in status).")
         except Exception as e:
@@ -1939,7 +2020,7 @@ class CheckpointManager(TrackingCheckpoint):
         if self._last_det_shot is None:
             return out
 
-        for shot in range(1, int(self._last_det_shot)):
+        for shot in range(1, int(self._last_emb_safe_shot)):
             det, have = self._count_det_rows_for_shot(shot)
             # Only flag shots that actually had detections.
             if det > 0 and have < det:
@@ -1974,9 +2055,9 @@ class CheckpointManager(TrackingCheckpoint):
 
         status = self.read_status() or {}
 
-        #set anchor frame
-        ldf = status.get("last_detection_frame")
-        self._anchor_frame = int(ldf) if ldf else None
+        # set anchor frame (embedding-safe only)
+        ldf = status.get("last_embedding_safe_frame")
+        self._anchor_frame = int(ldf) if ldf is not None else None
 
         # Restore minimal counters (best-effort; these are for status/telemetry, not logic)
         try:
@@ -1988,7 +2069,7 @@ class CheckpointManager(TrackingCheckpoint):
 
         # If counters are behind the anchor, bump frames_done to at least the anchor frame.
         if self._anchor_frame is not None:
-            self._frames_done = max(int(self._frames_done or 0), int(self._last_det_frame) + 1)
+            self._frames_done = max(int(self._frames_done or 0), int(self._last_emb_safe_frame) + 1)
 
         # Sanity: ensure the collectors reflect the anchor row counts (already trimmed)
         cur_obs = getattr(obs_collector, "count", lambda: None)() or 0
@@ -2220,6 +2301,12 @@ class CheckpointManager(TrackingCheckpoint):
             last_detection_shot_first_frame=self._last_det_shot_first_frame,
             obs_rows_at_last_detection=self._obs_rows_at_det,
             emb_rows_at_last_detection=self._emb_rows_at_det,
+
+            last_embedding_safe_frame=self._last_emb_safe_frame,
+            last_embedding_safe_shot_number=self._last_emb_safe_shot,
+            last_embedding_safe_shot_first_frame=self._last_emb_safe_shot_first_frame,
+            obs_rows_at_last_embedding_safe=int(self._obs_rows_at_emb_safe or 0),
+            emb_rows_at_last_embedding_safe=int(self._emb_rows_at_emb_safe or 0),
 
             **snap,
             note=note,

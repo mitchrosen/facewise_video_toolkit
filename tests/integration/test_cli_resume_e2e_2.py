@@ -333,6 +333,7 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
         "--output-global-json", str(out_json),
         "--detect-interval", "1",
         "--embedding-batch-size-max", "16",
+        "--embedding-queue-max-pending", "16",
         "--emb-store", "none",
         "--obs-sidecar-path", str(obs_sidecar),
         "--checkpoint-dir", str(ckpt_parent),
@@ -358,7 +359,11 @@ def test_resume_exact_replay_subprocess(tmp_path: Path):
         )
     status1 = json.loads(_find_status_json_under_run_root(run_root1).read_text())
     # Single source of truth for resume anchor
-    anchor = int(status1.get("last_detection_frame") or 0)
+    anchor = status1.get("last_embedding_safe_frame")
+    assert anchor is not None, (
+        f"missing last_embedding_safe_frame in status.json (keys={sorted(status1.keys())})"
+    )
+    anchor = int(anchor)
     assert 0 <= anchor < total_frames, f"bad anchor_frame={anchor} total={total_frames}"
     # Pre-anchor baseline comes from RUN 1’s checkpoint, not the shared sidecar.
     obs_ckpt1 = (run_root1 / "ckpt" / "obs_ckpt.npz")

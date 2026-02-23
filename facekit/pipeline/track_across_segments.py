@@ -430,11 +430,13 @@ def _attach_and_persist_embedded_obs(
     aggregator: ShotFaceTrackAggregator,
     checkpoint: TrackingCheckpoint | None,
     shot_number: int,
+    shot_first_frame: int | None,
 ) -> None:
     """
     For a batch of observations that have just been embedded:
       - attach embeddings to the aggregator per track_id
       - persist embeddings per track via _persist_embeddings_for_track
+      - record an embedding-safe anchor after successful persistence (checkpointing only)
     """
     if not embedded_obs:
         return
@@ -469,6 +471,40 @@ def _attach_and_persist_embedded_obs(
                     frames_for_embed=frames_for_embed,
                     embs=embs,
                 )
+
+    # If we got here, persistence for this flush batch succeeded.
+    # Anchor definition: last frame where a successful embedder flush took place.
+    if checkpoint is not None:
+        # TrackingCheckpoint protocol doesn't declare mark_embedding_safe, but
+        # CheckpointManager implements it; call if present.
+        mark_fn = getattr(checkpoint, "mark_embedding_safe", None)
+        if callable(mark_fn):
+            try:
+                max_frame = max(int(o.frame_idx) for o in embedded_obs)
+            except Exception:
+                max_frame = None
+            if max_frame is not None:
+                mark_fn(
+                    frame_idx=int(max_frame),
+                    shot_number=int(shot_number),
+                    shot_first_frame=(int(shot_first_frame) if shot_first_frame is not None else None),
+                )
+                
+    # If we reached here, persistence for this flush-batch succeeded.
+    # Record the embedding-safe anchor as the latest frame in this batch.
+    # (Anchor is defined as: last frame where a successful embedder flush took place.)
+    if checkpoint is not None:
+        try:
+            max_frame = max(int(o.frame_idx) for o in embedded_obs)
+        except Exception:
+            max_frame = None
+
+        if max_frame is not None:
+            checkpoint.mark_embedding_safe(
+                frame_idx=int(max_frame),
+                shot_number=int(shot_number),
+                shot_first_frame=(int(shot_first_frame) if shot_first_frame is not None else None),
+            )
 
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
@@ -797,6 +833,7 @@ def track_across_segments(
                     aggregator=aggregator,
                     checkpoint=checkpoint,
                     shot_number=shot_number,
+                    shot_first_frame=int(first),
                 )
 
                 _checkpoint_observations_and_snapshot(
@@ -846,6 +883,7 @@ def track_across_segments(
                 aggregator=aggregator,
                 checkpoint=checkpoint,
                 shot_number=shot_number,
+                shot_first_frame=int(first),
             )
 
             aggregator.finalize_tracks()

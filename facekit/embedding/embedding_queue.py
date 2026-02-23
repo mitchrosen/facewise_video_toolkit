@@ -10,7 +10,7 @@ class AlignedFaceEmbeddingQueue:
 
     Contract:
     - enqueue(obs): queue an observation for embedding if needed
-    - maybe_flush(): flush when pending >= max_pending
+    - maybe_flush(): flush when pending >= max_batch_size OR pending >= max_pending
     - flush(...): embed queued aligned faces, write obs.embedding, clear obs.aligned_face
     - Never re-embed observations that already have embedding
     - Returns the list of observations that were embedded during the flush
