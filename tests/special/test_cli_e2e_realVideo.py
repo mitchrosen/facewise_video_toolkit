@@ -169,7 +169,8 @@ def test_cli_e2e_realVideo(tmp_path: Path):
 
     # video_name = "53-man-roster-decisions"
     # video_name = "hot-to-go"
-    video_name = "OGsTest_10sec_snippet"
+    # video_name = "OGsTest_10sec_snippet"
+    video_name = "3fiUUxKMiBGn6kF4Puczvi"
 
     print(f"Video: {video_name}")
 
@@ -209,7 +210,7 @@ def test_cli_e2e_realVideo(tmp_path: Path):
         "--output-video", str(out_video),
         "--no-resume",                    # ensure fresh run
         "--new-run",
-        "--no-checkpoint-write", 
+        # "--no-checkpoint-write", 
         "--log", "INFO",
     ]
     print("Running COLD ----------------------")
