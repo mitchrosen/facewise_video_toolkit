@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import numpy as np
 import pytest
+from typing import List, Dict
 
 from facekit.pipeline.checkpoint import CheckpointManager, ResumeSafetyError
 from facekit.output.json_v2 import (
@@ -33,6 +34,23 @@ class SimpleTrack:
         return min(o.frame_idx for o in self.observations) if self.observations else 0
     def last_frame(self) -> int:
         return max(o.frame_idx for o in self.observations) if self.observations else -1
+
+def _write_shots_fixed_width(path: Path, first: int, last: int, width: int) -> None:
+    """
+    Write a shots.json with fixed-width shots (inclusive frame ranges).
+    width=10 on a 0..59 video yields shots: [0..9],[10..19],...,[50..59].
+    """
+    first_i = int(first)
+    last_i = int(last)
+    w = int(width)
+    assert w > 0
+    shots: List[Dict[str, int]] = []
+    s = first_i
+    while s <= last_i:
+        e = min(s + w - 1, last_i)
+        shots.append({"shot_number": len(shots) + 1, "first_frame": s, "last_frame": e})
+        s = e + 1
+    path.write_text(json.dumps({"shots": shots}, indent=2))
 
 # --- Tiny fake models -------------------------------------------------------
 
@@ -96,7 +114,8 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
     vw.release()
 
     shots_path = tmp_path / "shots.json"
-    _write_shots(shots_path, 0, 59)
+    # Force multiple shot boundaries so an aligned-face flush can occur before the crash.
+    _write_shots_fixed_width(shots_path, 0, 59, width=10)
 
     # Checkpoint parent
     parent = tmp_path / "ckpt"
@@ -129,8 +148,9 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
     )
     ckpt.start(obsA, embA, options_snapshot=opts)
 
-    # INITIAL run: detector crashes on the 22nd detection call (anchor will be at frame 20)
-    det_crash = CrashAfterNDetections(crash_at=22)
+    # INITIAL run: crash after we've crossed at least one shot boundary (>= 10).
+    # This should allow a flush/anchor to be established once the code is updated.
+    det_crash = CrashAfterNDetections(crash_at=30)
     emb = DummyEmbedder()
 
     with ReaderCoordinator(str(vid)) as fp:
@@ -148,10 +168,10 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
     # After crash, status.json should reflect an anchor (at last detection frame).
     st = ckpt.read_status()
     assert st is not None
-    anchor_f = int(st["last_detection_frame"])
+    anchor_f = int(st["last_embedding_safe_frame"])
     assert anchor_f >= 0
     # We expect at least 1 observation row
-    assert int(st["obs_rows_at_last_detection"]) > 0
+    assert int(st["obs_rows_at_last_embedding_safe"]) > 0
 
     # Simulate a fresh process: new collectors for the resume run
     obsB = ObservationsCollector()
@@ -167,12 +187,14 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
 
     # Hydrate + trim
     loaded_obs, loaded_emb = ckpt2.load_and_anchor_collectors(obsB, embB)
-    assert loaded_obs == int(st["obs_rows_at_last_detection"])
-    assert loaded_emb == int(st["emb_rows_at_last_detection"])
+    assert loaded_obs == int(st["obs_rows_at_last_embedding_safe"])
+    assert loaded_emb == int(st["emb_rows_at_last_embedding_safe"])
 
     ckpt2.obs_collector = obsB
-
-    setattr(ckpt2, "get_track_order", lambda: {(1, 0): 0, (1, 1): 1})
+    
+    # This test creates 6 shots (shot_number 1..6) with one track per shot (track_id=0).
+    # Track-order must cover every (shot_number, track_id) present in the persisted obs.
+    setattr(ckpt2, "get_track_order", lambda: {(s, 0): 0 for s in range(1, 7)})
 
     # Resume run (no crash)
     det_ok = NoCrashDetector()
@@ -220,23 +242,13 @@ def test_resume_reconstructs_prior_tracks_and_writes_v21_sidecar(tmp_path: Path)
 def test_iter_tracks_filters_and_groups(tmp_path: Path):
     oc = ObservationsCollector()
 
-    # Minimal valid 5x2 landmarks for DETECTED rows
-    def lm(x: float):
-        return np.asarray(
-            [[x, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
-            dtype=np.float32,
-        )
-
     rows = [
-        # DETECTED rows MUST have landmarks under the new contract
         {
             "shot": 1,
             "track_id": 7,
             "f": 5,
             "bbox_xyxy": [0, 0, 10, 10],
             "src": int(src_to_code(Source.DETECTED.value)),
-            "has_landmarks": 1,
-            "landmarks": lm(5.0),
         },
         # TRACKED row: landmarks optional
         {
@@ -252,8 +264,6 @@ def test_iter_tracks_filters_and_groups(tmp_path: Path):
             "f": 12,
             "bbox_xyxy": [2, 2, 12, 12],
             "src": int(src_to_code(Source.DETECTED.value)),
-            "has_landmarks": 1,
-            "landmarks": lm(12.0),
         },
     ]
 
@@ -294,8 +304,6 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_landmarks", "i4"),
-        ("landmarks", "f4", (10,)),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
 
@@ -318,11 +326,11 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
         "checkpoint_dir": str(run),
         "log_level": "INFO",
         "log_file": None,
-        "last_detection_frame": 0,
-        "last_detection_shot": 1,
-        "last_detection_shot_first_frame": 0,
-        "obs_rows_at_last_detection": 0,
-        "emb_rows_at_last_detection": 0,
+        "last_embedding_safe_frame": 0,
+        "last_embedding_safe_shot_number": 1,
+        "last_embedding_safe_shot_first_frame": 0,
+        "obs_rows_at_last_embedding_safe": 0,
+        "emb_rows_at_last_embedding_safe": 0,
         "frames_done": 0, "shots_done": 0, "tracks_seen": 0,
         "obs_rows": 0, "emb_rows": 0,
         "last_saved_utc": "now", "note": "opened",
@@ -359,8 +367,6 @@ def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
         ("src", "i4"),
         ("conf", "f4"),
         ("emb_idx", "i4"),
-        ("has_landmarks", "i4"),
-        ("landmarks", "f4", (10,)),
     ])
     np.savez(obs_sidecar, observations=np.zeros(0, dtype=obs_dtype))
     np.savez(emb_sidecar, embeddings=np.zeros((0, 512), dtype=np.float32))

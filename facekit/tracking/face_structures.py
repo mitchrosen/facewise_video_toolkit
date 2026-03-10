@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Literal
 import numpy as np
-from facekit.utils.geometry import compute_iou
 import logging
+import traceback
 from facekit.common.obs_consts import Source, code_to_src, src_to_code
 
 @dataclass
@@ -93,7 +93,7 @@ class FaceTrack:
     last_bbox = (0, 0, 0, 0)
 
     #   Authoritative cached DET frame index (kept in sync on every DET add)
-    _last_det_frame_idx: int | None = -1
+    _last_det_frame_idx: int | None = None
 
     closed = False
     
@@ -104,27 +104,53 @@ class FaceTrack:
                 raise ValueError(f"Duplicate frame_idx {obs.frame_idx} found during initialization")
             self._frame_index_map[obs.frame_idx] = obs
     
-    def add_observation(self, obs: FaceObservation, force: bool = False):
+    def add_observation(self, obs: FaceObservation, force: bool = False, *, allow_closed: bool = False) -> None:
         """
         Add an observation to the track.
 
         Args:
             obs (FaceObservation): The observation to add.
             force (bool): If True, overwrite existing observation for the same frame index.
+            allow_closed (bool): If True, allow adding observations even if the track is closed.
+                Intended for offline/post-processing (e.g., interpolation / merges). Defaults to False.
 
         Raises:
             ValueError: If an observation already exists for the frame index and force is False.
         """
 
-        if not self.is_open:
-            raise RuntimeError("Cannot add observation to a closed track")
-        
-        # Append after the closed check so we don't mutate on error
-        self.observations.append(obs)
+        if not self.is_open and (not allow_closed):
+            raise RuntimeError(
+                            "Attempt to add observation to CLOSED track\n"
+                            f"  shot_id={self.shot_id} track_id={self.track_id}\n"
+                            f"  obs.frame_idx={obs.frame_idx} obs.source={obs.source}\n"
+                            f"  last_frame={self.last_frame()}\n"
+                            f"  stack:\n{''.join(traceback.format_stack(limit=25))}"
+                        )
 
         existing = self._frame_index_map.get(obs.frame_idx)
-        if existing and not force:
-            raise ValueError(f"Observation for frame {obs.frame_idx} already exists. Use force=True to overwrite.")
+        if existing is not None:
+            if not force:
+                raise ValueError(
+                    f"Observation for frame {obs.frame_idx} already exists. "
+                    f"Use force=True to overwrite."
+                )
+            # force=True: replace the existing observation in the list, not just the map,
+            # to avoid duplicate frame_idx entries inside self.observations.
+            try:
+                # Find and replace the first matching obs in the list.
+                for i, o in enumerate(self.observations):
+                    if int(getattr(o, "frame_idx", -1)) == int(obs.frame_idx):
+                        self.observations[i] = obs
+                        break
+                else:
+                    # Map had it, list didn't (shouldn't happen), fall back to append.
+                    self.observations.append(obs)
+            except Exception:
+                # If something goes weird, fall back to append; map will still be authoritative.
+                self.observations.append(obs)
+        else:
+            # Normal path: no collision
+            self.observations.append(obs)
 
         self._frame_index_map[obs.frame_idx] = obs
 
@@ -150,10 +176,6 @@ class FaceTrack:
         # Keep the DET cache authoritative
         if getattr(obs, "source", None) == Source.DETECTED:
             self._last_det_frame_idx = int(obs.frame_idx)
-      
-        # Update last_bbox helper
-        if obs.bbox is not None:
-            self.last_bbox = tuple(int(v) for v in obs.bbox[:4])
 
     def reset_for_frame(self):
         self.is_active = False

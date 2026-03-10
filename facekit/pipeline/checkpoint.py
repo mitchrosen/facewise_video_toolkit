@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Tuple
 from datetime import datetime, timezone
 import json
 import os
@@ -190,7 +191,6 @@ def _assert_npz_keys(npz_path: Path, required_keys: tuple[str, ...], *, strict: 
         if strict:
             raise ResumeSafetyError(msg)
         logging.info("ckpt:non-strict: %s", msg)
-        
 
 @dataclass
 class CheckpointStatus:
@@ -209,6 +209,7 @@ class CheckpointStatus:
     last_detection_shot_first_frame: int | None
     obs_rows_at_last_detection: int
     emb_rows_at_last_detection: int
+
     # configuration snapshot (for safe resume)
     schema_version: str
     detect_interval: int
@@ -227,6 +228,13 @@ class CheckpointStatus:
     track_order: list[dict] | None = None
     open_tracks: list | None = None
 
+    # restart anchor (embedding-safe boundary)
+    last_embedding_safe_frame: int | None = None
+    last_embedding_safe_shot_number: int | None = None
+    last_embedding_safe_shot_first_frame: int | None = None
+    obs_rows_at_last_embedding_safe: int = 0
+    emb_rows_at_last_embedding_safe: int = 0
+ 
     # misc
     note: str = ""
 
@@ -252,33 +260,40 @@ class CheckpointManager(TrackingCheckpoint):
     @property
     def run_id(self) -> str:
         return self.root.name
+    
+    def _writes_disabled(self) -> bool:
+        """Whether checkpoint output writes are disabled for this run."""
+        return bool(getattr(self, "write_disabled", False))
+ 
+    def _writes_enabled(self) -> bool:
+        return not self._writes_disabled()
 
     def __init__(self,
                  root_dir: Union[str, Path],
                  *,
                  video_path: Union[str, Path],
-                 resume: bool = True) -> None:
+                 resume: bool = True,
+                 write_disabled: bool = False) -> None:
         
-        # Paths
+        # Output writes (status.json, snapshots, sidecars)
+        self.write_disabled = bool(write_disabled)
+
+        # Paths (no mkdir here unless writes are enabled)
         self.root = Path(root_dir)
-        self.ckpt_dir  = Path(self.root, "ckpt")
-        self.video_path = str(Path(video_path).resolve())
+        self.ckpt_dir = Path(self.root, "ckpt")
         self.status_path = Path(self.root, "status.json")
+        self.video_path = str(Path(video_path).resolve())
 
-        logging.info("ckpt.paths: root=%s ckpt_dir=%s status_path=%s", self.root, self.ckpt_dir, self.status_path)
+        self.obs_path = Path(self.ckpt_dir, "obs_ckpt.npz")
+        self.emb_path = Path(self.ckpt_dir, "emb_ckpt.npz")
 
+        if not self.write_disabled:
+            self.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        self.obs_path    = Path(self.ckpt_dir, "obs_ckpt.npz")
-        self.emb_path    = Path(self.ckpt_dir, "emb_ckpt.npz")
-
-        # Create dirs when missing
-        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resume
-        self.resume_enabled = bool(resume)
-        self._shot_track_to_order: dict[tuple[int,int], int] = {}
-        self._next_track_order: int = 0
-        self._anchor_frame: int | None = None
+        logging.info(
+            "ckpt.paths: root=%s ckpt_dir=%s status_path=%s",
+            self.root, self.ckpt_dir, self.status_path
+        )
 
         # Counters
         self._frames_done = 0
@@ -291,12 +306,30 @@ class CheckpointManager(TrackingCheckpoint):
         self._pending_det_shot_first: int | None = None
         self._pending_det_reason: str | None = None
 
+        # Resume
+        self.resume_enabled = bool(resume)
+        self._shot_track_to_order: dict[tuple[int,int], int] = {}
+        self._next_track_order: int = 0
+        self._anchor_frame: int | None = None
+
         # Detection anchors
         self._last_det_frame: int | None = None
         self._last_det_shot: int | None = None
         self._obs_rows_at_det: int = 0
         self._emb_rows_at_det: int = 0
         self._last_det_shot_first_frame: int | None = None
+
+        # Embedding-safe anchors
+        self._last_emb_safe_frame: int | None = None
+        self._last_emb_safe_shot: int | None = None
+        self._last_emb_safe_shot_first_frame: int | None = None
+        self._obs_rows_at_emb_safe: int = 0
+        self._emb_rows_at_emb_safe: int = 0
+
+        # Resume-time anchor (immutable once the run starts).
+        self._resume_anchor_frame: int | None = None
+        self._resume_anchor_shot: int | None = None
+        self._resume_anchor_shot_first_frame: int | None = None
 
         # Collector pointers (set via `start`)
         self._obs = None  # ObservationsCollector
@@ -314,6 +347,37 @@ class CheckpointManager(TrackingCheckpoint):
     def _is_pre_anchor(self, frame_idx: int) -> bool:
         a = self._anchor_frame
         return self.resume_enabled and a is not None and int(frame_idx) < int(a)
+    
+    @staticmethod
+    def _status_anchor_fields(status: dict) -> Tuple[str, int | None, int | None, int | None, int, int]:
+        """
+        Choose the resume anchor fields from status.json.
+
+        Returns:
+          (kind, frame, shot, shot_first_frame, obs_rows_anchor, emb_rows_anchor)
+
+        Embedding-safe ONLY:
+          - If last_embedding_safe_frame is present -> use embedding-safe anchor.
+          - Else -> no anchor ("none"). Detection anchors are intentionally ignored.
+        """
+        last_embedding_safe_frame = status.get("last_embedding_safe_frame")
+        if last_embedding_safe_frame is None:
+            return ("none", None, None, None, 0, 0)
+
+        frame = int(last_embedding_safe_frame)
+        shot = status.get("last_embedding_safe_shot_number")
+        shot_first = status.get("last_embedding_safe_shot_first_frame")
+        obs_rows = int(status.get("obs_rows_at_last_embedding_safe", 0) or 0)
+        emb_rows = int(status.get("emb_rows_at_last_embedding_safe", 0) or 0)
+
+        return (
+            "embedding_safe",
+            frame,
+            (int(shot) if shot is not None else None),
+            (int(shot_first) if shot_first is not None else None),
+            obs_rows,
+            emb_rows,
+        )
 
     # ---------- public API ----------
 
@@ -349,29 +413,49 @@ class CheckpointManager(TrackingCheckpoint):
 
             # ---- Pre-hydrate detection anchors BEFORE the first write ----
             try:
-                if self._last_det_frame is None:
-                    last_det_frame = status.get("last_detection_frame")
-                    if last_det_frame is not None:
-                        self._last_det_frame = int(last_det_frame)
-                if self._last_det_shot is None:
-                    last_det_shot = status.get("last_detection_shot")
-                    if last_det_shot is not None:
-                        self._last_det_shot = int(last_det_shot)
-                if self._last_det_shot_first_frame is None:
-                    last_det_shot_first_frame = status.get("last_detection_shot_first_frame")
-                    if last_det_shot_first_frame is not None:
-                        self._last_det_shot_first_frame = int(last_det_shot_first_frame)
-                if not self._obs_rows_at_det:
-                    last_det_obs_rows = status.get("obs_rows_at_last_detection")
-                    if last_det_obs_rows is not None:
-                        self._obs_rows_at_det = int(last_det_obs_rows)
-                if not self._emb_rows_at_det:
-                    last_det_emb_rows = status.get("emb_rows_at_last_detection")
-                    if last_det_emb_rows is not None:
-                        self._emb_rows_at_det = int(last_det_emb_rows)
+                # --- Pre-hydrate embedding-safe anchors (Design B) ---
+                if self._last_emb_safe_frame is None:
+                    v = status.get("last_embedding_safe_frame")
+                    if v is not None:
+                        self._last_emb_safe_frame = int(v)
+                if self._last_emb_safe_shot is None:
+                    v = status.get("last_embedding_safe_shot_number")
+                    if v is not None:
+                        self._last_emb_safe_shot = int(v)
+                if self._last_emb_safe_shot_first_frame is None:
+                    v = status.get("last_embedding_safe_shot_first_frame")
+                    if v is not None:
+                        self._last_emb_safe_shot_first_frame = int(v)
+                if not self._obs_rows_at_emb_safe:
+                    v = status.get("obs_rows_at_last_embedding_safe")
+                    if v is not None:
+                        self._obs_rows_at_emb_safe = int(v)
+                if not self._emb_rows_at_emb_safe:
+                    v = status.get("emb_rows_at_last_embedding_safe")
+                    if v is not None:
+                        self._emb_rows_at_emb_safe = int(v)
             except Exception:
                 # Non-fatal: resume can still proceed without these hints.
                 pass
+
+            # Freeze resume anchor exactly once at the beginning of a resumed run.
+            # This must NOT change during the rest of the run.
+            if self.resume_enabled and self._resume_anchor_frame is None:
+                try:
+                    kind, frame, shot, shot_first, _od, _ed = self._status_anchor_fields(status)
+                    if frame is not None:
+                        self._resume_anchor_frame = int(frame)
+                    if shot is not None:
+                        self._resume_anchor_shot = int(shot)
+                    if shot_first is not None:
+                        self._resume_anchor_shot_first_frame = int(shot_first)
+
+                    logging.info(
+                        "ckpt.start: froze resume anchor (%s) frame=%s shot=%s shot_first=%s",
+                        kind, frame, shot, shot_first,
+                    )
+                except Exception:
+                    pass
 
             try:
                 prev_open_tracks = status.get("open_tracks")
@@ -417,7 +501,8 @@ class CheckpointManager(TrackingCheckpoint):
                             logging.info("ckpt.start: installed track_order from sidecar (entries=%d)",
                                          len(self._shot_track_to_order))
                             # persist immediately so future resumes don't rely on fallback
-                            self._write_status("track_order from sidecar")
+                            if self._writes_enabled():
+                                self._write_status("track_order from sidecar")
                     except Exception:
                         logging.exception("ckpt.start: sidecar fallback for track_order failed")
         else:
@@ -427,16 +512,20 @@ class CheckpointManager(TrackingCheckpoint):
             logging.debug("ckpt.start: initializing empty track_order (fresh run).")
 
         # --- Always write an initial status snapshot ---
-        try:
-            logging.debug("ckpt.start: writing initial status.json")
-            self._write_status("checkpointing started")
-        except Exception as e:
-            logging.exception("ckpt.start: initial status write failed: %s", e)
+        if self._writes_enabled():
+            try:
+                logging.debug("ckpt.start: writing initial status.json")
+                self._write_status("checkpointing started")
+            except Exception as e:
+                logging.exception("ckpt.start: initial status write failed: %s", e)
 
     def on_new_tracks(self, n: int) -> None:
         self._tracks_seen += int(n)
 
     def on_shot_done(self) -> None:
+        if self._writes_disabled():
+            return
+
         self._shots_done += 1
         # Ensure the anchor’s row counters include end-of-shot backfill.
         try:
@@ -455,6 +544,9 @@ class CheckpointManager(TrackingCheckpoint):
         self._write_status("shot boundary (post-backfill + flush)")
 
     def refresh_anchor_row_counts_post_backfill(self) -> None:
+        # This method only exists to maintain checkpoint output semantics.
+        if self._writes_disabled():
+            return
         if self._last_det_frame is None or self._obs is None or self._emb is None:
             return
         try:
@@ -481,6 +573,9 @@ class CheckpointManager(TrackingCheckpoint):
 
     def on_frame(self, frame_idx: int) -> None:
         # Called for every processed frame (0-based)
+        if self._writes_disabled():
+            return
+
         self._frames_done = int(frame_idx) + 1
 
     @staticmethod
@@ -503,7 +598,7 @@ class CheckpointManager(TrackingCheckpoint):
         Contract:
         - returns (0, nan[10]) if no valid landmarks are present
         - returns (1, float32[10]) if valid landmarks are present
-        - if source == DETECTED: invalid/missing landmarks raise ValueError
+        - landmarks are OPTIONAL for all sources (including DETECTED)
         """
         import numpy as np
         from facekit.common.obs_consts import Source, src_to_code
@@ -524,16 +619,14 @@ class CheckpointManager(TrackingCheckpoint):
                 return ("detected" in s)  # intentionally loose
             return False
 
-        def _fail_detected(msg: str) -> None:
-            raise ValueError(f"landmarks invalid for DETECTED row: {msg}")
-
         # --- determine source ------------------------------------------------
         if isinstance(ob_or_row, dict):
             source_any = ob_or_row.get("src", None)
         else:
             source_any = getattr(ob_or_row, "source", None)
 
-        is_detected = _is_detected(source_any)
+        # We still parse/validate if present, but do not require landmarks for any source.
+        _ = _is_detected(source_any)
 
         # --- fast path: already-normalized dict fields -----------------------
         if isinstance(ob_or_row, dict):
@@ -546,18 +639,12 @@ class CheckpointManager(TrackingCheckpoint):
 
                 if has_landmarks == 1:
                     if landmarks_flat10.shape != (10,):
-                        if is_detected:
-                            _fail_detected(f"landmarks_flat10 wrong shape {landmarks_flat10.shape}")
                         return (0, nan_landmarks_flat10)
                     if not np.all(np.isfinite(landmarks_flat10)):
-                        if is_detected:
-                            _fail_detected("landmarks_flat10 contains NaN/Inf")
                         return (0, nan_landmarks_flat10)
                     return (1, landmarks_flat10.astype(np.float32, copy=False))
 
                 # has_landmarks == 0
-                if is_detected:
-                    _fail_detected("has_landmarks=0")
                 return (0, nan_landmarks_flat10)
 
         # --- general path: look for 'landmarks' ------------------------------
@@ -567,8 +654,6 @@ class CheckpointManager(TrackingCheckpoint):
             landmarks = getattr(ob_or_row, "landmarks", None)
 
         if landmarks is None:
-            if is_detected:
-                _fail_detected("missing landmarks")
             return (0, nan_landmarks_flat10)
 
         landmarks_arr = np.asarray(landmarks, dtype=np.float32)
@@ -577,14 +662,10 @@ class CheckpointManager(TrackingCheckpoint):
         elif landmarks_arr.shape == (10,):
             landmarks_flat10 = landmarks_arr
         else:
-            if is_detected:
-                _fail_detected(f"wrong shape {landmarks_arr.shape} (expected (5,2) or (10,))")
             return (0, nan_landmarks_flat10)
 
         if not np.all(np.isfinite(landmarks_flat10)):
-            if is_detected:
-                _fail_detected("contains NaN/Inf")
-            return (0, nan_landmarks_flat10)
+             return (0, nan_landmarks_flat10)
 
         return (1, landmarks_flat10.astype(np.float32, copy=False))
 
@@ -629,6 +710,9 @@ class CheckpointManager(TrackingCheckpoint):
         Append observations for THIS FRAME into the observations collector.
         STRICT: only accepts list[FaceObservation].
         """
+        # If checkpoint output is disabled, checkpoint collectors must be inert.
+        if self._writes_disabled():
+            return 0
         if not observations:
             return 0
         
@@ -738,8 +822,11 @@ class CheckpointManager(TrackingCheckpoint):
 
         - This call represents embeddings for exactly ONE frame (frame_idx_last).
         - `embs` must be shape (1, D).
-        - We link by exact frame equality to exactly one DETECTED, has_landmarks=1, emb_idx=-1 observation row.
+        - Link by exact frame equality to exactly one DETECTED, emb_idx=-1 observation row.
         """
+        # If checkpoint output is disabled, checkpoint collectors must be inert.
+        if self._writes_disabled():
+            return 0
         anchor = self._anchor_frame
         self.logger.debug(
             "add_embeddings: shot=%d tid=%d frame=%d anchor=%s embs_shape=%s",
@@ -790,7 +877,7 @@ class CheckpointManager(TrackingCheckpoint):
             track_id=int(track_id),
             frame_last=int(frame_idx_last),
             only_unassigned=True,
-            only_with_landmarks=True,
+            only_with_landmarks=False,
             source=det_code,
             count=None,
         )
@@ -845,19 +932,21 @@ class CheckpointManager(TrackingCheckpoint):
             shot_number: int,
             aggregator: ShotFaceTrackAggregatorProtocol,
             shot_first_frame: int | None = None,
+            open_tracks: list[dict] | None = None,
             note: str = "checkpoint") -> None:
         """
-        Persist a point-in-time snapshot that allows a safe resume:
-        - Write obs_ckpt-<frame>.npz under <run_root>/ckpt atomically.
-        - (Optionally) write emb_ckpt-<frame>.npz if an API is available.
-        - Update status.json with last_detection_frame/shot metadata.
+         Persist a checkpoint snapshot to disk and update status.json.
         """
+        if self._writes_disabled():
+            return
+
         if self._obs is None or self._emb is None:
             return
 
         obs_count = self._obs.count()
         emb_count = self._emb.count()
  
+        # Anchor bookkeeping is checkpoint-output bookkeeping (only when writes are enabled).
         self._last_det_frame = int(frame_idx)
         self._last_det_shot = int(shot_number)
         self._last_det_shot_first_frame = (int(shot_first_frame) if shot_first_frame is not None else None)
@@ -877,12 +966,64 @@ class CheckpointManager(TrackingCheckpoint):
         self._open_tracks_inline = self._build_open_tracks_list(aggregator, shot_number)
         self._write_status(note or "checkpoint")
 
+    def mark_embedding_safe(
+        self,
+        *,
+        frame_idx: int,
+        shot_number: int | None = None,
+        shot_first_frame: int | None = None,
+        open_tracks: list[dict] | None = None,
+        note: str = "embedding safe",
+    ) -> None:
+        """
+          Record the latest frame such that:
+            - all DET observations strictly < (or <=, depending on your policy) this frame
+              that require embeddings have had their embeddings persisted+linked.
+
+        This is the *resume anchor* when present.
+        """
+        if self._writes_disabled():
+            return
+
+        self._last_emb_safe_frame = int(frame_idx)
+        self._last_emb_safe_shot = (int(shot_number) if shot_number is not None else None)
+        self._last_emb_safe_shot_first_frame = (int(shot_first_frame) if shot_first_frame is not None else None)
+
+        if self._obs is not None:
+            try:
+                self._obs_rows_at_emb_safe = int(self._obs.count())
+            except Exception:
+                pass
+        if self._emb is not None:
+            try:
+                self._emb_rows_at_emb_safe = int(self._emb.count())
+            except Exception:
+                pass
+
+        if open_tracks is not None:
+            self._open_tracks_inline = list(open_tracks)
+
+        # Make the checkpoint durable at the embedding-safe boundary.
+        # (Generic semantics: "checkpoint reflects embeddings-safe anchor".)
+        try:
+            if self._obs is not None:
+                _dump_npz_atomic(self._obs, self.obs_path)
+            if self._emb is not None:
+                _dump_npz_atomic(self._emb, self.emb_path)
+        except Exception:
+            logging.exception("ckpt:mark_embedding_safe: sidecar dump failed (non-fatal)")
+
+        self._write_status(note)
+
     def matches_video(self, video_path: Union[str, Path]) -> bool:
         """Return True if the stored checkpoint was created for this video path."""
         status = self.read_status()
         return bool(status and str(status.get("video_path")) == str(video_path))
 
     def finalize(self, note: str = "final") -> None:
+        if self._writes_disabled():
+            return
+
         # Ensure sidecars exist even if no detection checkpoint happened.
         if self._obs is not None:
             _dump_npz_atomic(self._obs, self.obs_path)
@@ -903,6 +1044,9 @@ class CheckpointManager(TrackingCheckpoint):
         Embeddings are also copied verbatim.
         Safe no-ops if a given source file doesn't exist or a target path is None.
         """
+        if self._writes_disabled():
+            return
+        
         try:
             if obs_sidecar_path:
                 src = self.ckpt_dir / "obs_ckpt.npz"
@@ -929,6 +1073,9 @@ class CheckpointManager(TrackingCheckpoint):
         Mark the run as completed in status.json. This enables 'resume-for-outputs'
         semantics without adding any special CLI switches.
         """
+        if self._writes_disabled():
+            return
+        
         status = self.read_status()
         status["completed"] = True
         status["completed_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -942,30 +1089,31 @@ class CheckpointManager(TrackingCheckpoint):
     # ---------- resume helpers ----------
     def get_resume_anchor(self):
         """
-        Return (last_detection_frame, last_detection_shot, last_detection_shot_first_frame)
-        when available. If status.json exists, prefer it. Otherwise, fall back
-        to in-memory attributes that may be set during tests.
+        Return (anchor_frame, anchor_shot, anchor_shot_first_frame)
+        when available. If status.json exists, it is the only source of truth.
+        If no embedding-safe anchor exists in status.json, returns None.
         """
+
+        # If resuming, use resume anchor (immutable for the run).
+        if self.resume_enabled:
+            resume_anchor_frame = self._resume_anchor_frame
+            if resume_anchor_frame is not None:
+                return (
+                    int(resume_anchor_frame),
+                    int(self._resume_anchor_shot) if self._resume_anchor_shot is not None else None,
+                    int(self._resume_anchor_shot_first_frame) if self._resume_anchor_shot_first_frame is not None else None
+                )
+
         # 1) Prefer status.json (single source of truth)
         try:
             if self.status_path and self.status_path.exists():
                 import json
                 st = json.loads(self.status_path.read_text() or "{}")
-                frame = st.get("last_detection_frame")
-                shot = st.get("last_detection_shot")
-                shot_first_frame = st.get("last_detection_shot_first_frame")
+                kind, frame, shot, shot_first, _od, _ed = self._status_anchor_fields(st)
                 if frame is not None:
-                    return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
+                    return int(frame), (int(shot) if shot is not None else None), (int(shot_first) if shot_first is not None else None)
         except Exception:
             pass
-
-        # 2) Fall back to in-memory fields (used by tests)
-        frame = getattr(self, "_last_det_frame", None)
-        shot = getattr(self, "_last_det_shot", None)
-        shot_first_frame = getattr(self, "_last_det_shot_first_frame", None)
-        if frame is not None:
-            # Ensure ints; return triple (shot_first may be None)
-            return int(frame), (int(shot) if shot is not None else None), (int(shot_first_frame) if shot_first_frame is not None else None)
 
         return None
     
@@ -1225,6 +1373,8 @@ class CheckpointManager(TrackingCheckpoint):
           - last_det_frame (authoritative)
           - bbox at last_det_frame (if known), else last bbox
         """
+        if self._writes_disabled():
+            return
         open_list = []
 
         for track in getattr(aggregator, "tracks", []):
@@ -1424,6 +1574,7 @@ class CheckpointManager(TrackingCheckpoint):
         run_id: str | None = None,
         resume_latest: bool = False,
         force_new_run: bool = False,
+        write_disabled: bool = False,
     ) -> "CheckpointManager":
         """
         Create or select a checkpoint run directory and return a configured CheckpointManager.
@@ -1458,14 +1609,18 @@ class CheckpointManager(TrackingCheckpoint):
             - If an existing run is being targeted (`run_id` or `resume_latest`) but
             `no_resume` is True.
         """
-        # Ensure parent exists before globbing
         parent_dir = Path(parent_dir)
-        parent_dir.mkdir(parents=True, exist_ok=True)
 
         logging.debug(
             "ckpt.open: args run_id=%r resume_latest=%r force_new_run=%r no_resume=%r parent=%s video=%s",
-            run_id, resume_latest, force_new_run, no_resume, str(parent_dir), str(video_path)
-        )
+             run_id, resume_latest, force_new_run, no_resume, str(parent_dir), str(video_path)
+         )
+            
+        # Contradiction if write_disabled and force_new_run are both true
+        if write_disabled and force_new_run:
+            raise ValueError(
+                "force_new_run=True is incompatible with write_disabled=True (no checkpoint writes)."
+            )
 
         # Guard contradictions about selected dir
         if run_id and resume_latest:
@@ -1487,21 +1642,37 @@ class CheckpointManager(TrackingCheckpoint):
                 raise FileNotFoundError(f"checkpoint run not found: {run_dir}")
             selected_dir_exists = True
         elif resume_latest:
-            prev_runs = sorted([d for d in parent_dir.glob("run-*") if d.is_dir()], key=lambda p: p.name)
+            prev_runs = []
+            if parent_dir.exists():
+                prev_runs = sorted([d for d in parent_dir.glob("run-*") if d.is_dir()], key=lambda p: p.name)
             if prev_runs:
                 run_dir = prev_runs[-1]
                 selected_dir_exists = True
             else:
-                # no existing; fall back to new
-                run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
+                # No existing checkpoints. Opportunistic resume becomes "fresh run".
+                selected_dir_exists = False
                 do_resume = False
+                if write_disabled:
+                    # Writes disabled and nothing to resume: still return a manager object,
+                    # but do NOT create any directories. Use a placeholder run_dir path.
+                    run_dir = parent_dir / "run-write-disabled"
+                else:
+                    parent_dir.mkdir(parents=True, exist_ok=True)
+                    run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
         else:
-            run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
+            # Default selection: fresh run.
             do_resume = False
+            selected_dir_exists = False
+            if write_disabled:
+                # Writes disabled: return a manager without creating parent_dir/run_dir.
+                run_dir = parent_dir / "run-write-disabled"
+            else:
+                parent_dir.mkdir(parents=True, exist_ok=True)
+                run_dir = cls._create_new_run_dir(parent_dir, options_snapshot)
 
         logging.debug(
             "ckpt.open: selected run_dir=%s selected_dir_exists=%s do_resume=%s",
-            str(run_dir), selected_dir_exists, do_resume
+            (str(run_dir) if run_dir is not None else "<none>"), selected_dir_exists, do_resume
         )
 
         # Purge directory if overwrite set and directory exists
@@ -1511,7 +1682,7 @@ class CheckpointManager(TrackingCheckpoint):
             (run_dir / "ckpt").mkdir(parents=True, exist_ok=True)
             (run_dir / "status.json").unlink(missing_ok=True)
 
-        mgr = cls(run_dir, video_path=video_path, resume=do_resume)
+        mgr = cls(run_dir, video_path=video_path, resume=do_resume, write_disabled=write_disabled)
         mgr._cfg = dict(options_snapshot or {})
 
         # Helpful debug logging for presence/sizes of checkpoint sidecars
@@ -1748,17 +1919,16 @@ class CheckpointManager(TrackingCheckpoint):
             return loaded_obs, loaded_emb
 
         # ---- Trim to anchor (use the same status dict) ----
-        orig_od = int(status.get("obs_rows_at_last_detection", 0) or 0)
-        orig_ed = int(status.get("emb_rows_at_last_detection", 0) or 0)
-        lf = status.get("last_detection_frame")   # may be None
-        ls = status.get("last_detection_shot")    # may be None
-        lfirst = status.get("last_detection_shot_first_frame")
+        kind, frame, shot, shot_first, orig_od, orig_ed = self._status_anchor_fields(status)
 
-        self._last_det_frame = (int(lf) if lf is not None else None)
-        self._last_det_shot  = (int(ls) if ls is not None else None)
-        self._last_det_shot_first_frame = (int(lfirst) if lfirst is not None else None)
-        self._obs_rows_at_det = int(orig_od)
-        self._emb_rows_at_det = int(orig_ed)
+        lf = frame
+        ls = shot
+        lfirst = shot_first
+        self._last_emb_safe_frame = (int(lf) if lf is not None else None)
+        self._last_emb_safe_shot  = (int(ls) if ls is not None else None)
+        self._last_emb_safe_shot_first_frame = (int(lfirst) if lfirst is not None else None)
+        self._obs_rows_at_emb_safe = int(orig_od)
+        self._emb_rows_at_emb_safe = int(orig_ed)
 
         if orig_od == 0 and orig_ed == 0:
             logging.info(
@@ -1808,8 +1978,8 @@ class CheckpointManager(TrackingCheckpoint):
             lf, ls
         )
 
-        # --- Trim BY FRAME so nothing at/after the anchor remains ---
-        # If we know the last detection frame, drop any rows with f >= anchor_frame.
+        # --- Trim BY FRAME so nothing AFTER the embedding-safe frame remains ---
+        # If we know the embedding-safe frame, keep rows with f <= embedding_safe_frame.
         try:
             if lf is not None:
                 anchor_frame_int = int(lf)
@@ -1818,20 +1988,20 @@ class CheckpointManager(TrackingCheckpoint):
                 trimmed_by_frame = False
                 if hasattr(obs_collector, "trim_to_frame") and callable(obs_collector.trim_to_frame):
                     obs_before = getattr(obs_collector, "count", lambda: None)()
-                    obs_collector.trim_to_frame(anchor_frame_int - 1)   # keep strictly < anchor
+                    obs_collector.trim_to_frame(anchor_frame_int)   # keep <= embedding-safe frame
                     obs_after = getattr(obs_collector, "count", lambda: None)()
                     logging.info(
-                        "ckpt:frame-trim obs %s→%s @ frame=%d (strictly < anchor)",
+                        "ckpt:frame-trim obs %s→%s @ frame=%d (keep <= embedding-safe frame)",
                         obs_before, obs_after, anchor_frame_int
                     )
                     trimmed_by_frame = True
 
                 if hasattr(emb_collector, "trim_to_frame") and callable(emb_collector.trim_to_frame):
                     emb_before = getattr(emb_collector, "count", lambda: None)()
-                    emb_collector.trim_to_frame(anchor_frame_int - 1)
+                    emb_collector.trim_to_frame(anchor_frame_int)
                     emb_after = getattr(emb_collector, "count", lambda: None)()
                     logging.info(
-                        "ckpt:frame-trim emb %s→%s @ frame=%d (strictly < anchor)",
+                        "ckpt:frame-trim emb %s→%s @ frame=%d (keep <= embedding-safe frame)",
                         emb_before, emb_after, anchor_frame_int
                     )
                     trimmed_by_frame = True
@@ -1840,11 +2010,9 @@ class CheckpointManager(TrackingCheckpoint):
                 if not trimmed_by_frame and hasattr(obs_collector, "to_array"):
                     try:
                         arr = obs_collector.to_array()
-                        # find the last index whose frame ('f') is < anchor_frame
+                        # keep rows whose frame ('f') is <= embedding-safe frame
                         if getattr(arr, "size", 0) > 0:
-                            # We assume the collector preserves append order;
-                            # find the *position* of the last < anchor frame row.
-                            valid_mask = (arr["f"] < anchor_frame_int)
+                            valid_mask = (arr["f"] <= anchor_frame_int)
                             keep_rows = int(valid_mask.sum())
                             if keep_rows < getattr(obs_collector, "count", lambda: 0)():
                                 obs_before = getattr(obs_collector, "count", lambda: None)()
@@ -1852,14 +2020,14 @@ class CheckpointManager(TrackingCheckpoint):
                                     obs_collector.trim_to(keep_rows)
                                     obs_after = getattr(obs_collector, "count", lambda: None)()
                                     logging.info(
-                                        "ckpt:frame-trim(obs) by row-count %s→%s using f<%d",
+                                        "ckpt:frame-trim(obs) by row-count %s→%s using f<=%d",
                                         obs_before, obs_after, anchor_frame_int
                                     )
                     except Exception:
                         logging.exception("ckpt:frame-trim fallback failed; continuing with row-anchors only.")
 
                 # Cache for downstream logs
-                self._last_det_frame = anchor_frame_int
+                self._last_emb_safe_frame = anchor_frame_int
             else:
                 logging.info("ckpt:frame-trim skipped (no last_detection_frame in status).")
         except Exception as e:
@@ -1880,7 +2048,7 @@ class CheckpointManager(TrackingCheckpoint):
         if self._last_det_shot is None:
             return out
 
-        for shot in range(1, int(self._last_det_shot)):
+        for shot in range(1, int(self._last_emb_safe_shot)):
             det, have = self._count_det_rows_for_shot(shot)
             # Only flag shots that actually had detections.
             if det > 0 and have < det:
@@ -1915,9 +2083,9 @@ class CheckpointManager(TrackingCheckpoint):
 
         status = self.read_status() or {}
 
-        #set anchor frame
-        ldf = status.get("last_detection_frame")
-        self._anchor_frame = int(ldf) if ldf else None
+        # set anchor frame (embedding-safe only)
+        ldf = status.get("last_embedding_safe_frame")
+        self._anchor_frame = int(ldf) if ldf is not None else None
 
         # Restore minimal counters (best-effort; these are for status/telemetry, not logic)
         try:
@@ -1929,7 +2097,7 @@ class CheckpointManager(TrackingCheckpoint):
 
         # If counters are behind the anchor, bump frames_done to at least the anchor frame.
         if self._anchor_frame is not None:
-            self._frames_done = max(int(self._frames_done or 0), int(self._last_det_frame) + 1)
+            self._frames_done = max(int(self._frames_done or 0), int(self._last_emb_safe_frame) + 1)
 
         # Sanity: ensure the collectors reflect the anchor row counts (already trimmed)
         cur_obs = getattr(obs_collector, "count", lambda: None)() or 0
@@ -2124,6 +2292,8 @@ class CheckpointManager(TrackingCheckpoint):
      
     # ---------- internals ----------
     def _write_status(self, note: str) -> None:
+        if self._writes_disabled():
+            return
         # derive a stable, ordered list from the dict
         shot_track_order_list = track_order_dict_to_list(self._shot_track_to_order)
 
@@ -2159,6 +2329,12 @@ class CheckpointManager(TrackingCheckpoint):
             last_detection_shot_first_frame=self._last_det_shot_first_frame,
             obs_rows_at_last_detection=self._obs_rows_at_det,
             emb_rows_at_last_detection=self._emb_rows_at_det,
+
+            last_embedding_safe_frame=self._last_emb_safe_frame,
+            last_embedding_safe_shot_number=self._last_emb_safe_shot,
+            last_embedding_safe_shot_first_frame=self._last_emb_safe_shot_first_frame,
+            obs_rows_at_last_embedding_safe=int(self._obs_rows_at_emb_safe or 0),
+            emb_rows_at_last_embedding_safe=int(self._emb_rows_at_emb_safe or 0),
 
             **snap,
             note=note,

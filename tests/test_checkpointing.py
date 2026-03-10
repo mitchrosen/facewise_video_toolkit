@@ -25,9 +25,10 @@ class RecordingObs(DummyObs):
 class RecordingEmb(RecordingObs): pass
 
 class DummyTrack:
-    def __init__(self, tid, bbox, last_f, last_det, closed, shot_id=6):
+    def __init__(self, tid, bbox, last_f, last_det, closed, shot_id=6, segment_id=None):
         self.track_id = int(tid)
         self.shot_id = int(shot_id)
+        self.segment_id = None if segment_id is None else int(segment_id)
 
         self.last_bbox = tuple(int(v) for v in bbox[:4])
         self.last_frame_idx = int(last_f)
@@ -228,7 +229,7 @@ def test_status_lifecycle(tmp_path):
     assert st["frames_done"] == 11
     assert st["shots_done"] >= 1
 
-def test_load_and_anchor_trims_to_pre_detection(tmp_path):
+def test_load_and_anchor_trims_to_embedding_safe_boundary(tmp_path):
     v = tmp_path/"v.mp4"; v.write_bytes(b"")
     cm = CheckpointManager.open(parent_dir=tmp_path, video_path=v,
                              options_snapshot={"video_path": str(v.resolve())}, 
@@ -236,12 +237,16 @@ def test_load_and_anchor_trims_to_pre_detection(tmp_path):
     obs, emb = FileBackedObs(), FileBackedEmb()
     cm.start(obs, emb, options_snapshot={"video_path": str(v.resolve())})
 
-    # Pre-anchor rows, then checkpoint (anchor should record 7/3)
+    # Record an embedding-safe boundary at 7/3.
+    # Under the current contract, resume trimming keys off the embedding-safe
+    # frame, not the older detection checkpoint anchor.
     obs.rows = 7; emb.rows = 3
     agg = DummyAggregator()  # no tracks needed; we just want the call to succeed
     cm.checkpoint_now(frame_idx=5, shot_number=1, aggregator=agg)
+    cm.mark_embedding_safe(frame_idx=5, shot_number=1, shot_first_frame=0, note="embedding safe")
 
-    # Advance rows post-anchor and persist them
+
+    # Advance rows past the embedding-safe boundary and persist them.
     obs.rows = 12; emb.rows = 9
     cm.finalize()  # writes latest rows to the npz files
 
@@ -262,7 +267,7 @@ def test_load_and_anchor_trims_to_pre_detection(tmp_path):
     loaded_obs, loaded_emb = cm2.load_and_anchor_collectors(obs2, emb2)
     assert loaded_obs == 12 and loaded_emb == 9
 
-    # Now trim to anchor recorded at checkpoint (7/3)
+    # Now trim to the embedding-safe boundary recorded above (7/3).
     cm2.load_and_anchor_collectors(obs2, emb2, trim_to_anchor=True)
     assert obs2.trimmed_to == 7
     assert emb2.trimmed_to == 3
@@ -305,8 +310,8 @@ def test_checkpoint_now_saves_open_tracks_snapshot(tmp_path):
     cm.start(obs, emb, options_snapshot={"detect_interval": 60})
 
     # Two “open” tracks and one “closed” (closed should not appear as open)
-    t_open_a = DummyTrack(0, bbox=(10, 10, 50, 50), last_f=100, last_det=100, closed=False, shot_id=6)
-    t_open_b = DummyTrack(1, bbox=(20, 20, 60, 60), last_f=101, last_det=100, closed=False, shot_id=6)
+    t_open_a = DummyTrack(0, bbox=(10, 10, 50, 50), last_f=100, last_det=100, closed=False, shot_id=6, segment_id=7)
+    t_open_b = DummyTrack(1, bbox=(20, 20, 60, 60), last_f=101, last_det=100, closed=False, shot_id=6, segment_id=9)
     t_closed = DummyTrack(9, bbox=(0, 0, 0, 0),  last_f=55,  last_det=54,  closed=True,  shot_id=6)
     agg = DummyAggregator([t_open_a, t_open_b, t_closed], shot_number=6)
 
@@ -321,6 +326,8 @@ def test_checkpoint_now_saves_open_tracks_snapshot(tmp_path):
     # Spot-check contents
     oc = { (t["shot"], t["track_id"]): t for t in st["open_tracks"] }
     a = oc[(6, 0)]
+    # open_tracks must preserve live track identity; segment_id is optional here.
+    assert a["track_id"] == 0
     assert a["last_frame"] == 100
     assert a["last_det_frame"] == 100
     assert a["closed"] is False
