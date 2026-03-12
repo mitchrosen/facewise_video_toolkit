@@ -111,7 +111,7 @@ def test_build_resume_plan_keeps_only_anchor_open_tracks_live(monkeypatch):
     )
     monkeypatch.setattr(
         rr,
-        "rehydrate_tracks",
+        "prepare_tracks_for_resume",
         lambda *a, **k: list(rehydrated_tracks),
     )
 
@@ -121,7 +121,7 @@ def test_build_resume_plan_keeps_only_anchor_open_tracks_live(monkeypatch):
         assert int(resume_frame) == 152
         prepared_tids.extend(int(t.track_id) for t in tracks)
 
-    monkeypatch.setattr(rr, "_prepare_tracks_for_resume_runtime", _fake_prepare)
+    monkeypatch.setattr(rr, "_prepare_runtime_state_for_resume", _fake_prepare)
 
     all_tracks: list[FaceTrack] = []
     plan, shots_trimmed = rr._build_resume_plan(
@@ -283,7 +283,7 @@ class _FakeCheckpoint:
 def test_build_resume_plan_partitions_anchor_tracks_without_monkeypatching_prepare(monkeypatch):
     """
     Stronger boundary test:
-    - let the real _prepare_tracks_for_resume_runtime() run
+    - let the real _prepare_runtime_state_for_resume() run
     - verify dead-by-anchor track does NOT remain in prior_tracks_anchor
     - verify live-at-anchor tracks DO remain and are normalized for runtime use
     """
@@ -324,7 +324,7 @@ def test_build_resume_plan_partitions_anchor_tracks_without_monkeypatching_prepa
     )
     monkeypatch.setattr(
         rr,
-        "rehydrate_tracks",
+        "prepare_tracks_for_resume",
         lambda *a, **k: list(rehydrated_tracks),
     )
 
@@ -353,7 +353,7 @@ def test_build_resume_plan_partitions_anchor_tracks_without_monkeypatching_prepa
     assert 0 not in live_tids
 
     # The live anchor tracks should have been normalized by the *real*
-    # _prepare_tracks_for_resume_runtime().
+    # _prepare_runtime_state_for_resume().
     by_tid = {int(t.track_id): t for t in plan.prior_tracks_anchor}
 
     assert getattr(by_tid[1], "is_active", None) is False
@@ -783,7 +783,7 @@ def test_build_resume_plan_midshot_keeps_live_anchor_tracks_unlabeled(monkeypatc
     monkeypatch.setattr(rr, "_resolve_anchor", lambda checkpoint, resume_enabled: 152)
     monkeypatch.setattr(rr, "_audit_preanchor_embedding_parity", lambda *a, **k: None)
     monkeypatch.setattr(rr, "_build_emb_lookups_for_checkpoint", lambda *a, **k: (None, None))
-    monkeypatch.setattr(rr, "rehydrate_tracks", lambda *a, **k: list(rehydrated))
+    monkeypatch.setattr(rr, "prepare_tracks_for_resume", lambda *a, **k: list(rehydrated))
 
     plan, trimmed_shots = rr._build_resume_plan(
         shots,

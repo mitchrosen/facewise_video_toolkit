@@ -356,20 +356,6 @@ def _persist_embeddings_for_track(
     # ------------------------------------------------------------------
 
     # Contract: We only require that a DETECTED obs exists
-    # for the frame(s) being embedded.
-    #
-    det_frames = set(
-        int(f) for f in checkpoint.get_det_frames_for_track(shot_i, tid_i, frame_max=max_f)
-    )
-
-    bad_missing_det = [int(f) for f in frames_for_embed if int(f) not in det_frames]
-
-    if bad_missing_det:
-        raise ValueError(
-            "[ckpt] refusing to persist embeddings for frames without a DETECTED obs: "
-            f"shot={shot_i} track={tid_i} bad_frames={bad_missing_det} "
-            f"detected_up_to_{max_f}={sorted(det_frames)}"
-        )
 
     # Persist and link one frame at a time. If any call fails, DO NOT advance
     # the embedding-safe anchor.

@@ -1,5 +1,3 @@
-# tests/integration/test_resume_anchor_shot_continuity.py
-
 from __future__ import annotations
 
 import atexit
@@ -10,16 +8,16 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from facekit.common.obs_consts import Source, src_to_code
 
-# ---- helpers ---------------------------------------------------------------
 
 _LOG_DIRS_TO_ZIP: list[Path] = []
 
 
 def _repo_root() -> Path:
-    # This file lives at tests/integration/test_resume_anchor_shot_continuity.py
     return Path(__file__).resolve().parents[2]
 
 
@@ -29,6 +27,56 @@ def _env_with_repo() -> dict[str, str]:
     old = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = repo if not old else f"{repo}{os.pathsep}{old}"
     return env
+
+
+def _load_json(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def _load_single_array_from_npz(path: Path) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as data:
+        if len(data.files) != 1:
+            raise AssertionError(f"expected exactly one array in {path}, found {data.files}")
+        return data[data.files[0]]
+
+
+def _ordered_tracks(js: dict) -> list[dict]:
+    tracks: list[dict] = []
+    shots = js.get("shots")
+    if shots is None:
+        raise KeyError("No 'shots' key in manifest")
+
+    for shot in shots:
+        shot_no = int(shot.get("shot_number", 0))
+        for track in shot.get("face_tracks", []):
+            row = dict(track)
+            row.setdefault("shot_id", shot_no)
+            tracks.append(row)
+
+    tracks.sort(
+        key=lambda t: (
+            int(t["shot_id"]),
+            int(t["first_frame"]),
+            int(t.get("last_frame", -1)),
+            str(t.get("face_label") or ""),
+        )
+    )
+    return tracks
+
+
+def _latest_ckpt_dir(parent: Path) -> Path:
+    runs = [d for d in parent.iterdir() if d.is_dir() and d.name.startswith("run-")]
+    assert runs, f"No run-* directory under {parent}"
+
+    def _score(path: Path) -> tuple[bool, float, float]:
+        status = path / "status.json"
+        return (
+            status.exists(),
+            status.stat().st_mtime if status.exists() else 0.0,
+            path.stat().st_mtime,
+        )
+
+    return max(runs, key=_score)
 
 
 class RunResult:
@@ -84,56 +132,57 @@ def _zip_logs() -> None:
         pass
 
 
+def _resolve_obs_sidecar_path(latest_ckpt_dir: Path, requested_path: Path) -> Path:
+    if requested_path.exists():
+        return requested_path
+
+    status_json = latest_ckpt_dir / "status.json"
+    if status_json.exists():
+        status = _load_json(status_json)
+        for key in (
+            "obs_sidecar_path",
+            "observations_sidecar_path",
+            "obs_npz_path",
+        ):
+            value = status.get(key)
+            if value:
+                candidate = Path(value)
+                if candidate.exists():
+                    return candidate
+
+    candidates = sorted(latest_ckpt_dir.rglob("*.npz"))
+    obs_like = [p for p in candidates if "obs" in p.name.lower()]
+    if len(obs_like) == 1:
+        return obs_like[0]
+
+    raise AssertionError(
+        "Could not locate observation sidecar.\n"
+        f"requested_path={requested_path}\n"
+        f"latest_ckpt_dir={latest_ckpt_dir}\n"
+        f"npz_candidates={[str(p) for p in candidates]}"
+    )
+
 atexit.register(_zip_logs)
 
-
-def _load_json(path: Path) -> dict:
-    return json.loads(path.read_text())
-
-def _ordered_tracks(js: dict) -> list[dict]:
-    """
-    Return a flattened, consistently-sorted list of track dicts.
-    Matches the helper used by the original integration test.
-    """
-    tracks = []
-    if "shots" in js:
-        # v2.0 / v2.1: flatten shots[*].face_tracks and carry shot_number for sort
-        for shot in js.get("shots", []):
-            shot_no = int(shot.get("shot_number", 0))
-            for t in shot.get("face_tracks", []):
-                t = dict(t)  # shallow copy
-                t.setdefault("shot_id", shot_no)
-                tracks.append(t)
-    else:
-        raise KeyError("No 'shots' key in manifest")
-
-    tracks.sort(key=lambda t: (
-        int(t["shot_id"]),
-        int(t["first_frame"]),
-        int(t.get("last_frame", -1)),
-        str(t.get("face_label") or ""),
-    ))
-    return tracks
-
-# ---- test ------------------------------------------------------------------
 
 @pytest.mark.integration
 def test_resume_anchor_shot_continuity(tmp_path: Path):
     """
     Narrower/faster diagnostic than the full cold-vs-crash-vs-resume equivalence test.
 
-    This test does only:
-      1) crash a run at frame 183
-      2) verify the persisted embedding-safe anchor is 152
-      3) resume from that checkpoint
-      4) inspect only shot-2 track continuity in the resumed output
+    This test:
+      1) crashes a run at frame 183
+      2) verifies the persisted embedding-safe anchor under the current
+         sampled-embedding pipeline configuration
+      3) verifies that TRACKED observations with embeddings were persisted
+      4) resumes from that checkpoint
+      5) inspects only shot-2 continuity in the resumed output
 
-    It is intentionally aimed at the known bad shape where live anchor-shot tracks
-    get split into:
-      - pre-anchor fragments ending near 151/152
-      - fresh tracks beginning at 153
+    With tracked-frame sampling enabled, later sampled TRACKED observations can
+    be embedded and persisted before the crash, advancing the durable boundary
+    deeper into shot 2.
     """
-    video = Path(_repo_root(), "tests", "assets", "videos", "OGsTest_10sec_snippet.mp4")
+    video = _repo_root() / "tests" / "assets" / "videos" / "OGsTest_10sec_snippet.mp4"
     assert video.exists(), "missing test video"
 
     ckpt_parent = tmp_path / "ckpt_parent"
@@ -210,7 +259,7 @@ if __name__ == "__main__":
     ]
 
     print("Running CRASH ----------------------")
-    _ = _run(
+    _run(
         crash_cmd,
         env={**env, "CRASH_AT_FRAME": "183"},
         ok=(0, 1, 2),
@@ -218,27 +267,39 @@ if __name__ == "__main__":
     )
     print("-----------------------------------")
 
-    def _latest_ckpt_dir(parent: Path) -> Path:
-        runs = [d for d in parent.iterdir() if d.is_dir() and d.name.startswith("run-")]
-        assert runs, f"No run-* directory under {parent}"
-
-        def _score(p: Path):
-            s = p / "status.json"
-            return (s.exists(), s.stat().st_mtime if s.exists() else 0, p.stat().st_mtime)
-
-        return max(runs, key=_score)
-
     latest_ckpt_dir = _latest_ckpt_dir(ckpt_parent)
     status_json = latest_ckpt_dir / "status.json"
     assert status_json.exists(), f"Missing {status_json}"
 
     status = _load_json(status_json)
-    assert int(status["last_embedding_safe_frame"]) == 152, (
-        f"status.json embedding-safe-frame drift: expected 152, "
-        f"got {status.get('last_embedding_safe_frame')}"
-    )
-    assert status.get("open_tracks"), f"expected open_tracks at crash anchor, got {status.get('open_tracks')!r}"
+    anchor_frame = int(status["last_embedding_safe_frame"])
 
+    assert anchor_frame == 176, (
+        f"status.json embedding-safe-frame drift: expected 176, got {status.get('last_embedding_safe_frame')}"
+    )
+    assert status.get("open_tracks"), (
+        f"expected open_tracks at crash anchor, got {status.get('open_tracks')!r}"
+    )
+
+    obs_sidecar_path = _resolve_obs_sidecar_path(latest_ckpt_dir, obs_npz)
+    obs_arr = _load_single_array_from_npz(obs_sidecar_path)
+    tracked_code = int(src_to_code(Source.TRACKED.value))
+
+    tracked_embedded_rows = obs_arr[
+        (obs_arr["shot"] == 2)
+        & (obs_arr["src"] == tracked_code)
+        & (obs_arr["emb_idx"].astype(int) >= 0)
+    ]
+    tracked_embedded_frames = sorted(
+        set(int(f) for f in tracked_embedded_rows["f"].astype(int).tolist())
+    )
+
+    assert tracked_embedded_frames, (
+        "Expected at least one persisted TRACKED observation with an embedding in shot 2.\n"
+        f"obs_sidecar_path={obs_sidecar_path}\n"
+        f"tracked_embedded_frames={tracked_embedded_frames}\n"
+        f"anchor_frame={anchor_frame}\n"
+    )
 
     resume_cmd = [
         sys.executable, "-m", "facekit.cli.resolve_face_ids_v2_cli",
@@ -257,7 +318,7 @@ if __name__ == "__main__":
     ]
 
     print("Running RESUME ---------------------")
-    _ = _run(resume_cmd, env=env, log_prefix="diag_resume")
+    _run(resume_cmd, env=env, log_prefix="diag_resume")
     print("-----------------------------------")
 
     resume_js = _load_json(out_resume)
@@ -279,15 +340,31 @@ if __name__ == "__main__":
         (232, 299),
     ]
 
-    fresh_153 = [r for r in shot2 if r[0] == 153]
-    truncated_pre_anchor = [r for r in shot2 if r[1] in (151, 152)]
+    first_resumed_frame = anchor_frame + 1
+    fresh_at_resume_boundary = [r for r in shot2 if r[0] == first_resumed_frame]
+    truncated_at_anchor = [r for r in shot2 if r[1] in (anchor_frame - 1, anchor_frame)]
+
+    assert fresh_at_resume_boundary == [], (
+        "Unexpected fresh shot-2 tracks starting exactly at the first resumed frame.\n"
+        f"anchor_frame={anchor_frame}\n"
+        f"first_resumed_frame={first_resumed_frame}\n"
+        f"fresh_at_resume_boundary={fresh_at_resume_boundary}\n"
+        f"shot2={shot2}\n"
+    )
+
+    assert truncated_at_anchor == [], (
+        "Unexpected shot-2 tracks truncated at the embedding-safe anchor boundary.\n"
+        f"anchor_frame={anchor_frame}\n"
+        f"truncated_at_anchor={truncated_at_anchor}\n"
+        f"shot2={shot2}\n"
+    )
 
     assert shot2 == expected_shot2, (
         "Resumed shot-2 tracks do not match the expected continuity shape.\n"
         f"Expected shot-2 ranges: {expected_shot2}\n"
         f"Actual shot-2 ranges:   {shot2}\n"
-        f"Fresh 153-start ranges: {fresh_153}\n"
-        f"Pre-anchor truncations: {truncated_pre_anchor}\n"
+        f"Fresh at resume-boundary: {fresh_at_resume_boundary}\n"
+        f"Truncated at anchor: {truncated_at_anchor}\n"
         f"Open tracks at crash anchor: {status.get('open_tracks')}\n"
-        f"Resume status anchor: {status.get('last_embedding_safe_frame')}\n"
+        f"Resume status anchor: {anchor_frame}\n"
     )

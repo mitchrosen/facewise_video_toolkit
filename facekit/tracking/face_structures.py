@@ -4,6 +4,10 @@ import numpy as np
 import logging
 import traceback
 from facekit.common.obs_consts import Source, code_to_src, src_to_code
+from facekit.embedding.embedding_selection import (
+    TrackEmbeddingSample,
+    select_consistent_embedding_subset,
+)
 
 @dataclass
 class FaceObservation:
@@ -83,6 +87,10 @@ class FaceTrack:
     is_active: bool = False       # Frame-level: assigned in current frame
     is_open: bool = True          # Track lifecycle
     embeddings: List[np.ndarray] = field(default_factory=list)
+    embedding_samples: List[TrackEmbeddingSample] = field(default_factory=list)
+    selected_embedding_samples: List[TrackEmbeddingSample] = field(default_factory=list)
+    representative_embedding: Optional[np.ndarray] = None
+    embedding_stable: bool = False
 
     last_landmarks: Optional[np.ndarray] = None     # shape (5,2), float32
     last_bbox: Optional[Tuple[int,int,int,int]] = None
@@ -295,3 +303,62 @@ class FaceTrack:
                 x1,y1,x2,y2 = map(int, o.bbox[:4])
                 return (x1,y1,x2,y2)
         return None
+    
+    def add_embedding_sample(self, sample: TrackEmbeddingSample) -> None:
+        """
+        Register a per-frame embedding sample for later representative-selection.
+        """
+        if not isinstance(sample, TrackEmbeddingSample):
+            raise TypeError(
+                f"sample must be TrackEmbeddingSample, got {type(sample).__name__}: {sample!r}"
+            )
+
+        if not hasattr(self, "embedding_samples"):
+            self.embedding_samples = []
+
+        self.embedding_samples.append(sample)
+
+    def finalize_embedding_representation(self) -> None:
+        """
+        Select a consistent subset of per-track embedding samples and compute a
+        representative embedding for the track.
+
+        Contract:
+        - If no valid embeddings are available, do not crash.
+        - Preserve the selected sample metadata.
+        - Mark the track unstable when no representative embedding can be formed.
+        - Treat duplicate samples at the same logical observation identity as one sample.
+        """
+        deduped_samples: list[TrackEmbeddingSample] = []
+        seen: set[tuple[int, int, Source]] = set()
+
+        for sample in self.embedding_samples:
+            key = (
+                int(sample.frame_idx),
+                int(sample.track_local_index),
+                sample.source,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_samples.append(sample)
+
+        chosen = select_consistent_embedding_subset(deduped_samples)
+        self.selected_embedding_samples = list(chosen)
+
+        valid_embeddings = [
+            np.asarray(s.embedding, dtype=np.float32)
+            for s in self.selected_embedding_samples
+            if s.embedding is not None
+        ]
+
+        if not valid_embeddings:
+            self.representative_embedding = None
+            self.embedding_stable = False
+            return
+
+        self.representative_embedding = np.mean(
+            np.stack(valid_embeddings, axis=0),
+            axis=0,
+        )
+        self.embedding_stable = True

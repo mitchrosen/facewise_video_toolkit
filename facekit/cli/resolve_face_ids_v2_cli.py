@@ -271,6 +271,7 @@ def run_pipeline(args):
             detector=detector,
             embedder=embedder,
             detect_interval=int(args.detect_interval),
+            track_sample_interval=args.track_sample_interval,
             embedding_batch_size_max=int(args.embedding_batch_size_max),
             embedding_queue_max_pending=embedding_queue_max_pending,
             checkpoint=ckpt,
@@ -496,8 +497,6 @@ def main() -> None:
                         help="Path to YOLOv5 model weights",)
     parser.add_argument("--embedding-model", default="models/embedding/glintr100_dynamic.onnx",
                         help="Path to ArcFace ONNX model",)
-    parser.add_argument("--embedding-queue-max-pending", type=int, default=1024,
-                        help=("Flush trigger for the embedding queue: flush occurs only when pending >= max_pending. "))
     parser.add_argument("--config", default="models/detector/yolov5n.yaml",
                         help="Path to YOLOv5 model config",)
     parser.add_argument("--min-face", type=positive_int, default=10,
@@ -517,12 +516,20 @@ def main() -> None:
                         help=("Render video with global + segment IDs. "
                                 "If used with no value, writes '<video>_global_faceIDs.avi'. "
                                 "If a path is provided, writes there."))
-    parser.add_argument("--detect-interval", type=int, default=30,
-                        help="frame count between forced face detection frame")
-    parser.add_argument("--embedding-batch-size-max", type=int, default=32)
     parser.add_argument("--device",  choices=["auto", "cuda", "cpu"], default="auto",
                         help="Compute device for detector/embedder (default: auto)")
     
+    # control detection interval, embedding sampling interval, queue depth and batch size
+    parser.add_argument("--detect-interval", type=int, default=30,
+                        help="frame count between forced face detection frame")
+    parser.add_argument("--embedding-queue-max-pending", type=int, default=1024,
+                        help=("Flush trigger for the embedding queue: flush occurs only when pending >= max_pending. "))
+    parser.add_argument("--embedding-batch-size-max", type=int, default=32)
+    parser.add_argument("--track-sample-interval", type=int, default=4,
+                        help=("Subsampling interval for selecting frames to generate embeddings from non-detection frames. "
+                                "Lower values increase embedding density and identity stability at the cost "
+                                "of additional compute. A value of 1 uses every eligible frame."),)
+
     # Post processing
     parser.add_argument("--post-min-gap-len", type=int, default=210,
                         help=("Minimum gap length (in frames) that will NOT be filled during post-processing. "
