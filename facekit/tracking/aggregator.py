@@ -502,9 +502,14 @@ class ShotFaceTrackAggregator:
         def embedding_similarity(e1, e2):
             if e1 is None or e2 is None:
                 raise RuntimeError("Embedding missing for similarity computation")
-            e1 = e1 / np.linalg.norm(e1)
-            e2 = e2 / np.linalg.norm(e2)
-            return float(np.dot(e1, e2))
+
+            n1 = np.linalg.norm(e1)
+            n2 = np.linalg.norm(e2)
+
+            if n1 == 0.0 or n2 == 0.0:
+                return float("-inf")
+
+            return float(np.dot(e1, e2) / (n1 * n2))
         
         # Identify and summarize tracks missing embeddings
         missing_tracks = [

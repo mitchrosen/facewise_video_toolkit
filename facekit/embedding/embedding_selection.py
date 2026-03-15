@@ -11,11 +11,10 @@ class TrackEmbeddingSample:
     source: str
     embedding: np.ndarray | None
     quality_score: float | None = None
-
+    aligned_face: np.ndarray | None = None
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
-
 
 def _connected_components(adj: list[list[int]]) -> list[list[int]]:
     n = len(adj)
@@ -42,7 +41,6 @@ def _connected_components(adj: list[list[int]]) -> list[list[int]]:
 
     return components
 
-
 def _average_internal_similarity(
     comp: list[int],
     sim: np.ndarray,
@@ -55,7 +53,6 @@ def _average_internal_similarity(
         for j in range(i + 1, len(comp)):
             vals.append(float(sim[comp[i], comp[j]]))
     return float(sum(vals) / len(vals))
-
 
 def select_consistent_embedding_subset(
     samples: list[TrackEmbeddingSample],

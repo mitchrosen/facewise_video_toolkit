@@ -18,7 +18,6 @@ from facekit.io.frame_provider import FrameProvider, ReaderCoordinator
 from facekit.pipeline.checkpoint import TrackingCheckpoint
 from facekit.common.obs_consts import Source
 from facekit.utils.geometry import compute_iou 
-
 from facekit.pipeline.resume_rehydrate import (
     ResumePlan,
     _build_resume_plan,
@@ -27,12 +26,13 @@ from facekit.pipeline.resume_rehydrate import (
 )
 from facekit.pipeline.checkpoint_io import (
     _checkpoint_root_dir,
-    do_checkpoint, 
     _checkpoint_observations_and_snapshot,
     _persist_embeddings_for_track,
     _finalize_checkpoint_run
 )
 from facekit.errors import ResumeSafetyError
+from facekit.tracking.landmark_propagation import propagate_landmarks_by_bbox_transform
+from facekit.embedding.track_embedding_queueing import maybe_enqueue_track_observation_for_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +588,156 @@ def _attach_and_persist_embedded_obs(
             # Non-fatal: embeddings were already persisted; this only affects resume metadata.
             logging.exception("track: failed to mark embedding-safe (non-fatal)")
 
+def _maybe_enqueue_track_embedding_observations_for_frame(
+    *,
+    aggregator,
+    frame_idx: int,
+    frame,
+    track_sample_interval: int,
+    embedding_queue,
+) -> None:
+    """
+    For the current frame's authoritative observations (after track assignment),
+    decide which observations should be sampled for embedding, attempt alignment
+    online, and enqueue the observation itself when alignment succeeds.
+
+    Notes:
+    - DETECTED observations are always eligible by policy.
+    - TRACKED observations are eligible only when they land on the track-local
+      sampling interval.
+    - Observations without landmarks are skipped.
+    - This helper mutates observation.aligned_face only for items that are
+      actually enqueued.
+    """
+    obs_for_frame = aggregator.observations_at(
+        frame_idx,
+        require_track_id=True,
+    )
+
+    for obs in obs_for_frame:
+        tid = getattr(obs, "track_id", None)
+        if tid is None:
+            continue
+
+        track = next(
+            (
+                t
+                for t in aggregator.tracks
+                if int(getattr(t, "track_id", -1)) == int(tid)
+            ),
+            None,
+        )
+        if track is None:
+            continue
+
+        # update_tracks_with_frame(...) has already appended this frame's observation
+        # to the authoritative track history, so the track-local index for this obs
+        # is its current position in the per-track observation list.
+        try:
+            track_local_index = next(
+                i
+                for i, candidate in enumerate(track.observations)
+                if candidate is obs
+            )
+        except StopIteration:
+            continue
+
+        if getattr(obs, "aligned_face", None) is not None:
+            continue
+
+        try:
+            maybe_enqueue_track_observation_for_embedding(
+                observation=obs,
+                track_local_index=track_local_index,
+                track_sample_interval=track_sample_interval,
+                frame=frame,
+                align_face_fn=align_face_for_arcface,
+                embedding_queue=embedding_queue,
+            )
+        except Exception:
+            logging.exception(
+                "track-embed: failed enqueue attempt shot=%d frame=%d track_id=%s source=%s",
+                int(getattr(track, "shot_id", -1)),
+                int(frame_idx),
+                str(tid),
+                str(getattr(obs, "source", None)),
+            )
+
+def append_detection_observation(observations,
+                                shot_number, 
+                                frame_idx, 
+                                frame, 
+                                detected_box, 
+                                landmarks, 
+                                confidence):
+    bbox = tuple(int(v) for v in detected_box[:4])
+
+    aligned_face = None
+    try:
+        aligned_face = align_face_for_arcface(frame, landmarks)
+    except Exception:
+        logging.exception(
+            "align: failed to compute aligned_face shot=%d frame=%d bbox=%s",
+            int(shot_number),
+            int(frame_idx),
+            str(bbox),
+        )
+
+    observations.append(FaceObservation(
+                frame_idx=frame_idx,
+                bbox=bbox,
+                track_id=None,  # aggregator will set
+                embedding=None,
+                confidence=float(confidence) if confidence is not None else None,
+                aligned_face=aligned_face,
+                landmarks=landmarks,
+                source=Source.DETECTED,
+            )
+        )
+
+def append_tracking_observation(
+    observations,
+    frame_idx,
+    track_id,
+    tracked_box,
+    aggregator,
+):
+    x, y, w, h = tracked_box
+    bbox = (int(x), int(y), int(x + w), int(y + h))
+
+    previous_observation = None
+    track = next(
+        (t for t in aggregator.tracks if int(getattr(t, "track_id", -1)) == int(track_id)),
+        None,
+    )
+    if track is not None and getattr(track, "observations", None):
+        if track.observations:
+            previous_observation = track.observations[-1]
+
+    landmarks = None
+    if previous_observation is not None:
+        prev_landmarks = getattr(previous_observation, "landmarks", None)
+        prev_bbox = getattr(previous_observation, "bbox", None)
+        if prev_landmarks is not None and prev_bbox is not None:
+            landmarks = propagate_landmarks_by_bbox_transform(
+                prev_landmarks=prev_landmarks,
+                prev_bbox=prev_bbox,
+                curr_bbox=bbox,
+            )
+
+    observations.append(
+        FaceObservation(
+            frame_idx=frame_idx,
+            track_id=track_id,
+            bbox=bbox,
+            embedding=None,
+            confidence=None,
+            aligned_face=None,
+            landmarks=landmarks,
+            source=Source.TRACKED,
+        )
+    )
+    
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
     shot_json_path: str,
@@ -599,6 +749,7 @@ def track_across_segments(
     embedding_batch_size_max: int = 32,
     *,
     embedding_queue_max_pending: int = 1024,
+    track_sample_interval: int = 10,
     checkpoint: TrackingCheckpoint | None = None,
     resume_enabled: bool = True,
 ) -> List[FaceTrack]:
@@ -818,23 +969,17 @@ def track_across_segments(
                         basic_fail = (not tracked_boxes) or any(b is None for b in tracked_boxes.values())
 
                         if (not basic_fail) and validator.validate(tracked_boxes, frame, frame_idx):
-                            for track_id, tb in tracked_boxes.items():
-                                if tb is None:
+                            for track_id, tracked_box in tracked_boxes.items():
+                                if tracked_box is None:
                                     continue
-                                x, y, w, h = tb
-                                bbox = (int(x), int(y), int(x + w), int(y + h))
-                                observations.append(
-                                    FaceObservation(
-                                        frame_idx=frame_idx,
-                                        track_id=track_id,
-                                        bbox=bbox,
-                                        embedding=None,
-                                        confidence=None,
-                                        aligned_face=None,
-                                        source=Source.TRACKED,
-                                    )
-                                )
 
+                                append_tracking_observation(
+                                    observations,
+                                    frame_idx,
+                                    track_id,
+                                    tracked_box,
+                                    aggregator=aggregator,
+                                )
                         else:
                             aggregator.finalize_tracks()
                             tracker_active = False
@@ -867,32 +1012,14 @@ def track_across_segments(
                             if landmarks is None:
                                 continue  # treat as "not a detected face"
 
-                            bbox = tuple(int(v) for v in box[:4])
-
-                            aligned_face = None
-                            try:
-                                aligned_face = align_face_for_arcface(frame, landmarks)
-                            except Exception:
-                                logging.exception(
-                                    "align: failed to compute aligned_face shot=%d frame=%d bbox=%s",
-                                    int(shot_number),
-                                    int(frame_idx),
-                                    str(bbox),
-                                )
-
-                            observations.append(
-                                FaceObservation(
-                                    frame_idx=frame_idx,
-                                    bbox=bbox,
-                                    track_id=None,  # aggregator will set
-                                    embedding=None,
-                                    confidence=float(confidence) if confidence is not None else None,
-                                    aligned_face=aligned_face,
-                                    landmarks=landmarks,
-                                    source=Source.DETECTED,
-                                )
-                            )
-
+                            append_detection_observation(observations,
+                                                        shot_number, 
+                                                        frame_idx, 
+                                                        frame, 
+                                                        box, 
+                                                        landmarks, 
+                                                        confidence)
+                            
                         # print(f"Detection frame number: {frame_idx}, num faces: {len(observations)}")
                     
                     if not detections or not observations:
@@ -919,6 +1046,14 @@ def track_across_segments(
                             )
       
                 _ = aggregator.update_tracks_with_frame(frame_idx, observations)
+
+                _maybe_enqueue_track_embedding_observations_for_frame(
+                    aggregator=aggregator,
+                    frame_idx=frame_idx,
+                    frame=frame,
+                    track_sample_interval=track_sample_interval,
+                    embedding_queue=embed_q,
+                )
 
                 # Persist observations for EVERY processed frame.
                 #
@@ -1055,4 +1190,3 @@ def track_across_segments(
         logger.info("Done processing video")
 
         return all_tracks
-

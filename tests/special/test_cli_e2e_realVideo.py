@@ -167,10 +167,10 @@ def test_cli_e2e_realVideo(tmp_path: Path):
     results_dir = tests_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # video_name = "53-man-roster-decisions"
+    video_name = "53-man-roster-decisions"
     # video_name = "hot-to-go"
     # video_name = "OGsTest_10sec_snippet"
-    video_name = "3fiUUxKMiBGn6kF4Puczvi"
+    # video_name = "3fiUUxKMiBGn6kF4Puczvi"
 
     print(f"Video: {video_name}")
 
