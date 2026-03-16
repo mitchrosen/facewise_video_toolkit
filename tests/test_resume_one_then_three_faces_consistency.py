@@ -519,6 +519,7 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     emb_count_pre = int(emb_pre.shape[0])
 
     DET_CODE = int(src_to_code(Source.DETECTED.value))
+    TRK_CODE = int(src_to_code(Source.TRACKED.value))
 
     # Shot 1 is completed by anchor, so all its DETECTED rows must have embeddings.
     shot1_det = obs_pre[(obs_pre["shot"] == 1) & (obs_pre["src"] == DET_CODE)]
@@ -571,10 +572,15 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     # - Frame 130 observations exist, but their embeddings are not yet persisted/linked.
 
     # Absolute persisted-embedding count pre-crash:
-    # - shot 1: 11 faces persisted (7 at frame 60 + 4 at shot boundary)
-    # - shot 2 through frame 120: 9 faces persisted (3 @ 103, 3 @ 110, 3 @ 120)
-    # Total = 20
-    assert emb_count_pre == 20, f"expected 20 persisted embeddings pre-crash, got {emb_count_pre}"
+    # - shot 1: 11 DET faces persisted (7 at frame 60 + 4 at shot boundary)
+    # - shot 2 DET through frame 120: 9 persisted (3 @ 103, 3 @ 110, 3 @ 120)
+    # - shot 2 TRACKED sampling is enabled by default (track_sample_interval=10):
+    #     * frame 113 is track-local index 10 relative to shot-start detection at 103
+    #     * therefore the 3 tracked observations at frame 113 are sampled for embedding
+    #     * they remain pending until the next detection flush boundary at frame 120
+    #     * thus they are persisted pre-crash as well
+    # Total = 11 + 9 + 3 = 23
+    assert emb_count_pre == 23, f"expected 23 persisted embeddings pre-crash, got {emb_count_pre}"
 
     shot2_det = obs_pre[(obs_pre["shot"] == 2) & (obs_pre["src"] == DET_CODE)]
     shot2_det_frames = sorted(set(int(f) for f in shot2_det["f"].astype(int).tolist()))
@@ -612,6 +618,25 @@ def test_resume_three_phase_isolated(tmp_path: Path):
         f"got {shot2_det_unsafe.shape[0]}"
     )
 
+    shot2_trk = obs_pre[(obs_pre["shot"] == 2) & (obs_pre["src"] == TRK_CODE)]
+
+    shot2_trk_safe = shot2_trk[shot2_trk["emb_idx"].astype(int) >= 0]
+    shot2_trk_unsafe = shot2_trk[shot2_trk["emb_idx"].astype(int) < 0]
+
+    shot2_trk_safe_frames = sorted(set(int(f) for f in shot2_trk_safe["f"].astype(int).tolist()))
+
+    assert shot2_trk_safe_frames == [113], (
+        "unexpected embedding-safe TRACKED frames for shot 2 before crash; "
+        "with track_sample_interval=10, only frame 113 should have persisted TRACKED embeddings "
+        "before the crash boundary at 134.\n"
+        f"got {shot2_trk_safe_frames}"
+    )
+
+    assert shot2_trk_safe.shape[0] == 3, (
+        f"expected 3 embedding-safe TRACKED rows for shot 2 pre-crash "
+        f"(3 faces x frame 113), got {shot2_trk_safe.shape[0]}"
+    )
+
     # emb_idx should reference valid embedding rows.
     max_idx = int(emb_idx.max()) if emb_idx.size else -1
     assert max_idx == 10, f"expected max emb_idx 10 for shot1 (0-based, 11 rows), got {max_idx}"
@@ -621,13 +646,17 @@ def test_resume_three_phase_isolated(tmp_path: Path):
     )
 
     # Across both shots, pre-crash persisted embeddings should cover:
-    # - shot 1 frames 0..100 inclusive on the 10-frame cadence (11 embeddings total)
-    # - shot 2 frames 103, 110, 120 with 3 faces each (9 embeddings total)
+    # - shot 1 DET frames 0..100 inclusive on the 10-frame cadence (11 embeddings total)
+    # - shot 2 DET frames 103, 110, 120 with 3 faces each (9 embeddings total)
+    # - shot 2 TRACKED sampled frame 113 with 3 faces (3 embeddings total)
     # This also documents why the pre-crash anchor is 120 rather than 130, and why Shot 1's
     # final embedding payload frame (100) differs from its shot-end embedding-safe frame (102).
-    shot2_max_idx = int(shot2_det["emb_idx"].astype(int).max()) if shot2_det.size else -1
-    assert shot2_max_idx == 19, (
-        f"expected last pre-crash embedding index to be 19, got {shot2_max_idx}"
+    shot2_max_idx = max(
+        int(shot2_det["emb_idx"].astype(int).max()) if shot2_det.size else -1,
+        int(shot2_trk["emb_idx"].astype(int).max()) if shot2_trk.size else -1,
+    )
+    assert shot2_max_idx == 22, (
+        f"expected last pre-crash embedding index to be 22, got {shot2_max_idx}"
     )
 
     # ---- C) Resume run (must use the crash-run sidecars) ----

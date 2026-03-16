@@ -33,6 +33,7 @@ from facekit.pipeline.checkpoint_io import (
 from facekit.errors import ResumeSafetyError
 from facekit.tracking.landmark_propagation import propagate_landmarks_by_bbox_transform
 from facekit.embedding.track_embedding_queueing import maybe_enqueue_track_observation_for_embedding
+from facekit.embedding.embedding_selection import TrackEmbeddingSample
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,13 @@ def extend_prev_track_for_overlapping_detection(
 
     return matched
 
+def _normalize_embedding_for_sample(embedding: np.ndarray) -> np.ndarray:
+    arr = np.asarray(embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(arr))
+    if norm == 0.0:
+        return arr
+    return arr / norm
+
 def _attach_and_persist_embedded_obs(
     *,
     embedded_obs: list[FaceObservation],
@@ -547,25 +555,58 @@ def _attach_and_persist_embedded_obs(
 
         aggregator.attach_embeddings(int(tid), embs)
 
-        # Persist per track (if checkpoint enabled)
-        if checkpoint is not None:
-            # Find the actual FaceTrack object for this tid (needed by _persist_embeddings_for_track)
-            track = next((t for t in aggregator.tracks if int(getattr(t, "track_id", -1)) == int(tid)), None)
-            if track is not None:
-                _persist_embeddings_for_track(
-                    checkpoint,
-                    shot_number=shot_number,
-                    track=track,
-                    frames_for_embed=frames_for_embed,
-                    embs=embs,
+        # Find the actual FaceTrack object for this tid.
+        track = next(
+            (t for t in aggregator.tracks if int(getattr(t, "track_id", -1)) == int(tid)),
+            None,
+        )
+
+        # Register per-sample embedding metadata on the track.
+        if track is not None and hasattr(track, "add_embedding_sample"):
+            for ob in obs_list:
+                try:
+                    track_local_index = next(
+                        i
+                        for i, candidate in enumerate(track.observations)
+                        if candidate is ob
+                    )
+                except StopIteration:
+                    logging.warning(
+                        "track-embed: embedded observation missing from track history "
+                        "shot=%d track_id=%d frame=%d source=%s",
+                        int(shot_number),
+                        int(tid),
+                        int(getattr(ob, "frame_idx", -1)),
+                        str(getattr(ob, "source", None)),
+                    )
+                    continue
+
+                track.add_embedding_sample(
+                    TrackEmbeddingSample(
+                        frame_idx=int(ob.frame_idx),
+                        track_local_index=int(track_local_index),
+                        source=getattr(ob, "source", None),
+                        embedding=_normalize_embedding_for_sample(ob.embedding),
+                        quality_score=None,
+                    )
                 )
 
-                # Track the newest frame whose embeddings were persisted in this batch.
-                if frames_for_embed:
-                    last_f = int(frames_for_embed[-1])
-                    if max_persisted_frame is None or last_f > max_persisted_frame:
-                        max_persisted_frame = last_f
+        # Persist per track (if checkpoint enabled)
+        if checkpoint is not None and track is not None:
+            _persist_embeddings_for_track(
+                checkpoint,
+                shot_number=shot_number,
+                track=track,
+                frames_for_embed=frames_for_embed,
+                embs=embs,
+            )
 
+            # Track the newest frame whose embeddings were persisted in this batch.
+            if frames_for_embed:
+                last_f = int(frames_for_embed[-1])
+                if max_persisted_frame is None or last_f > max_persisted_frame:
+                    max_persisted_frame = last_f
+                    
     # Advance the embedding-safe resume anchor once per batch (after successful persistence).
     # Prefer the explicit boundary-completion frame when provided; otherwise use the newest
     # payload frame that contributed embeddings.
@@ -737,7 +778,7 @@ def append_tracking_observation(
             source=Source.TRACKED,
         )
     )
-    
+
 def track_across_segments(
     frame_source: Union[str, Path, FrameProvider],
     shot_json_path: str,

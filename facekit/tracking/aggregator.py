@@ -642,12 +642,14 @@ class ShotFaceTrackAggregator:
 
     def finalize_tracks(self) -> List[FaceTrack]:
         """
-        Close all remaining open tracks and return them.
+        Close all remaining open tracks, finalize embeddings and return them.
         """
 
-        for t in self.tracks:
-            if not t.is_closed():
-                t.mark_closed()
+        for track in self.tracks:
+            if not track.is_closed():
+                track.mark_closed()
+            track.finalize_embedding_representation()
+
         return self.tracks
 
     def _to_src_code(x):
