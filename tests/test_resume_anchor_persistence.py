@@ -317,7 +317,7 @@ def test_resume_starts_at_anchor_and_never_persists_preanchor(tmp_path: Path, mo
     # run with ckpt.write_disabled=True (no filesystem durability contract in this test).
     #
     # To keep this test focused and deterministic, bypass pre-anchor rehydration.
-    monkeypatch.setattr(_rr, "rehydrate_tracks", lambda *a, **k: [])
+    monkeypatch.setattr(_rr, "prepare_tracks_for_resume", lambda *a, **k: [])
 
     fp = SpyFP(total=400)
     _ = track_across_segments(

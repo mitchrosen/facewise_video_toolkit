@@ -1,6 +1,6 @@
 import numpy as np
 from facekit.output.json_v2 import ObservationsCollector
-from facekit.pipeline.resume_rehydrate import rehydrate_observation_tracks
+from facekit.pipeline.resume_rehydrate import reconstruct_tracks_from_observations
 
 
 def test_pre_anchor_tracks_produce_drawable_rects():
@@ -25,7 +25,7 @@ def test_pre_anchor_tracks_produce_drawable_rects():
         emb_idx_fn=lambda _: -1,
     )
 
-    tracks = rehydrate_observation_tracks(
+    tracks = reconstruct_tracks_from_observations(
         oc, frame_max=10, track_order={(1, 2): 0}
     )
     assert tracks
