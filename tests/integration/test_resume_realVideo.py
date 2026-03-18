@@ -1,4 +1,3 @@
-# tests/test_resume_equivalence_e2e.py
 import json
 import os
 import re
@@ -132,6 +131,12 @@ def _zip_logs():
             if path.exists():
                 zf.write(path, arcname=path.name)
     print(f"\n[LOG] logs.zip written to: {zip_path}\n")
+
+def _load_single_array_from_npz(path: Path) -> np.ndarray:
+    with np.load(path, allow_pickle=False) as data:
+        if len(data.files) != 1:
+            raise AssertionError(f"expected exactly one array in {path}, found {data.files}")
+        return data[data.files[0]]
 
 # register exit hook
 atexit.register(_zip_logs)
@@ -276,18 +281,36 @@ if __name__ == "__main__":
     assert isinstance(to_list, list) and len(to_list) > 0, "track_order missing/empty in status.json"
 
     status = _load_json(status_json)
-    assert int(status["last_embedding_safe_frame"]) == 152, (
-       f"status.json embedding-safe-frame drift: expected 152, got {status.get('last_embedding_safe_frame')}"
+    anchor_frame = int(status["last_embedding_safe_frame"])
+    assert anchor_frame == 176, (
+        f"status.json embedding-safe-frame drift: expected 176, got {status.get('last_embedding_safe_frame')}"
     )
 
-    # Crash run detections 
-    arr = np.load(obs_npz_path, allow_pickle=False)["observations"]
+    # Crash-run observations sidecar
+    obs_array = _load_single_array_from_npz(obs_npz_path)
+
+    tracked_code = SRC_TO_CODE[Source.TRACKED]
+    tracked_embedded_rows = obs_array[
+        (obs_array["shot"] == 2)
+        & (obs_array["src"] == tracked_code)
+        & (obs_array["emb_idx"].astype(int) >= 0)
+    ]
+    tracked_embedded_frames = sorted(
+        set(int(f) for f in tracked_embedded_rows["f"].astype(int).tolist())
+    )
+    assert tracked_embedded_frames, (
+        "Expected at least one persisted TRACKED observation with an embedding in shot 2.\n"
+        f"tracked_embedded_frames={tracked_embedded_frames}\n"
+        f"anchor_frame={anchor_frame}\n"
+    )
+
+    # Crash run detections
     shot = 1
     det_code = SRC_TO_CODE[Source.DETECTED]
-    is_shot = arr["shot"] == shot
-    is_det  = arr["src"]  == det_code
+    is_shot = obs_array["shot"] == shot
+    is_det  = obs_array["src"]  == det_code
 
-    names = set(arr.dtype.names or [])
+    names = set(obs_array.dtype.names or [])
 
     # Under the current contract, no landmarks are persisted in the obs sidecar.
     forbidden = ("landmarks", "lms", "lm", "landmarks_5pt", "landmarks_flat10")
@@ -303,7 +326,7 @@ if __name__ == "__main__":
     probe_cmd = [
         sys.executable, str(probe),
         "--run-root", str(latest_ckpt_dir),
-        "--anchor", "152",
+        "--anchor", str(anchor_frame),
         "--det-code", str(det_code_int),
     ]
     _ = _run(probe_cmd, env=_env_with_repo(), log_prefix="probe")
@@ -337,7 +360,7 @@ if __name__ == "__main__":
 
     # safe_frame = _extract_anchor_from_logs(resume_log.stdout + "\n" + resume_log.stderr)
     # print(f"Embedding-safe frame for resume run is {safe_frame}")
-    # assert safe_frame == 152, f"unexpected embedding-safe frame parsed: {safe_frame}"
+    # assert safe_frame == 176, f"unexpected embedding-safe frame parsed: {safe_frame}"
 
     # ---- Compare outputs ----
     cold_js   = _load_json(out_cold)
@@ -387,10 +410,6 @@ if __name__ == "__main__":
 
     assert not missing_cold, f"cold: face_metadata missing labels: {sorted(missing_cold)}"
     assert not missing_resume, f"resume: face_metadata missing labels: {sorted(missing_resume)}"
-
-    # Compare track-by-track by identity key (shot, first, last)
-    def _track_identity_key(t: dict) -> tuple[int, int, int]:
-        return (int(t["shot_id"]), int(t["first_frame"]), int(t["last_frame"]))
 
     cold_by_key = {_track_identity_key(t): t for t in cold_tracks}
     resume_by_key = {_track_identity_key(t): t for t in resume_tracks}

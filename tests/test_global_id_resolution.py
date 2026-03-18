@@ -247,3 +247,48 @@ def test_resolver_raises_when_cuda_requested_but_unavailable(monkeypatch):
     monkeypatch.setattr(torch, "cuda", type("X", (), {"is_available": lambda: False}))
     with pytest.raises(RuntimeError):
         GlobalIdentityResolver(device="cuda")
+
+def test_identity_resolution_prefers_track_representative_embedding():
+    """
+    Identity resolution should prefer a track's representative_embedding when
+    that embedding is marked as stable.
+
+    Tracks may contain multiple observation embeddings collected during
+    processing. Once a representative_embedding has been finalized for a track,
+    it becomes the canonical identity signal for that track.
+
+    This test constructs a situation where:
+
+      • observation embeddings would NOT cause the tracks to match
+      • representative embeddings WOULD cause the tracks to match
+
+    The resolver should therefore merge the tracks based on the
+    representative embeddings.
+    """
+
+    resolver = GlobalIdentityResolver(embedding_threshold=0.95)
+
+    rep = make_vector(angle_rad=0.0, seed=100)
+
+    obs_a = make_vector(angle_rad=0.60, seed=101)
+    obs_b = make_vector(angle_rad=1.20, seed=102)
+
+    t0 = make_track_with_frames(0, obs_a, shot_id=0, start=0, end=20)
+    t1 = make_track_with_frames(1, obs_b, shot_id=1, start=0, end=20)
+
+    # Canonical identity signal for each track
+    t0.representative_embedding = rep.copy()
+    t1.representative_embedding = rep.copy()
+
+    t0.embedding_stable = True
+    t1.embedding_stable = True
+
+    # Observation embeddings disagree with the representative identity
+    t0.embeddings = [obs_a.astype(np.float32)]
+    t1.embeddings = [obs_b.astype(np.float32)]
+
+    resolver.resolve_global_ids([t0, t1], start_id=0)
+
+    assert (
+        t0.global_id == t1.global_id
+    ), "Stable representative embeddings should drive identity matching"

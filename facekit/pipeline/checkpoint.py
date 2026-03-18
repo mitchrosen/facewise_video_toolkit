@@ -822,7 +822,8 @@ class CheckpointManager(TrackingCheckpoint):
 
         - This call represents embeddings for exactly ONE frame (frame_idx_last).
         - `embs` must be shape (1, D).
-        - Link by exact frame equality to exactly one DETECTED, emb_idx=-1 observation row.
+        - Link by exact frame equality to exactly one eligible, emb_idx=-1 observation row.
+        - Eligible sources are currently DETECTED or TRACKED.
         """
         # If checkpoint output is disabled, checkpoint collectors must be inert.
         if self._writes_disabled():
@@ -871,16 +872,21 @@ class CheckpointManager(TrackingCheckpoint):
             raise ResumeSafetyError("[ckpt] ObservationsCollector needs find_rows/update_emb_idx/frame_at_pos.")
 
         det_code = int(SRC_TO_CODE[Source.DETECTED])
+        tracked_code = int(SRC_TO_CODE[Source.TRACKED])
 
-        candidates = find_rows(
-            shot=int(shot_number),
-            track_id=int(track_id),
-            frame_last=int(frame_idx_last),
-            only_unassigned=True,
-            only_with_landmarks=False,
-            source=det_code,
-            count=None,
-        )
+        candidates = []
+        for src_code in (det_code, tracked_code):
+            candidates.extend(
+                find_rows(
+                    shot=int(shot_number),
+                    track_id=int(track_id),
+                    frame_last=int(frame_idx_last),
+                    only_unassigned=True,
+                    only_with_landmarks=False,
+                    source=src_code,
+                    count=None,
+                )
+            )
 
         # normalize candidate positions to (block,row) tuples
         norm: list[tuple[int, int]] = []
@@ -902,15 +908,15 @@ class CheckpointManager(TrackingCheckpoint):
 
         if len(exact) == 0:
             raise ResumeSafetyError(
-                f"[ckpt] cannot link embedding: no DETECTED+landmarks+unassigned obs row at exact frame "
+                f"[ckpt] cannot link embedding: no eligible unassigned obs row at exact frame "
                 f"(shot={shot_number} track={track_id} frame={frame_idx_last}). "
-                f"Candidates_upto_frame={len(norm)}"
+                f"Eligible sources=(DETECTED, TRACKED) candidates_upto_frame={len(norm)}"
             )
 
         if len(exact) > 1:
             # For bulletproof linking, ambiguity should be fatal.
             raise ResumeSafetyError(
-                f"[ckpt] ambiguous link: multiple candidate obs rows at the same frame "
+                f"[ckpt] ambiguous link: multiple eligible obs rows at the same frame "
                 f"(shot={shot_number} track={track_id} frame={frame_idx_last}) count={len(exact)}"
             )
 
@@ -1295,6 +1301,60 @@ class CheckpointManager(TrackingCheckpoint):
         )
         if frame_max is not None:
             mask &= (arr["f"] <= int(frame_max))
+
+        frames = [int(f) for f in np.asarray(arr["f"][mask]).tolist()]
+        frames.sort()
+        return frames
+    
+    def get_obs_frames_for_track(
+        self,
+        shot: int,
+        track_id: int,
+        frame_max: int | None = None,
+        *,
+        sources: list[Source] | tuple[Source, ...] | None = None,
+    ) -> list[int]:
+        """
+        Return frame indices for observation rows on a given track.
+
+        Parameters
+        ----------
+        shot, track_id
+            Track identity within the checkpoint sidecar.
+        frame_max
+            Optional inclusive upper bound on frame index.
+        sources
+            Optional whitelist of allowed observation sources. If omitted, all
+            sources are included.
+
+        Notes
+        -----
+        - Prefers the live in-memory collector when available.
+        - Returns sorted frame indices (ascending).
+        """
+        # Prefer live in-memory collector if present
+        arr = None
+        if getattr(self, "_obs", None) is not None and hasattr(self._obs, "to_array"):
+            try:
+                arr = self._obs.to_array()
+            except Exception:
+                arr = None
+
+        # Fallback: disk NPZ
+        if arr is None:
+            arr = self._obs_np()
+
+        mask = (
+            (arr["shot"] == int(shot)) &
+            (arr["track_id"] == int(track_id))
+        )
+
+        if frame_max is not None:
+            mask &= (arr["f"] <= int(frame_max))
+
+        if sources is not None:
+            source_codes = np.array([int(SRC_TO_CODE[s]) for s in sources], dtype=np.int32)
+            mask &= np.isin(arr["src"], source_codes)
 
         frames = [int(f) for f in np.asarray(arr["f"][mask]).tolist()]
         frames.sort()

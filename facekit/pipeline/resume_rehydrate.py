@@ -9,6 +9,7 @@ from facekit.tracking.face_structures import FaceTrack, FaceObservation
 from facekit.common.obs_consts import Source, code_to_src, SRC_TO_CODE
 from facekit.errors import ResumeSafetyError
 from facekit.pipeline.checkpoint import TrackingCheckpoint
+from facekit.embedding.embedding_selection import TrackEmbeddingSample
 
 def _emb_head(track: FaceTrack, n: int = 5):
     try:
@@ -45,7 +46,9 @@ def _log_tracks_emb_brief(label: str, tracks: List[FaceTrack] | None) -> None:
     except Exception:
         logging.exception("failed to log embedding summaries for %s", label)
 
-def _prepare_tracks_for_resume_runtime(
+# ---------- Runtime warm-start helpers for the first resumed frame ----------
+
+def _prepare_runtime_state_for_resume(
     tracks: List[FaceTrack],
     *,
     resume_frame: int,
@@ -166,7 +169,7 @@ def bootstrap_runtime_trackers_for_resume_frame(
     ]
     if not open_tracks:
         logging.info(
-            "resume-bootstrap: shot=%d frame=%d no open anchor tracks to seed "
+            "bootstrap_runtime_trackers_for_resume_frame: shot=%d frame=%d no open anchor tracks to seed "
             "(aggregator_open=%s, allowed_open=%s)",
             int(shot_number),
             int(frame_idx),
@@ -200,7 +203,7 @@ def bootstrap_runtime_trackers_for_resume_frame(
 
     if not track_ids:
         logging.warning(
-            "resume-bootstrap: shot=%d frame=%d no valid open-track boxes; skipped=%s",
+            "bootstrap_runtime_trackers_for_resume_frame: shot=%d frame=%d no valid open-track boxes; skipped=%s",
             int(shot_number),
             int(frame_idx),
             skipped,
@@ -216,7 +219,7 @@ def bootstrap_runtime_trackers_for_resume_frame(
     live = getattr(face_tracker, "trackers", None) or []
 
     logging.info(
-        "resume-bootstrap: shot=%d frame=%d seeded %d/%d live trackers tids=%s skipped=%s",
+        "bootstrap_runtime_trackers_for_resume_frame: shot=%d frame=%d seeded %d/%d live trackers tids=%s skipped=%s",
         int(shot_number),
         int(frame_idx),
         len(live),
@@ -273,17 +276,17 @@ def _normalize_src(raw_src) -> Source:
             try:
                 return Source(s.lower())
             except Exception as e:
-                raise ResumeSafetyError(f"rehydrate: unknown string src={raw_src!r}") from e
+                raise ResumeSafetyError(f"_normalize_src: unknown string src={raw_src!r}") from e
 
     # Numpy scalar string or other scalar-like
     if hasattr(raw_src, "item"):
         try:
             return _normalize_src(raw_src.item())
         except Exception as e:
-            raise ResumeSafetyError(f"rehydrate: unsupported src scalar {raw_src!r}") from e
+            raise ResumeSafetyError(f"_normalize_src: unsupported src scalar {raw_src!r}") from e
 
     raise ResumeSafetyError(
-        f"rehydrate: unsupported src type {type(raw_src)!r} value={raw_src!r}"
+        f"_normalize_src: unsupported src type {type(raw_src)!r} value={raw_src!r}"
     )
 
 def _landmarks_from_flat10(has_landmarks, flat10) -> np.ndarray | None:
@@ -299,21 +302,21 @@ def _landmarks_from_flat10(has_landmarks, flat10) -> np.ndarray | None:
         return None
 
     if flat10 is None:
-        raise ResumeSafetyError("rehydrate: has_landmarks=1 but landmarks_flat10 is None")
+        raise ResumeSafetyError("_landmarks_from_flat10: has_landmarks=1 but landmarks_flat10 is None")
 
     try:
         arr = np.asarray(flat10, dtype=np.float32)
     except Exception as e:
-        raise ResumeSafetyError(f"rehydrate: invalid landmarks_flat10: {e}")
+        raise ResumeSafetyError(f"_landmarks_from_flat10: invalid landmarks_flat10: {e}")
 
     if arr.shape != (10,):
         raise ResumeSafetyError(
-            f"rehydrate: landmarks_flat10 must have shape (10,), got {arr.shape}"
+            f"_landmarks_from_flat10: landmarks_flat10 must have shape (10,), got {arr.shape}"
         )
 
     if not np.all(np.isfinite(arr)):
         raise ResumeSafetyError(
-            "rehydrate: landmarks_flat10 contains NaN/Inf but has_landmarks=1"
+            "_landmarks_from_flat10: landmarks_flat10 contains NaN/Inf but has_landmarks=1"
         )
 
     return arr.reshape((5, 2))
@@ -368,7 +371,7 @@ def _row_to_faceobs(row: dict, *, shot_id: int, track_id: int) -> FaceObservatio
     # Debug logging (optional, safe)
     try:
         logging.info(
-            "rehydrate DEBUG obs row: shot=%r tid=%r f=%r src=%r has_landmarks=%r flat10_len=%r",
+            "_row_to_faceobs DEBUG obs row: shot=%r tid=%r f=%r src=%r has_landmarks=%r flat10_len=%r",
             int(shot_id),
             track_id,
             row.get("f"),
@@ -404,13 +407,13 @@ def make_emb_lookup_from_sidecars(
     """
     if emb_array is None or getattr(emb_array, "ndim", 0) != 2:
         raise ResumeSafetyError(
-            f"rehydrate: emb_array has invalid shape {getattr(emb_array, 'shape', None)}; expected (N, 512)"
+            f"make_emb_lookup_from_sidecars: emb_array has invalid shape {getattr(emb_array, 'shape', None)}; expected (N, 512)"
         )
 
     try:
         arr = obs_collector.to_array()
     except Exception as e:
-        raise ResumeSafetyError(f"rehydrate: obs_collector.to_array() failed: {e}") from e
+        raise ResumeSafetyError(f"make_emb_lookup_from_sidecars: obs_collector.to_array() failed: {e}") from e
 
     if getattr(arr, "size", 0) == 0:
         # no observations at all → no embeddings to attach.
@@ -423,7 +426,7 @@ def make_emb_lookup_from_sidecars(
     missing = required - set(names)
     if missing:
         raise ResumeSafetyError(
-            f"rehydrate: obs sidecar missing required fields {sorted(missing)}; "
+            f"make_emb_lookup_from_sidecars: obs sidecar missing required fields {sorted(missing)}; "
             f"present={list(names)}"
         )
 
@@ -436,7 +439,7 @@ def make_emb_lookup_from_sidecars(
             row_src = _normalize_src(row["src"])
         except ResumeSafetyError as e:
             raise ResumeSafetyError(
-                f"rehydrate: invalid src={row['src']!r} in obs sidecar row idx={idx}"
+                f"make_emb_lookup_from_sidecars: invalid src={row['src']!r} in obs sidecar row idx={idx}"
             ) from e
 
         if row_src != det_src:
@@ -465,7 +468,7 @@ def make_emb_lookup_from_sidecars(
         for f, ei in rows_sorted:
             if ei < 0 or ei >= n_rows:
                 raise ResumeSafetyError(
-                    f"rehydrate: emb_idx {ei} out of bounds for embeddings array of size {n_rows}"
+                    f"make_emb_lookup_from_sidecars: emb_idx {ei} out of bounds for embeddings array of size {n_rows}"
                 )
             frames.append(int(f))
             vecs.append(np.asarray(emb_array[ei], dtype=np.float32, order="C"))
@@ -477,8 +480,8 @@ def make_emb_lookup_from_sidecars(
 
     return _lookup
 
-# ---------- Phase 1: observations-only rehydration ----------
-def rehydrate_observation_tracks(
+# ---------- Track reconstruction from persisted observation rows ----------
+def reconstruct_tracks_from_observations(
     collector,
     *,
     frame_max: Optional[int],
@@ -490,7 +493,7 @@ def rehydrate_observation_tracks(
     """
     groups = list(collector.iter_tracks(frame_max=frame_max))
     if not groups:
-        logging.info("rehydrate_observation_tracks: no groups from collector (frame_max=%r)", frame_max)
+        logging.info("reconstruct_tracks_from_observations: no groups from collector (frame_max=%r)", frame_max)
         return []
 
     def _debug_track_order_lookup(track_order: dict[tuple[int, int], int], shot: int, track_id: int) -> None:
@@ -568,12 +571,12 @@ def rehydrate_observation_tracks(
         tracks.append(t)
 
     logging.info(
-        "rehydrate_observation_tracks: built %d tracks, %d observations; span first=%s last=%s",
+        "reconstruct_tracks_from_observations: built %d tracks, %d observations; span first=%s last=%s",
         len(tracks), obs_count, first_span, last_span
     )
     return tracks
 
-# ---------- Phase 2: embeddings attachment ----------
+# ---------- Embedding reattachment for reconstructed tracks ----------
 # Flexible lookups: supply whichever your checkpoint/collector supports.
 EmbLookup = Callable[[int, int], Optional[Tuple[Iterable[int], np.ndarray]]]       # -> (frame_indices, embs)
 EmbArrayLookup = Callable[[int, int], Optional[np.ndarray]]                        # -> embs only
@@ -704,8 +707,75 @@ def attach_embeddings_to_tracks(
         "%s: DET obs=%d, with_embeddings=%d (%.1f%%)", log_prefix, tot_det, tot_attached, pct
     )
 
-# ---------- Phase 3: one-call rehydration (observations + embeddings) ----------
-def rehydrate_tracks(
+def _finalize_track_identity_state(
+    tracks: List[FaceTrack],
+    *,
+    log_prefix: str,
+) -> None:
+    """
+    Rebuild track-level identity state after embeddings have been attached.
+
+    Resume rehydration restores DET observation embeddings and track.embeddings,
+    but FaceTrack.finalize_embedding_representation() derives the stable
+    representative embedding from track.embedding_samples. We therefore rebuild
+    embedding_samples from the attached observation embeddings before invoking
+    the canonical FaceTrack finalization path.
+    """
+    for track in tracks:
+        observations = getattr(track, "observations", None) or []
+
+        rebuilt_samples: list[TrackEmbeddingSample] = []
+        for track_local_index, observation in enumerate(observations):
+            embedding = getattr(observation, "embedding", None)
+            if embedding is None:
+                continue
+
+            embedding_array = np.asarray(embedding, dtype=np.float32)
+            if embedding_array.ndim != 1 or not np.isfinite(embedding_array).all():
+                continue
+
+            source = getattr(observation, "source", None)
+            source_name = getattr(source, "value", None)
+            if source_name is None:
+                source_name = str(source)
+
+            rebuilt_samples.append(
+                TrackEmbeddingSample(
+                    frame_idx=int(observation.frame_idx),
+                    track_local_index=int(track_local_index),
+                    source=str(source_name),
+                    embedding=embedding_array,
+                )
+            )
+
+        track.embedding_samples = rebuilt_samples
+
+        finalize = getattr(track, "finalize_embedding_representation", None)
+        if finalize is None or not callable(finalize):
+            raise ResumeSafetyError(
+                f"{log_prefix}: FaceTrack is missing finalize_embedding_representation(); "
+                "cannot rebuild deterministic track-level identity state during resume"
+            )
+
+        finalize()
+
+        has_embeddings = bool(getattr(track, "embeddings", None) or [])
+        if has_embeddings:
+            if not bool(getattr(track, "embedding_stable", False)):
+                raise ResumeSafetyError(
+                    f"{log_prefix}: finalize_embedding_representation() did not produce "
+                    f"stable track identity state for "
+                    f"(shot={int(getattr(track, 'shot_id', -1))}, tid={int(getattr(track, 'track_id', -1))})"
+                )
+            if getattr(track, "representative_embedding", None) is None:
+                raise ResumeSafetyError(
+                    f"{log_prefix}: finalize_embedding_representation() did not produce "
+                    f"a representative_embedding for "
+                    f"(shot={int(getattr(track, 'shot_id', -1))}, tid={int(getattr(track, 'track_id', -1))})"
+                )
+
+# ---------- Historical track finalization for resume ----------
+def prepare_tracks_for_resume(
     collector,
     *,
     frame_max: Optional[int],
@@ -725,7 +795,7 @@ def rehydrate_tracks(
     anchor_tracks: list[FaceTrack] = []
     future_tracks: list[FaceTrack] = []
 
-    tracks = rehydrate_observation_tracks(
+    tracks = reconstruct_tracks_from_observations(
         collector,
         frame_max=frame_max,
         track_order=track_order,
@@ -755,8 +825,11 @@ def rehydrate_tracks(
             strict=bool(strict),
             log_prefix="rehydrate-completed",
         )
-
-        _log_tracks_emb_brief("rehydrate-completed after attach", completed_tracks)
+        _finalize_track_identity_state(
+            completed_tracks,
+            log_prefix="rehydrate-completed",
+        )
+        _log_tracks_emb_brief("rehydrate-completed after finalize", completed_tracks)
 
     # 2) Resume-shot tracks: these observations are all strictly before the
     # resume frame (frame_max = anchor_frame - 1), so under the current
@@ -771,7 +844,11 @@ def rehydrate_tracks(
             strict=bool(strict),
             log_prefix="rehydrate-anchor",
         )
-        _log_tracks_emb_brief("rehydrate-anchor after attach", anchor_tracks)
+        _finalize_track_identity_state(
+            anchor_tracks,
+            log_prefix="rehydrate-anchor",
+        )
+        _log_tracks_emb_brief("rehydrate-anchor after finalize", anchor_tracks)
 
     # 3) Stitch back together in the original order
     return completed_tracks + anchor_tracks
@@ -856,7 +933,7 @@ def _resolve_anchor(
         0 means cold start / no anchor.
     """
     if not (resume_enabled and checkpoint):
-        logging.info("resume: disabled or no checkpoint -> start=0")
+        logging.info("_resolve_anchor: disabled or no checkpoint -> start=0")
         return 0
 
     # Resume starts at anchor+1.
@@ -866,11 +943,11 @@ def _resolve_anchor(
         anchors = None
 
     if anchors is None or len(anchors) < 1:
-        logging.info("resume: no embedding-safe anchor -> start=0")
+        logging.info("_resolve_anchor: no embedding-safe anchor -> start=0")
         return 0
 
     safe_f = int(anchors[0])
-    logging.info("resume: embedding-safe anchor=%d", safe_f)
+    logging.info("_resolve_anchor: embedding-safe anchor=%d", safe_f)
     return safe_f
 
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
@@ -978,9 +1055,9 @@ def _build_resume_plan(
     try:
         if checkpoint and hasattr(checkpoint, "obs_collector"):
             rows_before = int(checkpoint.obs_collector.count())
-            logging.info("resume: obs_collector rows BEFORE processing=%d", rows_before)
+            logging.info("_build_resume_plan: obs_collector rows BEFORE processing=%d", rows_before)
     except Exception:
-        logging.exception("resume: failed to read obs_collector.count() before")
+        logging.exception("_build_resume_plan: failed to read obs_collector.count() before")
 
     # Identify anchor-containing shot BEFORE any trimming (used for logging)
     anchor_shot_idx = _shot_idx_by_abs_frame(shots, resume_abs_frame) if resume_abs_frame > 0 else None
@@ -1012,7 +1089,7 @@ def _build_resume_plan(
             checkpoint,
             anchor_frame=resume_abs_frame,
         )
-        prior_tracks = rehydrate_tracks(
+        prior_tracks = prepare_tracks_for_resume(
             obs_for_rehydrate,
             frame_max=resume_abs_frame - 1,
             track_order=(checkpoint.get_track_order() or {}) if checkpoint else {},
@@ -1022,10 +1099,10 @@ def _build_resume_plan(
             strict=False,
         )
     elif obs_for_rehydrate is not None:
-        logging.info("resume: anchor=0 -> cold start; skipping pre-anchor rehydration")
+        logging.info("_build_resume_plan: anchor=0 -> cold start; skipping pre-anchor rehydration")
         prior_tracks = []
     else:
-        logging.info("resume: no obs_collector on checkpoint; skipping pre-anchor rehydration")
+        logging.info("_build_resume_plan: no obs_collector on checkpoint; skipping pre-anchor rehydration")
         prior_tracks = []
 
     # Split rehydrated tracks into fully completed vs anchor shot
@@ -1043,7 +1120,7 @@ def _build_resume_plan(
     # Completed shots become outputs immediately
     if prior_tracks_completed:
         logging.info(
-            "resume: adding %d completed pre-anchor tracks to outputs",
+            "_build_resume_plan: adding %d completed pre-anchor tracks to outputs",
             len(prior_tracks_completed),
         )
         all_tracks.extend(prior_tracks_completed)
@@ -1054,17 +1131,17 @@ def _build_resume_plan(
         for track in prior_tracks:
             shot = int(getattr(track, "shot_id", -1))
             by_shot_counts[shot] = by_shot_counts.get(shot, 0) + 1
-        logging.info("resume: rehydrated counts by shot: %r", by_shot_counts)
+        logging.info("_build_resume_plan: rehydrated counts by shot: %r", by_shot_counts)
         logging.info(
-            "resume: segment_id_seed_by_shot: %r",
+            "_build_resume_plan: segment_id_seed_by_shot: %r",
             {int(k): int(v) for k, v in (segment_id_seed_by_shot or {}).items()},
         )
         logging.info(
-            "resume: trackid_seed_by_shot: %r",
+            "_build_resume_plan: trackid_seed_by_shot: %r",
             {int(k): int(v) for k, v in (trackid_seed_by_shot or {}).items()},
         )
     except Exception:
-        logging.exception("resume: failed summarizing seeds")
+        logging.exception("_build_resume_plan: failed summarizing seeds")
 
     # Compute per-shot track_id seeds from all rehydrated tracks.
     # segment_id assignment is deferred until after we partition anchor-shot
@@ -1099,14 +1176,14 @@ def _build_resume_plan(
                 last_tid_by_shot[shot] = tid
 
         logging.info(
-            "resume: computed track_id seeds from %d rehydrated tracks; seeds=%s",
+            "_build_resume_plan: computed track_id seeds from %d rehydrated tracks; seeds=%s",
             len(prior_tracks),
             {int(k): int(v) for k, v in trackid_seed_by_shot.items()},
         )
 
     except Exception:
         logging.exception(
-            "resume: failed to compute track_id seeds from rehydrated tracks; continuing with empty seeds"
+            "_build_resume_plan: failed to compute track_id seeds from rehydrated tracks; continuing with empty seeds"
         )
         segment_id_seed_by_shot = {}
         trackid_seed_by_shot = {}
@@ -1116,7 +1193,7 @@ def _build_resume_plan(
         checkpoint._validate_resume_embeddings(anchor_shot=anchor_shot_num)
 
     logging.info(
-        "resume: prior_tracks strictness OK (anchor_shot=%s); rehydrated=%d (completed=%d, anchor-shot=%d)",
+        "_build_resume_plan: prior_tracks strictness OK (anchor_shot=%s); rehydrated=%d (completed=%d, anchor-shot=%d)",
         anchor_shot_num,
         len(prior_tracks or []),
         len(prior_tracks_completed),
@@ -1170,7 +1247,7 @@ def _build_resume_plan(
 
     if closed_anchor_tracks:
         logging.info(
-            "resume: anchor-shot closed-by-anchor tracks moved directly to outputs: %s",
+            "_build_resume_plan: anchor-shot closed-by-anchor tracks moved directly to outputs: %s",
             sorted(
                 (int(getattr(t, "shot_id", -1)), int(t.first_frame()), int(t.last_frame()), int(getattr(t, "track_id", -1)))
                 for t in closed_anchor_tracks
@@ -1187,13 +1264,13 @@ def _build_resume_plan(
             durable_prior_tracks, track_order_map or {}
         )
         logging.info(
-            "resume: assigned segment_ids to %d durable rehydrated tracks; seeds=%s",
+            "_build_resume_plan: assigned segment_ids to %d durable rehydrated tracks; seeds=%s",
             len(durable_prior_tracks),
             {k: int(v) for k, v in segment_id_seed_by_shot.items()},
         )
     except Exception:
         logging.exception(
-            "resume: failed to assign segment_ids to durable rehydrated tracks; continuing with empty seeds"
+            "_build_resume_plan: failed to assign segment_ids to durable rehydrated tracks; continuing with empty seeds"
         )
         segment_id_seed_by_shot = {}
 
@@ -1204,9 +1281,9 @@ def _build_resume_plan(
     # Only tracks that were actually OPEN at the embedding-safe boundary should
     # be normalized for warm-start runtime tracking.
     if prior_tracks_anchor and resume_abs_frame > 0:
-        _prepare_tracks_for_resume_runtime(prior_tracks_anchor, resume_frame=resume_abs_frame)
+        _prepare_runtime_state_for_resume(prior_tracks_anchor, resume_frame=resume_abs_frame)
         logging.info(
-            "resume: anchor-shot live tracks kept for runtime seeding: %s",
+            "_build_resume_plan: anchor-shot live tracks kept for runtime seeding: %s",
             sorted(
                 (int(getattr(t, "shot_id", -1)), int(t.first_frame()), int(t.last_frame()), int(getattr(t, "track_id", -1)))
                 for t in prior_tracks_anchor
@@ -1219,7 +1296,7 @@ def _build_resume_plan(
             reuse_tid_for_first_shot = last_tid_by_shot.get(int(first_processed_shot_number))
             if reuse_tid_for_first_shot is not None:
                 logging.info(
-                    "resume: will reuse tid=%d for first detection in shot=%d",
+                    "_build_resume_plan: will reuse tid=%d for first detection in shot=%d",
                     int(reuse_tid_for_first_shot),
                     int(first_processed_shot_number),
                 )
@@ -1227,7 +1304,7 @@ def _build_resume_plan(
             reuse_tid_for_first_shot = None
 
         logging.info(
-            "resume: anchor=%d anchor_shot_num=%s first_processed_shot_number=%s reuse_tid_for_first_shot=%s",
+            "_build_resume_plan: anchor=%d anchor_shot_num=%s first_processed_shot_number=%s reuse_tid_for_first_shot=%s",
             resume_abs_frame,
             anchor_shot_num,
             first_processed_shot_number,
@@ -1269,14 +1346,14 @@ def _read_open_track_ids_for_shot(
             if int(row.get("shot", -1)) == int(shot_number)
         }
         logging.info(
-            "resume: open_track_ids for shot=%s -> %s",
+            "_read_open_track_ids_for_shot: open_track_ids for shot=%s -> %s",
             shot_number,
             sorted(tids),
         )
         return frozenset(tids)
     except Exception:
         logging.exception(
-            "resume: failed reading open_tracks from status.json for shot=%s",
+            "_read_open_track_ids_for_shot: failed reading open_tracks from status.json for shot=%s",
             shot_number,
         )
         return frozenset()
@@ -1289,7 +1366,7 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
     landmarks are present (when available).
     """
     if not checkpoint or not hasattr(checkpoint, "obs_collector"):
-        logging.info("RESUME-AUDIT: no checkpoint/collector; skipping.")
+        logging.info("_audit_preanchor_embedding_parity: no checkpoint/collector; skipping.")
         return
 
     oc = checkpoint.obs_collector
@@ -1297,7 +1374,7 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
     has_iter_track_frames = hasattr(oc, "iter_track_frames") and callable(getattr(oc, "iter_track_frames"))
 
     if not has_rows_for_frame and not has_iter_track_frames:
-        logging.info("RESUME-AUDIT: collector lacks rows_for_frame/iter_track_frames; skipping.")
+        logging.info("_audit_preanchor_embedding_parity: collector lacks rows_for_frame/iter_track_frames; skipping.")
         return
 
     # Helper: record a missing embedding at (shot, tid, frame) with landmarks presence if we can see it.
@@ -1333,7 +1410,7 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
                 try:
                     rows = list(oc.rows_for_frame(shot_num, f))  # iterable of dict-ish
                 except Exception:
-                    logging.exception("RESUME-AUDIT: rows_for_frame failed at shot=%d frame=%d", shot_num, f)
+                    logging.exception("_audit_preanchor_embedding_parity: rows_for_frame failed at shot=%d frame=%d", shot_num, f)
                     continue
                 for r in rows:
                     try:
@@ -1393,25 +1470,25 @@ def _audit_preanchor_embedding_parity(checkpoint, *, shots: list, anchor_frame: 
                     except Exception:
                         continue
             if not seen_any:
-                logging.debug("RESUME-AUDIT: no tracks observed via iter_track_frames for shot=%d", shot_num)
+                logging.debug("_audit_preanchor_embedding_parity: no tracks observed via iter_track_frames for shot=%d", shot_num)
 
     # Summarize
     if not det_by_key:
-        logging.info("RESUME-AUDIT: no pre-anchor DET rows to audit (or none missing).")
+        logging.info("_audit_preanchor_embedding_parity: no pre-anchor DET rows to audit (or none missing).")
         return
 
     for (shot, tid), misses in sorted(det_by_key.items()):
         misses.sort(key=lambda r: int(r["f"]))
         frames_str = ",".join(f'{m["f"]}({m["has_landmarks"]})' for m in misses)
         logging.error(
-            "RESUME-AUDIT shot=%d tid=%d missing_preanchor=%d frames=[%s]  (paren=has_landmarks)",
+            "_audit_preanchor_embedding_parityAUDIT shot=%d tid=%d missing_preanchor=%d frames=[%s]  (paren=has_landmarks)",
             shot, tid, len(misses), frames_str
         )
 
     if total_missing == 0:
-        logging.info("RESUME-AUDIT OK: all pre-anchor DET rows have embeddings.")
+        logging.info("_audit_preanchor_embedding_parity OK: all pre-anchor DET rows have embeddings.")
     else:
-        logging.error("RESUME-AUDIT FAIL: total missing pre-anchor DET embeddings=%d", total_missing)
+        logging.error("_audit_preanchor_embedding_parity FAIL: total missing pre-anchor DET embeddings=%d", total_missing)
 
 def _build_emb_lookups_for_checkpoint(
     checkpoint: TrackingCheckpoint | None,
@@ -1419,7 +1496,7 @@ def _build_emb_lookups_for_checkpoint(
     anchor_frame: int,
 ):
     """
-    Build emb_lookup/emb_array_lookup callables for resume_rehydrate.rehydrate_tracks.
+    Build emb_lookup/emb_array_lookup callables for resume_rehydrate.prepare_tracks_for_resume.
 
     emb_lookup(shot, tid) returns (frames, embs) for DET observations strictly
     before the anchor frame, using the checkpoint's sidecar accessors:

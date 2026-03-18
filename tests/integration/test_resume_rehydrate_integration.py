@@ -129,7 +129,7 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
         emb_idx_fn=lambda _: -1,
     )
 
-    # ---- spy on rehydrate_tracks ----
+    # ---- spy on prepare_tracks_for_resume ----
     called = {"count": 0, "args": None}
 
     def fake_rehydrate(collector, frame_max, **kwargs):
@@ -137,7 +137,7 @@ def test_resume_invokes_rehydrate_once_with_anchor_minus_one(tmp_path, monkeypat
         called["args"] = (collector, int(frame_max), kwargs.get("track_order"))
         return []
 
-    monkeypatch.setattr(resume_rehydrate, "rehydrate_tracks", fake_rehydrate)
+    monkeypatch.setattr(resume_rehydrate, "prepare_tracks_for_resume", fake_rehydrate)
 
     # non-empty track_order required
     monkeypatch.setattr(ckpt, "get_track_order", lambda: {(1, 1): 0})

@@ -168,9 +168,9 @@ def test_cli_e2e_realVideo(tmp_path: Path):
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # video_name = "53-man-roster-decisions"
-    # video_name = "hot-to-go"
+    video_name = "hot-to-go"
     # video_name = "OGsTest_10sec_snippet"
-    video_name = "3fiUUxKMiBGn6kF4Puczvi"
+    # video_name = "3fiUUxKMiBGn6kF4Puczvi"
 
     print(f"Video: {video_name}")
 
@@ -201,6 +201,8 @@ def test_cli_e2e_realVideo(tmp_path: Path):
         "--input", str(input_video),
         "--checkpoint-dir", str(ckpt_parent),
         "--detect-interval", "10",
+        "--track-sample-interval", "5",
+        "--min-face", "10",
         "--device", "cpu",
         "--schema-version", "2.1",
         "--emb-store", "sidecar",
@@ -209,8 +211,8 @@ def test_cli_e2e_realVideo(tmp_path: Path):
         "--output-global-json", str(out_cold),
         "--output-video", str(out_video),
         "--no-resume",                    # ensure fresh run
-        "--new-run",
-        # "--no-checkpoint-write", 
+        # "--new-run",  # incompatible with --no-checkpoint-write
+        "--no-checkpoint-write", # incompatible with --new-run
         "--log", "INFO",
     ]
     print("Running COLD ----------------------")
