@@ -169,6 +169,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         embedding_queue_max_pending=1024,
         checkpoint=None,
         resume_enabled=True,
+        **kwargs,
     ):
         tracks: list[FaceTrack] = []
 
@@ -254,6 +255,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         post_iou_threshold=0.2,
         embedding_batch_size_max=32,
         embedding_queue_max_pending=1024,
+        track_sample_interval=4,
         device="cpu",
         emb_store="sidecar",
         emb_sidecar_path=None,
