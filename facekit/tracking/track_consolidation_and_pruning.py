@@ -44,9 +44,8 @@ def apply_track_consolidation_and_pruning(
             min_track_len=min_track_len,
             iou_threshold=iou_threshold,
         )
-        apply_assigned_global_ids(shot_tracks, assignments)
 
-        shot_tracks = prune_short_tracks(shot_tracks, min_track_len=min_track_len)
+        apply_assigned_global_ids(shot_tracks, assignments)
 
         # NOTE: this may merge tracks (reduce count) and inject observations
         fill_short_gaps_within_shot_and_merge(
@@ -54,6 +53,8 @@ def apply_track_consolidation_and_pruning(
             min_gap_len=min_gap_len,
             iou_threshold=iou_threshold,
         )
+
+        shot_tracks = prune_short_tracks(shot_tracks, min_track_len=min_track_len)
 
         out.extend(shot_tracks)
 
@@ -379,19 +380,23 @@ def prune_short_tracks(
     """
     Keep:
       - any track len >= min_track_len
-      - short tracks that have a non-None global_id
     Drop:
-      - short tracks with global_id None
+      - any remaining track len < min_track_len
     """
     out: list[FaceTrack] = []
     for t in shot_tracks:
-        if track_len(t) >= int(min_track_len):
+        tlen = track_len(t)
+        if tlen >= int(min_track_len):
             out.append(t)
             continue
-        if getattr(t, "global_id", None) is None:
-            logger.debug("prune short track: shot=%s tid=%s len=%s", t.shot_id, t.track_id, track_len(t))
-            continue
-        out.append(t)
+
+        logger.debug(
+            "prune short track: shot=%s tid=%s gid=%s len=%s",
+            t.shot_id,
+            t.track_id,
+            getattr(t, "global_id", None),
+            tlen,
+        )
     return out
 
 
@@ -762,3 +767,5 @@ def span(t: FaceTrack) -> Tuple[int, int]:
 
 def ranges_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
     return not (a1 < b0 or b1 < a0)
+
+
