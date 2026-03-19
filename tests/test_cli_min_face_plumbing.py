@@ -64,6 +64,7 @@ def test_min_face_is_passed_to_load_yolo5face_model(monkeypatch, tmp_path: Path)
         min_face=37,  # <-- what we want to see plumbed
         detect_interval=30,
         embedding_batch_size_max=32,
+        track_sample_interval=4,
         device="auto",
         emb_store="none",
         emb_sidecar_path=None,
