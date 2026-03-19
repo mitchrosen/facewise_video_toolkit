@@ -168,8 +168,8 @@ def test_cli_e2e_realVideo(tmp_path: Path):
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # video_name = "53-man-roster-decisions"
-    video_name = "hot-to-go"
-    # video_name = "OGsTest_10sec_snippet"
+    # video_name = "hot-to-go"
+    video_name = "OGsTest_10sec_snippet"
     # video_name = "3fiUUxKMiBGn6kF4Puczvi"
 
     print(f"Video: {video_name}")
@@ -203,6 +203,7 @@ def test_cli_e2e_realVideo(tmp_path: Path):
         "--detect-interval", "10",
         "--track-sample-interval", "5",
         "--min-face", "10",
+        "--post-min-track-len", "80",
         "--device", "cpu",
         "--schema-version", "2.1",
         "--emb-store", "sidecar",
