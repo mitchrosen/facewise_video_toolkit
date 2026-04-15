@@ -16,8 +16,8 @@ def test_resume_starts_after_embedding_safe_frame():
     start_at, _, _ = _init_shot_aggregator(
         shot_idx=0,
         shot_number=2,
-        first=103,
-        last=299,
+        execution_start_frame=153,
+        execution_end_frame=299,
         detect_interval=8,
         resume_plan=resume_plan,
         iou_thresh=0.2,
@@ -27,7 +27,7 @@ def test_resume_starts_after_embedding_safe_frame():
 
     assert start_at == 153
 
-def test_resume_skips_completed_shot_when_embedding_safe_frame_is_shot_last():
+def test_resume_rejects_empty_execution_range_when_anchor_consumes_shot():
     resume_plan = SimpleNamespace(
         anchor_frame=102,
         is_resume=True,
@@ -42,8 +42,8 @@ def test_resume_skips_completed_shot_when_embedding_safe_frame_is_shot_last():
         _init_shot_aggregator(
             shot_idx=0,
             shot_number=1,
-            first=0,
-            last=102,
+            execution_start_frame=103,
+            execution_end_frame=102,
             detect_interval=8,
             resume_plan=resume_plan,
             iou_thresh=0.2,
@@ -52,4 +52,4 @@ def test_resume_skips_completed_shot_when_embedding_safe_frame_is_shot_last():
         )
         assert False, "expected empty-work-range failure"
     except Exception as e:
-        assert "empty work-range" in str(e)
+        assert "empty execution range" in str(e)

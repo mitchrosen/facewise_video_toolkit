@@ -291,7 +291,6 @@ def test_resume_safety_video_mismatch_raises(tmp_path: Path):
     vidA = tmp_path / "A.mp4"
     vidA.write_bytes(b"not a real video")
     run = CheckpointManager._create_new_run_dir(parent, {"video_path": str(vidA)})
-    Path(run, "ckpt").mkdir()
     obs_sidecar = Path(run, "ckpt", "obs_ckpt.npz")
     emb_sidecar = Path(run, "ckpt", "emb_ckpt.npz")
 
@@ -354,7 +353,6 @@ def test_resume_safety_schema_mismatch_raises(tmp_path: Path):
     vid = Path(tmp_path, "v.mp4")
     vid.write_bytes(b"v")
     run = CheckpointManager._create_new_run_dir(parent, {"video_path": str(vid)})
-    Path(run, "ckpt").mkdir()
 
     obs_sidecar = Path(run, "ckpt", "obs_ckpt.npz")
     emb_sidecar = Path(run, "ckpt", "emb_ckpt.npz")

@@ -60,6 +60,8 @@ class TrackingCheckpoint(Protocol):
     # resuming
     def get_resume_anchor(self) -> tuple[int, int, int] | None: ...     # Return (frame_idx, shot_number, shot_first_frame) or None for fresh run.
 
+    def get_embedding_safe_frames(self) -> list[int]: ...
+
 _PROTECTED_KEYS = (
     "video_path",
     "detector_model_path",
@@ -1019,7 +1021,37 @@ class CheckpointManager(TrackingCheckpoint):
         except Exception:
             logging.exception("ckpt:mark_embedding_safe: sidecar dump failed (non-fatal)")
 
-        self._write_status(note)
+        existing_status = self.read_status() or {}
+        history = list(existing_status.get("embedding_safe_frames") or [])
+
+        frame_idx_i = int(frame_idx)
+
+        if not any(
+            int(row.get("frame_idx", -1)) == frame_idx_i
+            for row in history
+        ):
+            history.append(
+                {
+                    "frame_idx": frame_idx_i,
+                    "shot_number": (
+                        int(shot_number)
+                        if shot_number is not None
+                        else None
+                    ),
+                    "shot_first_frame": (
+                        int(shot_first_frame)
+                        if shot_first_frame is not None
+                        else None
+                    ),
+                }
+            )
+
+        history.sort(key=lambda row: int(row["frame_idx"]))
+
+        self._write_status(
+            note,
+            extra_status={"embedding_safe_frames": history},
+        )
 
     def matches_video(self, video_path: Union[str, Path]) -> bool:
         """Return True if the stored checkpoint was created for this video path."""
@@ -1041,38 +1073,94 @@ class CheckpointManager(TrackingCheckpoint):
         self,
         obs_sidecar_path: str | None = None,
         emb_sidecar_path: str | None = None,
+        requested_start_frame: int | None = None,
+        requested_end_frame: int | None = None,
     ) -> None:
         """
-        Export sidecars from the live checkpoint directory to the final locations.
-        Copy the observations NPZ verbatim so the final file contains a single 
-        structured array under the key `'observations'`
-        with fields: f, shot, track_id, bbox_xyxy, src, conf, emb_idx.
-        Embeddings are also copied verbatim.
-        Safe no-ops if a given source file doesn't exist or a target path is None.
+        Export sidecar data from checkpoint storage to run output paths.
+
+        The checkpoint sidecars under ckpt/ are resume artifacts and reflect the
+        executed checkpoint state. This method does not mutate them.
+
+        The user-facing embedding sidecar, when requested via --emb-sidecar-path,
+        should reflect the requested output frame range, not necessarily the full
+        checkpoint execution history.
+
+        obs_sidecar_path is internal/export plumbing used to keep observation
+        rows consistent with the exported embedding rows; it is not a separate
+        user-facing CLI output option.
+
+        If a requested frame range is supplied:
+        - filter observations to the inclusive requested frame range
+        - keep only embeddings referenced by exported observations
+        - remap exported obs.emb_idx to the compact exported embedding array
+
+        If no requested frame range is supplied, sidecars are copied verbatim.
         """
         if self._writes_disabled():
             return
-        
-        try:
-            if obs_sidecar_path:
-                src = self.ckpt_dir / "obs_ckpt.npz"
-                if src.exists():
-                    shutil.copy2(src, obs_sidecar_path)
-                    logging.info("ckpt:export wrote legacy structured obs sidecar -> %s", obs_sidecar_path)
-                else:
-                    logging.info("ckpt:export obs sidecar missing at %s", src)
 
-            if emb_sidecar_path:
-                src = self.ckpt_dir / "emb_ckpt.npz"
-                if src.exists():
-                    shutil.copy2(src, emb_sidecar_path)
-                    logging.info("ckpt:export copied emb sidecar -> %s", emb_sidecar_path)
-                else:
-                    logging.info("ckpt:export emb sidecar missing at %s", src)
+        obs_src = self.ckpt_dir / "obs_ckpt.npz"
+        emb_src = self.ckpt_dir / "emb_ckpt.npz"
 
-        except Exception as e:
-            # Do not crash pipeline completion if export copy fails; just log.
-            logging.error("ckpt:export failed: %s", e)
+        has_frame_filter = (
+            requested_start_frame is not None
+            or requested_end_frame is not None
+        )
+
+        if not has_frame_filter:
+            if obs_sidecar_path and obs_src.exists():
+                shutil.copy2(obs_src, obs_sidecar_path)
+                logging.info("ckpt:export copied obs sidecar -> %s", obs_sidecar_path)
+
+            if emb_sidecar_path and emb_src.exists():
+                shutil.copy2(emb_src, emb_sidecar_path)
+                logging.info("ckpt:export copied emb sidecar -> %s", emb_sidecar_path)
+
+            return
+
+        if not obs_src.exists():
+            logging.info("ckpt:export obs sidecar missing at %s", obs_src)
+            return
+
+        with np.load(obs_src, allow_pickle=False) as data:
+            obs = data["observations"]
+
+        mask = np.ones(obs.shape[0], dtype=bool)
+
+        if requested_start_frame is not None:
+            mask &= obs["f"] >= int(requested_start_frame)
+
+        if requested_end_frame is not None:
+            mask &= obs["f"] <= int(requested_end_frame)
+
+        out_obs = obs[mask].copy()
+
+        used_emb_indices = sorted({
+            int(idx)
+            for idx in out_obs["emb_idx"]
+            if int(idx) >= 0
+        })
+
+        emb_index_map = {
+            old_idx: new_idx
+            for new_idx, old_idx in enumerate(used_emb_indices)
+        }
+
+        for old_idx, new_idx in emb_index_map.items():
+            out_obs["emb_idx"][out_obs["emb_idx"] == old_idx] = new_idx
+
+        if obs_sidecar_path:
+            np.savez(obs_sidecar_path, observations=out_obs)
+            logging.info("ckpt:export wrote filtered obs sidecar -> %s", obs_sidecar_path)
+
+        if emb_sidecar_path:
+            with np.load(emb_src, allow_pickle=False) as data:
+                embeddings = data["embeddings"]
+
+            out_embeddings = embeddings[used_emb_indices]
+            np.savez(emb_sidecar_path, embeddings=out_embeddings)
+            logging.info("ckpt:export wrote compact emb sidecar -> %s", emb_sidecar_path)
 
     def mark_completed(self) -> None:
         """
@@ -1122,6 +1210,26 @@ class CheckpointManager(TrackingCheckpoint):
             pass
 
         return None
+    
+    def get_embedding_safe_frames(self) -> list[int]:
+        """
+        Return historical embedding-safe frame boundaries in ascending order.
+
+        These boundaries are persisted in status.json and are used for
+        requested-start anchor selection.
+        """
+        status = self.read_status() or {}
+
+        rows = status.get("embedding_safe_frames") or []
+
+        frames = []
+        for row in rows:
+            try:
+                frames.append(int(row["frame_idx"]))
+            except Exception:
+                continue
+
+        return sorted(set(frames))
     
     def _obs_np(self):
         """
@@ -1773,16 +1881,42 @@ class CheckpointManager(TrackingCheckpoint):
                 )
 
             status = mgr.read_status() or {}
-            # Extract minimal signals of progress/anchors
+            # Extract minimal signals of progress/anchors.
+            #
+            # Resume is embedding-safe based. A checkpoint with an
+            # embedding-safe anchor/history is not an empty run even if the
+            # legacy detection-anchor fields are unset.
             frames_done = int(status.get("frames_done", 0) or 0)
             shots_done  = int(status.get("shots_done", 0) or 0)
             obs_anchor  = int(status.get("obs_rows_at_last_detection", 0) or 0)
             emb_anchor  = int(status.get("emb_rows_at_last_detection", 0) or 0)
-            track_order = status.get("track_order") if isinstance(status.get("track_order"), list) else []
+
+            emb_safe_frame = status.get("last_embedding_safe_frame")
+            obs_emb_safe = int(status.get("obs_rows_at_last_embedding_safe", 0) or 0)
+            emb_emb_safe = int(status.get("emb_rows_at_last_embedding_safe", 0) or 0)
+
+            track_order = (
+                status.get("track_order")
+                if isinstance(status.get("track_order"), list)
+                else []
+            )
+
+            embedding_safe_frames = (
+                status.get("embedding_safe_frames")
+                if isinstance(status.get("embedding_safe_frames"), list)
+                else []
+            )
+
             had_progress = any([
-                frames_done > 0, shots_done > 0,
-                obs_anchor > 0, emb_anchor > 0,
-                len(track_order) > 0
+                frames_done > 0,
+                shots_done > 0,
+                obs_anchor > 0,
+                emb_anchor > 0,
+                emb_safe_frame is not None,
+                obs_emb_safe > 0,
+                emb_emb_safe > 0,
+                len(track_order) > 0,
+                len(embedding_safe_frames) > 0,
             ])
 
             mgr._had_prior_progress = bool(had_progress)
@@ -1795,13 +1929,15 @@ class CheckpointManager(TrackingCheckpoint):
                 # If anchors > 0, the corresponding sidecar MUST exist.
                 if not have_obs:
                     raise ResumeSafetyError(
-                        f"ckpt.open: inconsistent checkpoint: obs_anchor={obs_anchor} "
-                        f"but {obs_sidecar_path} is missing."
+                        "ckpt.open: inconsistent checkpoint: status.json records "
+                        "prior progress or an embedding-safe anchor, but "
+                        f"{obs_sidecar_path} is missing."
                     )
                 if not have_emb:
                     raise ResumeSafetyError(
-                        f"ckpt.open: inconsistent checkpoint: emb_anchor={emb_anchor} "
-                        f"but {emb_sidecar_path} is missing."
+                        "ckpt.open: inconsistent checkpoint: status.json records "
+                        "prior progress or an embedding-safe anchor, but "
+                        f"{emb_sidecar_path} is missing."
                     )
                 # structural sanity 
                 try:
@@ -1823,20 +1959,56 @@ class CheckpointManager(TrackingCheckpoint):
 
         return mgr
 
+    @staticmethod
+    def _publish_run_dir(tmp_run_dir: Path, final_run_dir: Path) -> None:
+        tmp_run_dir = Path(tmp_run_dir)
+        final_run_dir = Path(final_run_dir)
+
+        if tmp_run_dir.parent != final_run_dir.parent:
+            raise ValueError(
+                "tmp_run_dir and final_run_dir must share the same parent"
+            )
+
+        os.replace(tmp_run_dir, final_run_dir)
+        fsync_parent_dir(final_run_dir)
+
+
     @classmethod
-    def _create_new_run_dir(cls, parent_dir: Path, snapshot: dict) -> Path:
-        rid = f"run-{_utcstamp_compact()}-{_paramhash8(snapshot)}"
-        run_dir = parent_dir / rid
-        run_dir.mkdir(parents=True, exist_ok=False)
-        # Best-effort convenience symlink
+    def _create_new_run_dir(cls, parent_dir: Path, options_snapshot: dict) -> Path:
+        ts = _utcstamp_compact()
+        h = _paramhash8(options_snapshot)
+
+        final_name = f"run-{ts}-{h}"
+        tmp_name = f".tmp-{final_name}"
+
+        tmp_run_dir = parent_dir / tmp_name
+        final_run_dir = parent_dir / final_name
+
+        if tmp_run_dir.exists():
+            raise FileExistsError(
+                f"temporary checkpoint run directory already exists: {tmp_run_dir}"
+            )
+
+        if final_run_dir.exists():
+            raise FileExistsError(
+                f"checkpoint run directory already exists: {final_run_dir}"
+            )
+
+        (tmp_run_dir / "ckpt").mkdir(parents=True, exist_ok=False)
+
+        cls._publish_run_dir(tmp_run_dir, final_run_dir)
+
+        # Best-effort convenience symlink. This must happen after publish so
+        # current never points at an unpublished temp run.
         try:
             cur = parent_dir / "current"
             if cur.exists() or cur.is_symlink():
                 cur.unlink()
-            cur.symlink_to(run_dir.name)
+            cur.symlink_to(final_run_dir.name)
         except Exception:
             pass
-        return run_dir
+
+        return final_run_dir
 
     # ---------- resume safety ----------
 
@@ -2351,7 +2523,11 @@ class CheckpointManager(TrackingCheckpoint):
             return 0
      
     # ---------- internals ----------
-    def _write_status(self, note: str) -> None:
+    def _write_status(
+        self,
+        note: str = "",
+        extra_status: dict | None = None,
+    ) -> None:
         if self._writes_disabled():
             return
         # derive a stable, ordered list from the dict
@@ -2399,7 +2575,17 @@ class CheckpointManager(TrackingCheckpoint):
             **snap,
             note=note,
         )
-        _atomic_write_text(self.status_path, status.to_json())
+
+        status_dict = asdict(status)
+
+        if extra_status:
+            status_dict.update(extra_status)
+
+        _atomic_write_text(
+            self.status_path,
+            json.dumps(status_dict, indent=2),
+        )
+
         logging.debug("in checkpoint._write_status - just called _atomic_write_text()")
 
     def _rewrite_obs_npz_to_flat(self, src_path, dst_path) -> bool:

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import numpy as np
 
 from facekit.pipeline.checkpoint import CheckpointManager
 
@@ -7,7 +8,20 @@ def _write_run(parent: Path, run_id: str, status: dict) -> Path:
     run_dir = parent / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "status.json").write_text(json.dumps(status))
-    (run_dir / "ckpt").mkdir(exist_ok=True)
+
+    ckpt_dir = run_dir / "ckpt"
+    ckpt_dir.mkdir(exist_ok=True)
+
+    np.savez(
+        ckpt_dir / "obs_ckpt.npz",
+        observations=np.empty(0, dtype=[("f", "i4")]),
+    )
+
+    np.savez(
+        ckpt_dir / "emb_ckpt.npz",
+        embeddings=np.empty((0, 512), dtype=np.float32),
+    )
+
     return run_dir
 
 def test_resume_anchor_uses_last_embedding_safe_frame_when_present(tmp_path: Path):

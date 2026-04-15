@@ -906,6 +906,8 @@ class ResumePlan:
 def _resolve_anchor(
     checkpoint: TrackingCheckpoint | None,
     resume_enabled: bool,
+    *,
+    requested_start_frame: int | None = None,
 ) -> int:
     """
     Decide the global resume anchor frame for this run.
@@ -935,6 +937,28 @@ def _resolve_anchor(
     if not (resume_enabled and checkpoint):
         logging.info("_resolve_anchor: disabled or no checkpoint -> start=0")
         return 0
+    
+    if requested_start_frame is not None:
+        get_safe_frames = getattr(checkpoint, "get_embedding_safe_frames", None)
+
+        if callable(get_safe_frames):
+            try:
+                safe_frames = list(get_safe_frames() or [])
+            except Exception:
+                safe_frames = []
+
+            selected = _select_embedding_safe_anchor(
+                safe_frames,
+                requested_start_frame=requested_start_frame,
+            )
+
+            if selected > 0:
+                logging.info(
+                    "_resolve_anchor: selected embedding-safe anchor=%d for requested_start_frame=%d",
+                    int(selected),
+                    int(requested_start_frame),
+                )
+                return int(selected)
 
     # Resume starts at anchor+1.
     try:
@@ -947,8 +971,40 @@ def _resolve_anchor(
         return 0
 
     safe_f = int(anchors[0])
+
     logging.info("_resolve_anchor: embedding-safe anchor=%d", safe_f)
     return safe_f
+
+def _select_embedding_safe_anchor(
+    safe_frames: list[int],
+    *,
+    requested_start_frame: int | None,
+) -> int:
+    """
+    Select the embedding-safe frame to use as the hydration boundary.
+
+    Modes
+    -----
+    Legacy resume execution:
+        If requested_start_frame is None, use the latest/final safe frame.
+
+    History-preserving range execution:
+        If requested_start_frame is explicit, use the latest safe frame strictly
+        less than requested_start_frame.
+
+    Fallback fresh execution:
+        If there is no usable safe frame, return 0.
+    """
+    frames = sorted(int(f) for f in safe_frames if f is not None)
+
+    if not frames:
+        return 0
+
+    if requested_start_frame is None:
+        return int(frames[-1])
+
+    prior = [f for f in frames if f < int(requested_start_frame)]
+    return int(prior[-1]) if prior else 0
 
 def _shot_idx_by_abs_frame(shots, abs_frame_idx: int) -> int:
     """
@@ -1010,6 +1066,7 @@ def _build_resume_plan(
     checkpoint: TrackingCheckpoint | None,
     resume_enabled: bool,
     all_tracks: List[FaceTrack],
+    requested_start_frame: int | None = None,
 ) -> tuple[ResumePlan, list]:
     """
     Construct a ResumePlan and trim the shot list to the anchor-containing shot.
@@ -1049,7 +1106,11 @@ def _build_resume_plan(
     trackid_seed_by_shot: Dict[int, int] = {}
     prior_tracks: List[FaceTrack] = []
 
-    resume_abs_frame: int = _resolve_anchor(checkpoint, resume_enabled)
+    resume_abs_frame: int = _resolve_anchor(
+        checkpoint,
+        resume_enabled,
+        requested_start_frame=requested_start_frame,
+    )
 
     # === AUDIT FENCE #0: record collector rows BEFORE any new work ===
     try:
