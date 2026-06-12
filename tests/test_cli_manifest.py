@@ -247,7 +247,7 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         schema_version="2.1",
         schema_dir=None,
         output_segment_json=None,
-        output_global_json=True,             # trigger JSON manifest write
+        output_global_json=True,
         output_video=None,
         detect_interval=30,
         post_min_gap_len=210,
@@ -256,6 +256,8 @@ def test_cli_v2_1_manifest_includes_trackless_shots_with_full_coverage(tmp_path:
         embedding_batch_size_max=32,
         embedding_queue_max_pending=1024,
         track_sample_interval=4,
+        start_frame=None,
+        end_frame=None,
         device="cpu",
         emb_store="sidecar",
         emb_sidecar_path=None,

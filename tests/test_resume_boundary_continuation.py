@@ -62,8 +62,8 @@ def test_resume_first_resumed_frame_does_not_mint_fresh_tracks(monkeypatch):
     start_at, aggregator, seg_seed = _init_shot_aggregator(
         shot_idx=0,
         shot_number=2,
-        first=103,
-        last=299,
+        execution_start_frame=153,
+        execution_end_frame=299,
         detect_interval=8,
         resume_plan=plan,
         iou_thresh=0.3,

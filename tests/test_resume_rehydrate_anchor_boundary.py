@@ -780,7 +780,11 @@ def test_build_resume_plan_midshot_keeps_live_anchor_tracks_unlabeled(monkeypatc
     checkpoint = _FakeCheckpoint()
     all_tracks = []
 
-    monkeypatch.setattr(rr, "_resolve_anchor", lambda checkpoint, resume_enabled: 152)
+    monkeypatch.setattr(
+        rr,
+        "_resolve_anchor",
+        lambda checkpoint, resume_enabled, requested_start_frame=None: 152,
+    )
     monkeypatch.setattr(rr, "_audit_preanchor_embedding_parity", lambda *a, **k: None)
     monkeypatch.setattr(rr, "_build_emb_lookups_for_checkpoint", lambda *a, **k: (None, None))
     monkeypatch.setattr(rr, "prepare_tracks_for_resume", lambda *a, **k: list(rehydrated))

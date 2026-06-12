@@ -98,6 +98,57 @@ def _validate_manifest_dict(
                                  total_frame_count=total_frame_count,
                                  schema_dir=schema_dir,
                                  )
+    
+def _validate_frame_range(
+    start_frame: int | None,
+    end_frame: int | None,
+    total_frames: int,
+) -> None:
+    """
+    Validate a requested inclusive frame range against the video bounds.
+
+    Frame-range semantics:
+    - start_frame=None means "beginning of video" (frame 0)
+    - end_frame=None means "end of video" (frame total_frames - 1)
+
+    Validation is therefore performed against the normalized inclusive range:
+
+        [effective_start_frame, effective_end_frame]
+
+    where:
+        effective_start_frame =
+            0 if start_frame is None else start_frame
+
+        effective_end_frame =
+            total_frames - 1 if end_frame is None else end_frame
+
+    Raises:
+        ResumeSafetyError:
+            If the normalized range is invalid or out of bounds.
+    """
+    effective_start_frame = 0 if start_frame is None else int(start_frame)
+    effective_end_frame = total_frames - 1 if end_frame is None else int(end_frame)
+
+    if effective_start_frame < 0:
+        raise ResumeSafetyError(f"--start-frame must be >= 0 (got {start_frame})")
+
+    if effective_end_frame < 0:
+        raise ResumeSafetyError(f"--end-frame must be >= 0 (got {end_frame})")
+
+    if effective_start_frame >= total_frames:
+        raise ResumeSafetyError(
+            f"--start-frame {start_frame} is out of bounds for video with {total_frames} frames"
+        )
+
+    if effective_end_frame >= total_frames:
+        raise ResumeSafetyError(
+            f"--end-frame {end_frame} is out of bounds for video with {total_frames} frames"
+        )
+
+    if effective_end_frame < effective_start_frame:
+        raise ResumeSafetyError(
+            f"--end-frame ({end_frame}) must be >= --start-frame ({start_frame})"
+        )
 
 def run_pipeline(args):
     # ---- forbid inline embeddings for 2.1 ----
@@ -138,7 +189,29 @@ def run_pipeline(args):
         fps = float(fp.fps() or 0.0)
         size = fp.size() or (0, 0)
         width, height = int(size[0]), int(size[1])
+
         total_frames = int(fp.total_frames() or 0)
+        if total_frames <= 0:
+            raise ResumeSafetyError(
+                f"video reports invalid total frame count: {total_frames}"
+            )
+
+        requested_start_frame = getattr(args, "start_frame", None)
+        start_frame = (
+            None
+            if requested_start_frame is None
+            else int(requested_start_frame)
+        )
+
+        requested_end_frame = getattr(args, "end_frame", None)
+        end_frame = (
+            None
+            if requested_end_frame is None
+            else int(requested_end_frame)
+        )
+        
+        _validate_frame_range(start_frame, end_frame, total_frames)
+
         embedding_queue_max_pending = int(getattr(args, "embedding_queue_max_pending", 1024))
 
         # Shots (if not provided, build to a temp file then read back)
@@ -270,6 +343,8 @@ def run_pipeline(args):
             shot_json_path=str(shot_json_path),
             detector=detector,
             embedder=embedder,
+            start_frame=start_frame,
+            end_frame=end_frame,
             detect_interval=int(args.detect_interval),
             track_sample_interval=args.track_sample_interval,
             embedding_batch_size_max=int(args.embedding_batch_size_max),
@@ -470,8 +545,10 @@ def run_pipeline(args):
 
             if ckpt is not None:
                 ckpt.copy_ckpt_sidecars_to_final(
-                    obs_sidecar_path=None,   # <-- prevent overwrite
-                    emb_sidecar_path=None
+                    obs_sidecar_path=args.obs_sidecar_path,
+                    emb_sidecar_path=args.emb_sidecar_path,
+                    requested_start_frame=args.start_frame,
+                    requested_end_frame=args.end_frame,
                 )
                 ckpt.mark_completed()
 
@@ -519,7 +596,7 @@ def main() -> None:
     parser.add_argument("--device",  choices=["auto", "cuda", "cpu"], default="auto",
                         help="Compute device for detector/embedder (default: auto)")
     
-    # control detection interval, embedding sampling interval, queue depth and batch size
+    # control tuning
     parser.add_argument("--detect-interval", type=int, default=30,
                         help="frame count between forced face detection frame")
     parser.add_argument("--embedding-queue-max-pending", type=int, default=1024,
@@ -529,6 +606,10 @@ def main() -> None:
                         help=("Subsampling interval for selecting frames to generate embeddings from non-detection frames. "
                                 "Lower values increase embedding density and identity stability at the cost "
                                 "of additional compute. A value of 1 uses every eligible frame."),)
+    parser.add_argument("--start-frame", type=int, default=None,
+                        help="Inclusive first frame to process/output (default: 0).")
+    parser.add_argument("--end-frame", type=int, default=None,
+                        help="Inclusive last frame to process/output. If omitted, run to the end.")
 
     # Post processing
     parser.add_argument("--post-min-gap-len", type=int, default=210,
@@ -571,7 +652,7 @@ def main() -> None:
     parser.add_argument("--log", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"])
     parser.add_argument("--log-file", default=None)
 
-    args = parser.parse_args()
+    args = parser.parse_args(sys.argv[1:])
 
     try:
         run_pipeline(args)

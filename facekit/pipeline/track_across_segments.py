@@ -37,6 +37,39 @@ from facekit.embedding.embedding_selection import TrackEmbeddingSample
 
 logger = logging.getLogger(__name__)
 
+# Execution mode vocabulary
+# -------------------------
+# User-facing requested bounds:
+#   requested_start_frame:
+#       Inclusive first frame requested by the user, or None for legacy/full-start behavior.
+#   requested_end_frame:
+#       Inclusive last frame requested by the user, or None for video end.
+#
+# Processing concepts:
+#   execution_start_frame:
+#       First frame actually processed for the current shot.
+#   execution_end_frame:
+#       Last frame actually processed for the current shot.
+#   hydrate_through_frame:
+#       Last frame restored from checkpoint history before execution begins.
+#
+# Modes:
+#   Full fresh execution:
+#       No requested start/end, resume disabled. Execute from frame 0.
+#   Legacy resume execution:
+#       No requested start, resume enabled, valid checkpoint with an embedding-safe
+#       frame. Hydrate through final safe frame, execute from final_safe + 1.
+#   Full fallback fresh execution:
+#       Resume enabled but no usable checkpoint/safe frame. Execute from frame 0.
+#   Local range execution:
+#       Requested start is provided and no history is used. Execute from requested start.
+#   History-preserving range execution:
+#       Requested start is provided and a usable checkpoint safe frame exists before it.
+#       Hydrate through that safe frame; execute from safe_frame + 1.
+#   History-covered output only:
+#       Requested start is None, requested end is within already-safe history.
+#       Hydrate only through requested end; execute no new frames.
+
 def _snapshot_open_tracks_for_status(aggregator, shot_number: int) -> list[dict]:
     rows: list[dict] = []
     for t in getattr(aggregator, "tracks", []):
@@ -59,8 +92,8 @@ def _init_shot_aggregator(
     *,
     shot_idx: int,
     shot_number: int,
-    first: int,
-    last: int,
+    execution_start_frame: int,
+    execution_end_frame: int,
     detect_interval: int,
     resume_plan: ResumePlan,
     iou_thresh: float,
@@ -68,30 +101,37 @@ def _init_shot_aggregator(
     checkpoint: TrackingCheckpoint | None,
 ) -> tuple[int, ShotFaceTrackAggregator, int]:
     """
-    Initialize a ShotFaceTrackAggregator for a single shot, applying resume rules.
+    Initialize a ShotFaceTrackAggregator for a single shot, applying resume-aware
+    track seeding and per-shot ID initialization.
 
     Responsibilities
     ----------------
-    * Decide the starting frame for this shot:
-        - First processed shot starts at max(first_frame, anchor_frame).
-        - Subsequent shots start at their first_frame.
-    * For the anchor-containing shot, seed the aggregator with pre-anchor tracks
-      so that labels and embeddings continue seamlessly.
-    * Apply track_id seeding and (optional) forced tid reuse at the resume boundary.
-    * Compute the per-shot segment-id seed returned as seg_seed.
+    * Build the per-shot aggregator.
+    * Seed the aggregator with rehydrated pre-resume tracks when this is the
+    resume-containing shot.
+    * Normalize seeded track open/closed state using checkpoint-declared open
+    track IDs at the embedding-safe boundary.
+    * Apply track_id seeding and compute the initial per-shot segment-id seed.
+
+    This helper does not decide the execution frame range for the shot. The caller
+    is responsible for computing:
+    - execution_start_frame
+    - execution_end_frame
 
     Parameters
     ----------
     shot_idx :
-        0-based index of this shot within the trimmed shot list.
+        0-based index of this shot within the shot list being processed.
     shot_number :
         Logical shot identifier from the shot JSON.
-    first, last :
-        Absolute first and last frame indices for this shot.
+    execution_start_frame :
+        Absolute frame index at which processing for this shot will begin.
+    execution_end_frame :
+        Absolute last frame index that may be processed for this shot.
     detect_interval :
-        Detection interval used for logging the resume fence.
+        Detection interval used for logging/debugging.
     resume_plan :
-        ResumePlan containing anchor frame and per-shot seeds.
+        ResumePlan containing embedding-safe-frame information and per-shot seeds.
     iou_thresh, embedding_thresh :
         Aggregator matching and within-shot identity thresholds.
     checkpoint :
@@ -99,34 +139,27 @@ def _init_shot_aggregator(
 
     Returns
     -------
-    start_at, aggregator, seg_seed :
-        start_at : int
-            Absolute frame index at which this shot-loop should start.
+    execution_start_frame, aggregator, seg_seed :
+        execution_start_frame : int
+            The absolute frame index at which this shot-loop should begin.
         aggregator : ShotFaceTrackAggregator
             Fully initialized aggregator for this shot.
         seg_seed : int
-            Initial segment_id_counter seed for this shot (used at resolve_segment_ids()).
+            Initial segment_id_counter seed for this shot.
     """
-    # Decide starting frame
-    # Under the embedding-safe-frame contract, resume begins at the frame
-    # *following* the embedding-safe frame.
-    if shot_idx == 0 and resume_plan.is_resume:
-        start_at = max(first, int(resume_plan.anchor_frame) + 1)
-    else:
-        start_at = first
-
     if shot_idx == 0:
         logging.info(
-            "resume: first_new_frame=%d (shot=[%d..%d]) detect_interval=%d mod=%d",
-            start_at,
-            first,
-            last,
+            "resume: execution_start_frame=%d (execution_range=[%d..%d]) detect_interval=%d mod=%d",
+            execution_start_frame,
+            execution_start_frame,
+            execution_end_frame,
             detect_interval,
-            ((start_at - first) % max(1, detect_interval)),
+            ((execution_start_frame - execution_start_frame) % max(1, detect_interval)),
         )
-        if start_at > last:
+        if execution_start_frame > execution_end_frame:
             raise ResumeSafetyError(
-                f"empty work-range at resume: start_at={start_at} > shot_last={last} for shot={shot_number}"
+                f"empty execution range: execution_start_frame={execution_start_frame} "
+                f"> execution_end_frame={execution_end_frame} for shot={shot_number}"
             )
         
     is_resume_shot = (
@@ -197,7 +230,7 @@ def _init_shot_aggregator(
             iou_threshold=iou_thresh,
             embedding_threshold=embedding_thresh,
             prior_tracks=seeded_tracks,
-            resume_abs_frame=start_at,
+            resume_abs_frame=execution_start_frame,
             next_tid_seed=int(resume_plan.trackid_seed_by_shot.get(int(shot_number), 0)),
         )
 
@@ -268,7 +301,7 @@ def _init_shot_aggregator(
         elif hasattr(aggregator, "_next_track_id"):
             setattr(aggregator, "_next_track_id", seed_tid)
 
-    return start_at, aggregator, seg_seed
+    return execution_start_frame, aggregator, seg_seed
 
 
 def _guard_seek_failure(
@@ -331,7 +364,11 @@ def _guard_no_rewind(frame_idx: int, resume_plan: ResumePlan) -> None:
     Any attempt to produce observations for a frame strictly before
     resume_plan.anchor_frame is treated as a bug and raises ResumeSafetyError.
     """
-    if resume_plan.anchor_frame and frame_idx < resume_plan.anchor_frame:
+    if (
+        resume_plan.is_resume
+        and resume_plan.anchor_frame
+        and frame_idx < resume_plan.anchor_frame
+    ):
         raise ResumeSafetyError(
             f"Illegal rewind: got frame_idx={frame_idx} < anchor={resume_plan.anchor_frame}"
         )
@@ -789,6 +826,8 @@ def track_across_segments(
     detect_interval: int = 10,
     embedding_batch_size_max: int = 32,
     *,
+    start_frame: int = 0,
+    end_frame: int | None = None,
     embedding_queue_max_pending: int = 1024,
     track_sample_interval: int = 10,
     checkpoint: TrackingCheckpoint | None = None,
@@ -836,16 +875,42 @@ def track_across_segments(
         Run the detector every `detect_interval` frames (and on the first frame of a shot or after tracker reset).
     embedding_batch_size_max : int, default 32
         Maximum batch size for `embedder.get_embedding_batch`.
+    start_frame : int, default 0
+        - Inclusive first frame to process/output.
+        - For cold runs (no resume), processing begins exactly at this frame.
+        - For resume runs, the internal starting frame may be earlier than this frame
+          if required to safely rehydrate tracker state (e.g., at an embedding-safe
+          boundary). In such cases, frames prior to `start_frame` are processed
+          internally but should not be considered part of the requested output range.
+    end_frame : int | None, default None
+        - Inclusive last frame to process/output.
+        - If None, processing continues to the end of the video.
+        - If specified, the pipeline must not emit results beyond this frame.
     checkpoint : TrackingCheckpoint | None, optional
         Checkpoint interface used for sidecar persistence (observations/embeddings),
         status.json updates, and rehydration of prior observations/tracks.
     resume_enabled : bool, default True
-        When True, this function resolves a resume anchor from the `checkpoint`
-        (preferring `get_resume_anchor()`, then `last_detection_frame` from status,
-        then the maximum observed frame in the observations collector). The tracker
-        will start at `max(anchor, shot_first)` within the containing shot and will
-        rehydrate prior observations strictly *before* the anchor. When False,
-        the function ignores any resume state and starts from the first shot frame.
+        When True
+            - if checkpoint artifacts are located and compatible, they are used to determine 
+              last embedding-safe frame
+                - resume processing from the last embedding-safe frame, if there is one 
+                - The embedding-safe frame is the most recent frame for which all required
+                  embeddings have been durably persisted. Resume begins at the frame
+                  immediately following this boundary.
+                - For the shot containing the embedding-safe frame:
+                    - The tracker state is rehydrated from checkpointed observations.
+                    - Only tracks that were open at the embedding-safe boundary are
+                      considered active and eligible for continuation.
+                - The pipeline guarantees:
+                    - No recomputation of embeddings for frames at or before the
+                      embedding-safe frame.
+                - No emission of observations for frames prior to the embedding-safe
+                  frame (no rewind).
+            - If resume is not possible (e.g., incompatible checkpoint), the function
+              must fail rather than silently falling back to a cold run.
+        When False
+            - the function ignores any checkpoint state and processes the
+              video from the beginning (or from `start_frame` if provided).
 
     Returns
     -------
@@ -863,6 +928,14 @@ def track_across_segments(
       the internally constructed provider is closed automatically via `ExitStack()`.
     - **Performance knobs:** `detect_interval` trades accuracy for speed; increasing it reduces detector calls.
       `embedding_batch_size_max` controls memory/throughput on the embedder.
+
+    Frame range semantics
+    ---------------------
+    - The requested [start_frame, end_frame] defines the user-visible output range.
+    - Resume logic may require internal processing prior to start_frame in order
+      to rehydrate track state safely.
+    - Implementations should ensure that any internal replay does not leak
+      observations or outputs outside the requested frame range.
 
     Resume semantics & label continuity
     -----------------------------------
@@ -906,12 +979,16 @@ def track_across_segments(
 
         all_tracks: List[FaceTrack] = []
 
+        requested_start_frame = None if start_frame is None else int(start_frame)
+        requested_end_frame = None if end_frame is None else int(end_frame)
+
         # Centralized resume/rehydrate logic
         resume_plan, shots = _build_resume_plan(
             shots,
             checkpoint=checkpoint,
             resume_enabled=resume_enabled,
             all_tracks=all_tracks,
+            requested_start_frame=requested_start_frame,
         )
 
         for shot_idx, shot_num in enumerate(shots):
@@ -922,12 +999,62 @@ def track_across_segments(
             first = shot_num["first_frame"]
             last = shot_num["last_frame"]
 
+            # No resume plan was selected.
+            #
+            # If resume was disabled, this is local range execution: start exactly
+            # at requested_start_frame.
+            #
+            # If resume was enabled but no usable checkpoint/safe frame was selected,
+            # this is fallback fresh execution: start at frame 0 so requested output
+            # can be produced with complete forward context.
+            if not resume_plan.is_resume:
+                if resume_enabled:
+                    # Resume was requested, but no usable embedding-safe
+                    # boundary was selected. For history-preserving fallback,
+                    # execute from frame 0 rather than from requested_start_frame.
+                    effective_start_frame = 0
+                else:
+                    # Local range execution: resume/history is intentionally
+                    # disabled, so start exactly at requested_start_frame.
+                     effective_start_frame = 0 if requested_start_frame is None else requested_start_frame
+
+                if last < effective_start_frame:
+                    continue
+                if requested_end_frame is not None and first > requested_end_frame:
+                    break
+
+                execution_start_frame = max(int(first), effective_start_frame)
+                execution_end_frame = (
+                    min(int(last), requested_end_frame)
+                    if requested_end_frame is not None
+                    else int(last)
+                )
+            else:
+                # the first processed resume shot begins at the frame
+                # immediately after the embedding-safe anchor.
+                if shot_idx == 0:
+                    execution_start_frame = max(
+                        int(first),
+                        int(resume_plan.anchor_frame) + 1,
+                    )
+                else:
+                    execution_start_frame = int(first)
+
+                execution_end_frame = (
+                    min(int(last), requested_end_frame)
+                    if requested_end_frame is not None
+                    else int(last)
+                )
+
+                if execution_start_frame > execution_end_frame:
+                    continue
+
             # Initialize shot-level aggregator and seeds (resume aware)
             start_at, aggregator, seg_seed = _init_shot_aggregator(
                 shot_idx=shot_idx,
                 shot_number=shot_number,
-                first=first,
-                last=last,
+                execution_start_frame=execution_start_frame,
+                execution_end_frame=execution_end_frame,
                 detect_interval=detect_interval,
                 resume_plan=resume_plan,
                 iou_thresh=iou_thresh,
@@ -956,7 +1083,7 @@ def track_across_segments(
 
             frame_provider.reset_to_frame(int(start_at))
 
-            for frame_idx in range(start_at, last + 1):
+            for frame_idx in range(start_at, execution_end_frame + 1):
                 frame = frame_provider.next()
                 frame = _guard_seek_failure(
                     frame=frame,
