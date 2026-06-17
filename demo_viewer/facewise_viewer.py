@@ -508,8 +508,17 @@ class Viewer(QMainWindow):
     
     def toggle_framing(self):
         self.auto_framing = not self.auto_framing
-        self.framing_button.setText("Manual Framing" if self.auto_framing else "Auto Framing")
+        self.framing_button.setText(
+            "Fit Video" if self.auto_framing else "Auto Frame"
+        )
+        self.manual_mode = False
+
         self.render_current_pixmap()
+
+    def enter_manual_mode(self):
+        self.auto_framing = False
+        self.manual_mode = True
+        self.framing_button.setText("Auto Frame")
 
     def auto_frame(self):
         if self.face_index is None:
