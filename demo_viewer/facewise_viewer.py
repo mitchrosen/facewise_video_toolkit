@@ -19,6 +19,17 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QSlider,
+    QHBoxLayout,
+    QVBoxLayout,
+    QWidget,
+)
 
 class VideoReader:
     def __init__(self, path: Path):
@@ -171,6 +182,10 @@ class Viewer(QMainWindow):
         self.start_button = QPushButton("|<<")
         self.start_button.clicked.connect(self.go_to_start)
 
+        self.is_portrait = True
+        self.orientation_button = QPushButton("Landscape ▭")
+        self.orientation_button.clicked.connect(self.toggle_orientation)
+
         # self.prev_button = QPushButton("<<")
         # self.prev_button.clicked.connect(self.prev_frame)
         # self.prev_button.setAutoRepeat(True)
@@ -195,6 +210,10 @@ class Viewer(QMainWindow):
         self.slider.sliderPressed.connect(self.begin_slider_drag)
         self.slider.sliderReleased.connect(self.end_slider_drag)
 
+        self.auto_framing = False
+        self.framing_button = QPushButton("Auto Framing")
+        self.framing_button.clicked.connect(self.toggle_framing)
+
         self.face_index: FacewiseJsonIndex | None = None
         self.displayed_frame_idx = 0
 
@@ -207,6 +226,8 @@ class Viewer(QMainWindow):
         controls.addWidget(self.next_button)
         controls.addWidget(self.end_button)
         controls.addWidget(self.slider)
+        controls.addWidget(self.orientation_button)
+        controls.addWidget(self.framing_button)
 
         layout = QVBoxLayout()
         layout.addWidget(self.video_label)
@@ -381,36 +402,131 @@ class Viewer(QMainWindow):
         if self.current_pixmap is None:
             return
 
-        pix = self.current_pixmap.copy()
+        viewport_w, viewport_h = self.viewport_size()
 
+        canvas = QPixmap(viewport_w, viewport_h)
+        canvas.fill(Qt.black)
+
+        src = self.current_pixmap.copy()
+
+        painter = QPainter(src)
         if self.face_index is not None:
             faces = self.face_index.faces_at(self.displayed_frame_idx)
 
-            painter = QPainter(pix)
             pen = QPen(Qt.red)
             pen.setWidth(3)
             painter.setPen(pen)
 
             for face in faces:
                 x1, y1, x2, y2 = face["bbox"]
-                painter.drawRect(
-                    int(x1),
-                    int(y1),
-                    int(x2 - x1),
-                    int(y2 - y1),
-                )
-
+                painter.drawRect(int(x1), int(y1), int(x2 - x1), int(y2 - y1))
                 label = face.get("face_label") or f"g={face.get('global_id')} s={face.get('segment_id')}"
                 painter.drawText(int(x1), max(12, int(y1) - 6), label)
+        painter.end()
 
+        target_face = self.auto_frame() if self.auto_framing else None
+
+        if target_face is None:
+            scaled = src.scaled(
+                viewport_w,
+                viewport_h,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+
+            x = (viewport_w - scaled.width()) // 2
+            y = (viewport_h - scaled.height()) // 2
+
+            painter = QPainter(canvas)
+            painter.drawPixmap(x, y, scaled)
+            painter.end()
+        else:
+            x1, y1, x2, y2 = target_face["bbox"]
+
+            face_w = max(1.0, float(x2) - float(x1))
+            face_h = max(1.0, float(y2) - float(y1))
+
+            buffer = 2.0
+            crop_w = face_w * buffer
+            crop_h = face_h * buffer
+
+            cx = (float(x1) + float(x2)) / 2.0
+            cy = (float(y1) + float(y2)) / 2.0
+
+            crop_x1 = cx - crop_w / 2.0
+            crop_y1 = cy - crop_h / 2.0
+            crop_x2 = cx + crop_w / 2.0
+            crop_y2 = cy + crop_h / 2.0
+
+            source_w = src.width()
+            source_h = src.height()
+
+            crop_x1 = max(0.0, crop_x1)
+            crop_y1 = max(0.0, crop_y1)
+            crop_x2 = min(float(source_w), crop_x2)
+            crop_y2 = min(float(source_h), crop_y2)
+
+            crop_w = max(1, int(crop_x2 - crop_x1))
+            crop_h = max(1, int(crop_y2 - crop_y1))
+
+            cropped = src.copy(
+                int(crop_x1),
+                int(crop_y1),
+                crop_w,
+                crop_h,
+            )
+
+            scaled = cropped.scaled(
+                viewport_w,
+                viewport_h,
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation,
+            )
+
+            draw_x = (viewport_w - scaled.width()) // 2
+            draw_y = (viewport_h - scaled.height()) // 2
+
+            painter = QPainter(canvas)
+            painter.drawPixmap(draw_x, draw_y, scaled)
             painter.end()
 
         self.video_label.setPixmap(
-            pix.scaled(
+            canvas.scaled(
                 self.video_label.size(),
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
+        )
+    
+    def toggle_orientation(self):
+        self.is_portrait = not self.is_portrait
+        self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
+        self.render_current_pixmap()
+
+    def viewport_size(self) -> tuple[int, int]:
+        return (750, 1334) if self.is_portrait else (1334, 750)
+    
+    def toggle_framing(self):
+        self.auto_framing = not self.auto_framing
+        self.framing_button.setText("Manual Framing" if self.auto_framing else "Auto Framing")
+        self.render_current_pixmap()
+
+    def auto_frame(self):
+        if self.face_index is None:
+            return None
+
+        faces = self.face_index.faces_at(self.displayed_frame_idx)
+        if not faces:
+            return None
+        
+        return max(
+            faces,
+            key=lambda face: (
+                float(face["bbox"][2]) - float(face["bbox"][0])
+            )
+            * (
+                float(face["bbox"][3]) - float(face["bbox"][1])
+            ),
         )
 
 def main():
