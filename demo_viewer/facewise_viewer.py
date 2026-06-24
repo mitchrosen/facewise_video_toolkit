@@ -205,6 +205,10 @@ class Viewer(QMainWindow):
         self.framing_button = QPushButton("Auto Framing")
         self.framing_button.clicked.connect(self.toggle_framing)
 
+        self.show_boxes = True
+        self.boxes_button = QPushButton("Hide Boxes")
+        self.boxes_button.clicked.connect(self.toggle_boxes)
+
         self.zoom_out_button = QPushButton("Zoom -")
         self.zoom_out_button.clicked.connect(self.zoom_out)
 
@@ -257,6 +261,7 @@ class Viewer(QMainWindow):
         framing_controls.addStretch(1)
         framing_controls.addWidget(self.orientation_button)
         framing_controls.addWidget(self.framing_button)
+        framing_controls.addWidget(self.boxes_button)
         framing_controls.addWidget(self.zoom_out_button)
         framing_controls.addWidget(self.zoom_in_button)
         framing_controls.addWidget(pan_widget)
@@ -444,7 +449,7 @@ class Viewer(QMainWindow):
         src = self.current_pixmap.copy()
 
         painter = QPainter(src)
-        if self.face_index is not None:
+        if self.show_boxes and self.face_index is not None:
             faces = self.face_index.faces_at(self.displayed_frame_idx)
 
             pen = QPen(Qt.red)
@@ -597,7 +602,7 @@ class Viewer(QMainWindow):
     def toggle_orientation(self):
         if self.manual_mode and self.last_visible_center is not None:
             self.manual_center = self.last_visible_center
-            
+
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
         self.render_current_pixmap()
@@ -608,6 +613,11 @@ class Viewer(QMainWindow):
     def viewport_aspect(self) -> float:
         viewport_w, viewport_h = self.viewport_size()
         return float(viewport_w) / float(viewport_h)
+    
+    def toggle_boxes(self):
+        self.show_boxes = not self.show_boxes
+        self.boxes_button.setText("Hide Boxes" if self.show_boxes else "Show Boxes")
+        self.render_current_pixmap()
 
     def toggle_framing(self):
         if self.auto_framing or self.manual_mode:
