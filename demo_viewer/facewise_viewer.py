@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from cProfile import label
 import json
 import sys
 from pathlib import Path
@@ -412,8 +411,7 @@ class Viewer(QMainWindow):
             return
         self.set_stopped()
         last = max(0, self.reader.frame_count - 1)
-        self.reader.seek(last)
-        img = self.reader.next_frame()
+        img = self.reader.frame_at_exact(last)
         if img is not None:
             self.show_frame(img)
 
@@ -452,8 +450,7 @@ class Viewer(QMainWindow):
             return
 
         target = self.slider.value()
-        self.reader.seek(target)
-        img = self.reader.next_frame()
+        img = self.reader.frame_at_exact(target)
         if img is not None:
             self.show_frame(img)
 
@@ -762,6 +759,17 @@ class Viewer(QMainWindow):
         self.render_current_pixmap()
 
     def toggle_framing(self):
+        """
+        Toggle between Fit Video mode and Auto Frame mode.
+
+        Auto Frame follows the largest detected face when one is available.
+        If the current frame has no detected face, rendering temporarily
+        falls back to Fit Video while remaining in Auto Frame mode. When
+        faces reappear, Auto Frame resumes automatically.
+
+        Leaving Auto Frame, or leaving manual face-selection mode, returns
+        the viewer to Fit Video and clears manual crop, zoom, and pan state.
+        """
         if self.auto_framing or self.manual_mode:
             self.auto_framing = False
             self.reset_manual_mode()
@@ -874,6 +882,9 @@ class Viewer(QMainWindow):
                 continue
 
             face = faces[idx]
+            label.mousePressEvent = (
+                lambda event, selected_face=face: self.select_drawer_face(selected_face)
+            )
             x1, y1, x2, y2 = face["bbox"]
 
             face_w = max(1.0, float(x2) - float(x1))
@@ -1024,6 +1035,17 @@ class Viewer(QMainWindow):
         self.manual_center = (cx, cy)
         self.clamp_manual_center()
 
+        self.render_current_pixmap()
+
+    def select_drawer_face(self, face):
+        self.auto_framing = False
+        self.reset_manual_mode()
+        self.manual_crop = self.crop_for_face(face, self.viewport_aspect())
+
+        x1, y1, x2, y2 = self.manual_crop
+        self.manual_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        self.manual_mode = True
+        self.framing_button.setText("Fit Video")
         self.render_current_pixmap()
 
 def main():
