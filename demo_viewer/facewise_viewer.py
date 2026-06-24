@@ -15,17 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSlider,
-    QHBoxLayout,
-    QVBoxLayout,
-    QWidget,
-)
-from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QLabel,
-    QMainWindow,
-    QPushButton,
-    QSlider,
+    QGridLayout,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
@@ -166,10 +156,11 @@ class Viewer(QMainWindow):
         self.current_pixmap = None
         self.last_open_dir = Path.home()
         self._slider_dragging = False
+        self.phone_display_long_side = 650
 
         self.video_label = QLabel("Open a video to begin")
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(800, 450)
+        self.video_label.setFixedSize(760, 760)
 
         self.open_button = QPushButton("Open…")
         self.open_button.clicked.connect(self.open_video)
@@ -220,30 +211,61 @@ class Viewer(QMainWindow):
         self.zoom_in_button = QPushButton("Zoom +")
         self.zoom_in_button.clicked.connect(self.zoom_in)
 
+        self.pan_up_button = QPushButton("↑")
+        self.pan_up_button.clicked.connect(lambda: self.pan(0.0, -0.1))
+
+        self.pan_left_button = QPushButton("←")
+        self.pan_left_button.clicked.connect(lambda: self.pan(-0.1, 0.0))
+
+        self.pan_right_button = QPushButton("→")
+        self.pan_right_button.clicked.connect(lambda: self.pan(0.1, 0.0))
+
+        self.pan_down_button = QPushButton("↓")
+        self.pan_down_button.clicked.connect(lambda: self.pan(0.0, 0.1))
+
+        pan_layout = QGridLayout()
+        pan_layout.addWidget(self.pan_up_button, 0, 1)
+        pan_layout.addWidget(self.pan_left_button, 1, 0)
+        pan_layout.addWidget(self.pan_right_button, 1, 2)
+        pan_layout.addWidget(self.pan_down_button, 2, 1)
+
+        pan_widget = QWidget()
+        pan_widget.setLayout(pan_layout)
+
         self.manual_mode = False
         self.manual_zoom = 1.0
         self.manual_crop: tuple[float, float, float, float] | None = None
+        self.manual_center: tuple[float, float] | None = None
+        self.last_visible_center: tuple[float, float] | None = None
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
 
         self.face_index: FacewiseJsonIndex | None = None
         self.displayed_frame_idx = 0
 
-        controls = QHBoxLayout()
-        controls.addWidget(self.open_button)
-        controls.addWidget(self.open_json_button)
-        controls.addWidget(self.start_button)
-        # controls.addWidget(self.prev_button)
-        controls.addWidget(self.play_button)
-        controls.addWidget(self.next_button)
-        controls.addWidget(self.end_button)
-        controls.addWidget(self.slider)
-        controls.addWidget(self.orientation_button)
-        controls.addWidget(self.framing_button)
-        controls.addWidget(self.zoom_out_button)
-        controls.addWidget(self.zoom_in_button)
+        playback_controls = QHBoxLayout()
+        playback_controls.addWidget(self.open_button)
+        playback_controls.addWidget(self.open_json_button)
+        playback_controls.addWidget(self.start_button)
+        # playback_controls.addWidget(self.prev_button)
+        playback_controls.addWidget(self.play_button)
+        playback_controls.addWidget(self.next_button)
+        playback_controls.addWidget(self.end_button)
+        playback_controls.addWidget(self.slider, stretch=1)
+
+        framing_controls = QHBoxLayout()
+        framing_controls.addStretch(1)
+        framing_controls.addWidget(self.orientation_button)
+        framing_controls.addWidget(self.framing_button)
+        framing_controls.addWidget(self.zoom_out_button)
+        framing_controls.addWidget(self.zoom_in_button)
+        framing_controls.addWidget(pan_widget)
+        framing_controls.addStretch(1)
 
         layout = QVBoxLayout()
-        layout.addWidget(self.video_label)
-        layout.addLayout(controls)
+        layout.addWidget(self.video_label, alignment=Qt.AlignCenter)
+        layout.addLayout(playback_controls)
+        layout.addLayout(framing_controls)
 
         root = QWidget()
         root.setLayout(layout)
@@ -436,15 +458,16 @@ class Viewer(QMainWindow):
                 painter.drawText(int(x1), max(12, int(y1) - 6), label)
         painter.end()
 
-        target_face = self.auto_frame() if self.auto_framing else None
+        target_face = self.auto_frame() if self.auto_framing and not self.manual_mode else None
+
         manual_zoom = self.manual_zoom if self.manual_mode else 1.0
 
         crop = None
 
-        if target_face is not None:
-            crop = self.crop_for_face(target_face)
-        elif self.manual_mode and self.manual_crop is not None:
+        if self.manual_mode and self.manual_crop is not None:
             crop = self.manual_crop
+        elif target_face is not None:
+            crop = self.crop_for_face(target_face, self.viewport_aspect())
 
         if crop is None:
             scaled = src.scaled(
@@ -465,6 +488,12 @@ class Viewer(QMainWindow):
             x = (viewport_w - scaled.width()) // 2
             y = (viewport_h - scaled.height()) // 2
 
+            if self.manual_mode and manual_zoom != 1.0:
+                overflow_x = max(0, scaled.width() - viewport_w)
+                overflow_y = max(0, scaled.height() - viewport_h)
+                x -= int(self.manual_pan_x * overflow_x)
+                y -= int(self.manual_pan_y * overflow_y)
+
             painter = QPainter(canvas)
             painter.drawPixmap(x, y, scaled)
             painter.end()
@@ -474,10 +503,54 @@ class Viewer(QMainWindow):
             source_w = src.width()
             source_h = src.height()
 
+            base_crop_w = max(1.0, crop_x2 - crop_x1)
+            base_crop_h = max(1.0, crop_y2 - crop_y1)
+
+            if self.manual_mode and self.manual_center is not None:
+                crop_center_x, crop_center_y = self.manual_center
+            else:
+                crop_center_x = (crop_x1 + crop_x2) / 2.0
+                crop_center_y = (crop_y1 + crop_y2) / 2.0
+
+            effective_crop_w = base_crop_w / manual_zoom
+            effective_crop_h = base_crop_h / manual_zoom
+
+            effective_aspect = effective_crop_w / effective_crop_h
+            viewport_aspect = self.viewport_aspect()
+            if effective_aspect < viewport_aspect:
+                effective_crop_w = effective_crop_h * viewport_aspect
+            else:
+                effective_crop_h = effective_crop_w / viewport_aspect
+
+            crop_x1 = crop_center_x - effective_crop_w / 2.0
+            crop_y1 = crop_center_y - effective_crop_h / 2.0
+            crop_x2 = crop_center_x + effective_crop_w / 2.0
+            crop_y2 = crop_center_y + effective_crop_h / 2.0
+
+            if crop_x1 < 0.0:
+                crop_x2 -= crop_x1
+                crop_x1 = 0.0
+            if crop_y1 < 0.0:
+                crop_y2 -= crop_y1
+                crop_y1 = 0.0
+            if crop_x2 > float(source_w):
+                shift = crop_x2 - float(source_w)
+                crop_x1 -= shift
+                crop_x2 = float(source_w)
+            if crop_y2 > float(source_h):
+                shift = crop_y2 - float(source_h)
+                crop_y1 -= shift
+                crop_y2 = float(source_h)
+
             crop_x1 = max(0.0, crop_x1)
             crop_y1 = max(0.0, crop_y1)
             crop_x2 = min(float(source_w), crop_x2)
             crop_y2 = min(float(source_h), crop_y2)
+
+            self.last_visible_center = (
+                (crop_x1 + crop_x2) / 2.0,
+                (crop_y1 + crop_y2) / 2.0,
+            )
 
             crop_w = max(1, int(crop_x2 - crop_x1))
             crop_h = max(1, int(crop_y2 - crop_y1))
@@ -488,20 +561,6 @@ class Viewer(QMainWindow):
                 crop_w,
                 crop_h,
             )
-
-            if manual_zoom != 1.0:
-                zoom_crop_w = max(1, int(crop_w / manual_zoom))
-                zoom_crop_h = max(1, int(crop_h / manual_zoom))
-
-                zoom_x = max(0, (crop_w - zoom_crop_w) // 2)
-                zoom_y = max(0, (crop_h - zoom_crop_h) // 2)
-
-                cropped = cropped.copy(
-                    zoom_x,
-                    zoom_y,
-                    zoom_crop_w,
-                    zoom_crop_h,
-                )
 
             scaled = cropped.scaled(
                 viewport_w,
@@ -517,15 +576,28 @@ class Viewer(QMainWindow):
             painter.drawPixmap(draw_x, draw_y, scaled)
             painter.end()
 
+        display_long_side = self.phone_display_long_side
+
+        if canvas.width() >= canvas.height():
+            display_w = display_long_side
+            display_h = round(display_w * canvas.height() / canvas.width())
+        else:
+            display_h = display_long_side
+            display_w = round(display_h * canvas.width() / canvas.height())
+
         self.video_label.setPixmap(
             canvas.scaled(
-                self.video_label.size(),
+                display_w,
+                display_h,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
         )
     
     def toggle_orientation(self):
+        if self.manual_mode and self.last_visible_center is not None:
+            self.manual_center = self.last_visible_center
+            
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
         self.render_current_pixmap()
@@ -533,20 +605,36 @@ class Viewer(QMainWindow):
     def viewport_size(self) -> tuple[int, int]:
         return (750, 1334) if self.is_portrait else (1334, 750)
     
+    def viewport_aspect(self) -> float:
+        viewport_w, viewport_h = self.viewport_size()
+        return float(viewport_w) / float(viewport_h)
+
     def toggle_framing(self):
-        self.auto_framing = not self.auto_framing
-        self.framing_button.setText(
-            "Fit Video" if self.auto_framing else "Auto Frame"
-        )
-        self.reset_manual_mode()
+        if self.auto_framing or self.manual_mode:
+            self.auto_framing = False
+            self.reset_manual_mode()
+            self.framing_button.setText("Auto Frame")
+        else:
+            self.auto_framing = True
+            self.reset_manual_mode()
+            self.framing_button.setText("Fit Video")
 
         self.render_current_pixmap()
 
     def reset_manual_mode(self):
         self.manual_mode = False
         self.manual_zoom = 1.0
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
+        self.manual_crop = None
+        self.manual_center = None
 
-    def crop_for_face(self, face, buffer: float = 2.0):
+    def crop_for_face(
+        self,
+        face,
+        viewport_aspect: float | None = None,
+        buffer: float = 2.0,
+    ):
         x1, y1, x2, y2 = face["bbox"]
 
         face_w = max(1.0, float(x2) - float(x1))
@@ -554,6 +642,13 @@ class Viewer(QMainWindow):
 
         crop_w = face_w * buffer
         crop_h = face_h * buffer
+
+        if viewport_aspect is not None:
+            crop_aspect = crop_w / crop_h
+            if crop_aspect < viewport_aspect:
+                crop_w = crop_h * viewport_aspect
+            else:
+                crop_h = crop_w / viewport_aspect
 
         cx = (float(x1) + float(x2)) / 2.0
         cy = (float(y1) + float(y2)) / 2.0
@@ -586,22 +681,112 @@ class Viewer(QMainWindow):
     def zoom_in(self):
         self.enter_manual_mode()
         self.manual_zoom = min(6.0, self.manual_zoom * 1.15)
+        self.clamp_manual_center()
         self.render_current_pixmap()
 
     def zoom_out(self):
         self.enter_manual_mode()
-        self.manual_zoom = max(1.0, self.manual_zoom / 1.15)
+        self.manual_zoom = max(self.minimum_manual_zoom(), self.manual_zoom / 1.15)
+        self.clamp_manual_center()
         self.render_current_pixmap()
 
     def enter_manual_mode(self):
-        if self.auto_framing and self.manual_crop is None:
-            face = self.auto_frame()
-            if face is not None:
-                self.manual_crop = self.crop_for_face(face)
+        
+        if self.manual_crop is None:
+            if self.auto_framing:
+                face = self.auto_frame()
+                if face is not None:
+                    self.manual_crop = self.crop_for_face(face, self.viewport_aspect())
 
-        self.auto_framing = False
+        if self.manual_crop is not None and self.manual_center is None:
+            x1, y1, x2, y2 = self.manual_crop
+            self.manual_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
         self.manual_mode = True
-        self.framing_button.setText("Auto Frame")
+        self.framing_button.setText("Fit Video")
+
+    def minimum_manual_zoom(self) -> float:
+        if self.manual_crop is None or self.current_pixmap is None:
+            return 1.0
+
+        crop_x1, crop_y1, crop_x2, crop_y2 = self.manual_crop
+        crop_w = max(1.0, crop_x2 - crop_x1)
+        crop_h = max(1.0, crop_y2 - crop_y1)
+
+        source_w = max(1.0, float(self.current_pixmap.width()))
+        source_h = max(1.0, float(self.current_pixmap.height()))
+
+        viewport_aspect = self.viewport_aspect()
+        fit_crop_w = source_w
+        fit_crop_h = source_w / viewport_aspect
+
+        if fit_crop_h > source_h:
+            fit_crop_h = source_h
+            fit_crop_w = source_h * viewport_aspect
+
+        return min(crop_w / fit_crop_w, crop_h / fit_crop_h)
+    
+    def clamp_manual_center(self):
+        if self.current_pixmap is None:
+            return
+
+        if self.manual_crop is None:
+            self.manual_pan_x = max(-0.5, min(0.5, self.manual_pan_x))
+            self.manual_pan_y = max(-0.5, min(0.5, self.manual_pan_y))
+            return
+
+        if self.manual_center is None:
+            return
+
+        x1, y1, x2, y2 = self.manual_crop
+        crop_w = max(1.0, x2 - x1)
+        crop_h = max(1.0, y2 - y1)
+
+        visible_w = crop_w / max(0.001, self.manual_zoom)
+        visible_h = crop_h / max(0.001, self.manual_zoom)
+
+        source_w = float(self.current_pixmap.width())
+        source_h = float(self.current_pixmap.height())
+
+        cx, cy = self.manual_center
+
+        if visible_w >= source_w:
+            cx = source_w / 2.0
+        else:
+            cx = max(visible_w / 2.0, min(source_w - visible_w / 2.0, cx))
+
+        if visible_h >= source_h:
+            cy = source_h / 2.0
+        else:
+            cy = max(visible_h / 2.0, min(source_h - visible_h / 2.0, cy))
+
+        self.manual_center = (cx, cy)
+
+    def pan(self, dx: float, dy: float):
+        if not self.auto_framing and not self.manual_mode:
+            return
+        self.enter_manual_mode()
+        if self.manual_crop is None:
+            self.manual_pan_x += dx
+            self.manual_pan_y += dy
+            self.clamp_manual_center()
+            self.render_current_pixmap()
+            return
+
+        if self.manual_center is None:
+            return
+
+        x1, y1, x2, y2 = self.manual_crop
+        crop_w = max(1.0, x2 - x1)
+        crop_h = max(1.0, y2 - y1)
+
+        cx, cy = self.manual_center
+        cx += dx * crop_w / max(1.0, self.manual_zoom)
+        cy += dy * crop_h / max(1.0, self.manual_zoom)
+        self.manual_center = (cx, cy)
+        self.clamp_manual_center()
+
+        self.render_current_pixmap()
 
 def main():
     parser = argparse.ArgumentParser()
