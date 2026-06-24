@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSlider,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QVBoxLayout,
@@ -161,6 +162,37 @@ class Viewer(QMainWindow):
         self.video_label = QLabel("Open a video to begin")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setFixedSize(760, 760)
+
+        self.drawer_visible = False
+        self.drawer_button = QPushButton("⌃", self.video_label)
+        self.drawer_button.setFlat(True)
+        self.drawer_button.setStyleSheet(
+            "QPushButton { font-size: 28px; color: white; "
+            "background: rgba(0, 0, 0, 80); border: none; }"
+        )
+        self.drawer_button.clicked.connect(self.toggle_drawer)
+        self.drawer_button.resize(72, 36)
+        self.drawer_button.hide()
+
+        self.drawer_panel = QFrame(self.video_label)
+        self.drawer_panel.setStyleSheet(
+            "QFrame { background: rgba(0, 0, 0, 130); border: none; }"
+        )
+        self.drawer_panel.hide()
+
+        self.drawer_face_labels = [QLabel("Face 1"), QLabel("Face 2")]
+        for label in self.drawer_face_labels:
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(
+                "QLabel { color: white; background: rgba(255, 255, 255, 30); }"
+            )
+
+        self.drawer_layout = QVBoxLayout()
+        self.drawer_layout.setContentsMargins(8, 8, 8, 8)
+        self.drawer_layout.setSpacing(8)
+        for label in self.drawer_face_labels:
+            self.drawer_layout.addWidget(label)
+        self.drawer_panel.setLayout(self.drawer_layout)
 
         self.open_button = QPushButton("Open…")
         self.open_button.clicked.connect(self.open_video)
@@ -598,6 +630,7 @@ class Viewer(QMainWindow):
                 Qt.SmoothTransformation,
             )
         )
+        self.position_drawer_button(display_w, display_h)
     
     def toggle_orientation(self):
         if self.manual_mode and self.last_visible_center is not None:
@@ -606,6 +639,67 @@ class Viewer(QMainWindow):
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
         self.render_current_pixmap()
+
+    def toggle_drawer(self):
+        self.drawer_visible = not self.drawer_visible
+        self.position_drawer_button_for_current_orientation()
+
+    def position_drawer_button_for_current_orientation(self):
+        if self.current_pixmap is None:
+            return
+
+        viewport_w, viewport_h = self.viewport_size()
+        if viewport_w >= viewport_h:
+            display_w = self.phone_display_long_side
+            display_h = round(display_w * viewport_h / viewport_w)
+        else:
+            display_h = self.phone_display_long_side
+            display_w = round(display_h * viewport_w / viewport_h)
+
+        self.position_drawer_button(display_w, display_h)
+
+    def position_drawer_button(self, display_w: int, display_h: int):
+        label_w = self.video_label.width()
+        label_h = self.video_label.height()
+
+        phone_x = (label_w - display_w) // 2
+        phone_y = (label_h - display_h) // 2
+
+        if self.is_portrait:
+            drawer_h = 150
+            self.drawer_panel.setGeometry(
+                phone_x,
+                phone_y + display_h - drawer_h,
+                display_w,
+                drawer_h,
+            )
+            self.drawer_button.setText("⌃" if not self.drawer_visible else "⌄")
+            self.drawer_button.resize(72, 36)
+            self.drawer_button.move(
+                phone_x + (display_w - self.drawer_button.width()) // 2,
+                phone_y + display_h - self.drawer_button.height(),
+            )
+        else:
+            drawer_w = 180
+            self.drawer_panel.setGeometry(
+                phone_x + display_w - drawer_w,
+                phone_y,
+                drawer_w,
+                display_h,
+            )
+            self.drawer_button.setText("‹" if not self.drawer_visible else "›")
+            self.drawer_button.resize(36, 72)
+            self.drawer_button.move(
+                phone_x + display_w - drawer_w - self.drawer_button.width()
+                    if self.drawer_visible
+                    else phone_x + display_w - self.drawer_button.width(),
+                phone_y + (display_h - self.drawer_button.height()) // 2,
+            )
+
+        self.drawer_panel.setVisible(self.drawer_visible)
+        self.drawer_panel.raise_()
+        self.drawer_button.raise_()
+        self.drawer_button.show()
 
     def viewport_size(self) -> tuple[int, int]:
         return (750, 1334) if self.is_portrait else (1334, 750)
