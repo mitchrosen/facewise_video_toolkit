@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from cProfile import label
 import json
 import sys
 from pathlib import Path
@@ -158,6 +159,7 @@ class Viewer(QMainWindow):
         self.last_open_dir = Path.home()
         self._slider_dragging = False
         self.phone_display_long_side = 650
+        self.is_portrait = True
 
         self.video_label = QLabel("Open a video to begin")
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -180,19 +182,17 @@ class Viewer(QMainWindow):
         )
         self.drawer_panel.hide()
 
-        self.drawer_face_labels = [QLabel("Face 1"), QLabel("Face 2")]
+        self.drawer_face_labels = [
+            QLabel("Face 1", self.drawer_panel),
+            QLabel("Face 2", self.drawer_panel),
+        ]
         for label in self.drawer_face_labels:
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet(
                 "QLabel { color: white; background: rgba(255, 255, 255, 30); }"
             )
 
-        self.drawer_layout = QVBoxLayout()
-        self.drawer_layout.setContentsMargins(8, 8, 8, 8)
-        self.drawer_layout.setSpacing(8)
-        for label in self.drawer_face_labels:
-            self.drawer_layout.addWidget(label)
-        self.drawer_panel.setLayout(self.drawer_layout)
+        self.drawer_layout = None
 
         self.open_button = QPushButton("Open…")
         self.open_button.clicked.connect(self.open_video)
@@ -205,7 +205,6 @@ class Viewer(QMainWindow):
         self.start_button = QPushButton("|<<")
         self.start_button.clicked.connect(self.go_to_start)
 
-        self.is_portrait = True
         self.orientation_button = QPushButton("Landscape ▭")
         self.orientation_button.clicked.connect(self.toggle_orientation)
 
@@ -320,6 +319,10 @@ class Viewer(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.render_current_pixmap()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_drawer_faces()
 
     def set_controls_enabled(self, enabled: bool):
         self.start_button.setEnabled(enabled)
@@ -463,6 +466,7 @@ class Viewer(QMainWindow):
         qimg = QImage(img.data, w, h, ch * w, QImage.Format_RGB888).copy()
         self.current_pixmap = QPixmap.fromImage(qimg)
         self.render_current_pixmap()
+        self.update_drawer_faces()
 
         if not self._slider_dragging:
             self.slider.blockSignals(True)
@@ -631,18 +635,36 @@ class Viewer(QMainWindow):
             )
         )
         self.position_drawer_button(display_w, display_h)
+        self.update_drawer_faces()
     
     def toggle_orientation(self):
+        """
+        Switch the orientation of the viewer between portrait and landscape.
+
+        Maintain, where possible, the center of the currently visible source region
+        to be the center of the switched-to orientation when toggling.
+
+        Boundary corrections may cause the displayed center to shift.
+        """
         if self.manual_mode and self.last_visible_center is not None:
             self.manual_center = self.last_visible_center
 
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
         self.render_current_pixmap()
+        self.update_drawer_faces()
 
     def toggle_drawer(self):
         self.drawer_visible = not self.drawer_visible
         self.position_drawer_button_for_current_orientation()
+        self.update_drawer_faces()
+
+    def rebuild_drawer_layout(self):
+        # Drawer preview labels are explicitly positioned in
+        # position_drawer_button(). A Qt layout here can leave both labels at
+        # (0, 0) during rapid orientation/frame updates, causing thumbnails to
+        # render on top of each other.
+        return
 
     def position_drawer_button_for_current_orientation(self):
         if self.current_pixmap is None:
@@ -679,6 +701,18 @@ class Viewer(QMainWindow):
                 phone_x + (display_w - self.drawer_button.width()) // 2,
                 phone_y + display_h - self.drawer_button.height(),
             )
+
+            margin = 8
+            spacing = 8
+            label_w = max(1, (display_w - 2 * margin - spacing) // 2)
+            label_h = max(1, drawer_h - 2 * margin)
+            for idx, label in enumerate(self.drawer_face_labels):
+                label.setGeometry(
+                    margin + idx * (label_w + spacing),
+                    margin,
+                    label_w,
+                    label_h,
+                )
         else:
             drawer_w = 180
             self.drawer_panel.setGeometry(
@@ -690,16 +724,30 @@ class Viewer(QMainWindow):
             self.drawer_button.setText("‹" if not self.drawer_visible else "›")
             self.drawer_button.resize(36, 72)
             self.drawer_button.move(
-                phone_x + display_w - drawer_w - self.drawer_button.width()
-                    if self.drawer_visible
-                    else phone_x + display_w - self.drawer_button.width(),
+                phone_x + display_w - self.drawer_button.width(),
                 phone_y + (display_h - self.drawer_button.height()) // 2,
             )
+
+            margin = 8
+            spacing = 8
+            label_w = max(1, drawer_w - 2 * margin)
+            label_h = max(1, (display_h - 2 * margin - spacing) // 2)
+            for idx, label in enumerate(self.drawer_face_labels):
+                label.setGeometry(
+                    margin,
+                    margin + idx * (label_h + spacing),
+                    label_w,
+                    label_h,
+                )
+
+        for label in self.drawer_face_labels:
+            label.setFixedSize(label_w, label_h)
 
         self.drawer_panel.setVisible(self.drawer_visible)
         self.drawer_panel.raise_()
         self.drawer_button.raise_()
         self.drawer_button.show()
+        self.update_drawer_faces()
 
     def viewport_size(self) -> tuple[int, int]:
         return (750, 1334) if self.is_portrait else (1334, 750)
@@ -781,6 +829,92 @@ class Viewer(QMainWindow):
                 float(face["bbox"][3]) - float(face["bbox"][1])
             ),
         )
+    
+    def largest_faces_for_current_frame(self, limit: int = 2) -> list[dict]:
+        """
+        Return up to `limit` faces for the current frame, sorted by
+        descending face area.
+
+        The returned list may contain fewer than `limit` faces when there are fewer
+        faces for this framethan the limit.
+        """
+        if self.face_index is None:
+            return []
+
+        faces = self.face_index.faces_at(self.displayed_frame_idx)
+        return sorted(
+            faces,
+            key=lambda face: (
+                float(face["bbox"][2]) - float(face["bbox"][0])
+            )
+            * (
+                float(face["bbox"][3]) - float(face["bbox"][1])
+            ),
+            reverse=True,
+        )[:limit]
+
+    def update_drawer_faces(self):
+        """
+        Populate drawer preview widgets with the largest currently
+        visible faces, up to a maximum of two.
+
+        Face crops intentionally include substantial padding around
+        the detected face rectangle so previews appear as head-and-
+        shoulders views rather than tightly cropped facial features.
+        """
+        if self.current_pixmap is None:
+            return
+
+        faces = self.largest_faces_for_current_frame(limit=2)
+
+        for idx, label in enumerate(self.drawer_face_labels):
+            if idx >= len(faces):
+                label.clear()
+                label.hide()
+                continue
+
+            face = faces[idx]
+            x1, y1, x2, y2 = face["bbox"]
+
+            face_w = max(1.0, float(x2) - float(x1))
+            face_h = max(1.0, float(y2) - float(y1))
+
+            pad_x = face_w * 0.75
+            pad_y = face_h * 0.75
+
+            crop_x1 = max(0, int(float(x1) - pad_x))
+            crop_y1 = max(0, int(float(y1) - pad_y))
+            crop_x2 = min(
+                self.current_pixmap.width(),
+                int(float(x2) + pad_x),
+            )
+            crop_y2 = min(
+                self.current_pixmap.height(),
+                int(float(y2) + pad_y),
+            )
+
+            crop_w = max(1, crop_x2 - crop_x1)
+            crop_h = max(1, crop_y2 - crop_y1)
+
+            face_pix = self.current_pixmap.copy(
+                crop_x1,
+                crop_y1,
+                crop_w,
+                crop_h,
+            )
+
+            label.show()
+            label.setPixmap(
+                face_pix.scaled(
+                    max(1, label.width()),
+                    max(1, label.height()),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+
+            for label in self.drawer_face_labels:
+                label.setAlignment(Qt.AlignCenter)
 
     def zoom_in(self):
         self.enter_manual_mode()
