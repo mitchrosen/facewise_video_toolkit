@@ -502,8 +502,8 @@ class Viewer(QMainWindow):
 
         crop = None
 
-        if self.manual_mode and self.manual_crop is not None:
-            crop = self.manual_crop
+        if self.manual_mode:
+            crop = self.manual_source_crop()
         elif target_face is not None:
             crop = self.crop_for_face(target_face, self.viewport_aspect())
 
@@ -537,82 +537,88 @@ class Viewer(QMainWindow):
             painter.end()
         else:
             crop_x1, crop_y1, crop_x2, crop_y2 = crop
-
-            source_w = src.width()
-            source_h = src.height()
-
-            base_crop_w = max(1.0, crop_x2 - crop_x1)
-            base_crop_h = max(1.0, crop_y2 - crop_y1)
-
-            if self.manual_mode and self.manual_center is not None:
-                crop_center_x, crop_center_y = self.manual_center
+        
+            if self.manual_mode:
+                self.paint_virtual_source_crop(src, canvas, crop)
+                self.last_visible_center = self.crop_center(crop)
+                crop = None
             else:
-                crop_center_x = (crop_x1 + crop_x2) / 2.0
-                crop_center_y = (crop_y1 + crop_y2) / 2.0
 
-            effective_crop_w = base_crop_w / manual_zoom
-            effective_crop_h = base_crop_h / manual_zoom
+                source_w = src.width()
+                source_h = src.height()
 
-            effective_aspect = effective_crop_w / effective_crop_h
-            viewport_aspect = self.viewport_aspect()
-            if effective_aspect < viewport_aspect:
-                effective_crop_w = effective_crop_h * viewport_aspect
-            else:
-                effective_crop_h = effective_crop_w / viewport_aspect
+                base_crop_w = max(1.0, crop_x2 - crop_x1)
+                base_crop_h = max(1.0, crop_y2 - crop_y1)
 
-            crop_x1 = crop_center_x - effective_crop_w / 2.0
-            crop_y1 = crop_center_y - effective_crop_h / 2.0
-            crop_x2 = crop_center_x + effective_crop_w / 2.0
-            crop_y2 = crop_center_y + effective_crop_h / 2.0
+                if self.manual_mode and self.manual_center is not None:
+                    crop_center_x, crop_center_y = self.manual_center
+                else:
+                    crop_center_x = (crop_x1 + crop_x2) / 2.0
+                    crop_center_y = (crop_y1 + crop_y2) / 2.0
 
-            if crop_x1 < 0.0:
-                crop_x2 -= crop_x1
-                crop_x1 = 0.0
-            if crop_y1 < 0.0:
-                crop_y2 -= crop_y1
-                crop_y1 = 0.0
-            if crop_x2 > float(source_w):
-                shift = crop_x2 - float(source_w)
-                crop_x1 -= shift
-                crop_x2 = float(source_w)
-            if crop_y2 > float(source_h):
-                shift = crop_y2 - float(source_h)
-                crop_y1 -= shift
-                crop_y2 = float(source_h)
+                effective_crop_w = base_crop_w / manual_zoom
+                effective_crop_h = base_crop_h / manual_zoom
 
-            crop_x1 = max(0.0, crop_x1)
-            crop_y1 = max(0.0, crop_y1)
-            crop_x2 = min(float(source_w), crop_x2)
-            crop_y2 = min(float(source_h), crop_y2)
+                effective_aspect = effective_crop_w / effective_crop_h
+                viewport_aspect = self.viewport_aspect()
+                if effective_aspect < viewport_aspect:
+                    effective_crop_w = effective_crop_h * viewport_aspect
+                else:
+                    effective_crop_h = effective_crop_w / viewport_aspect
 
-            self.last_visible_center = (
-                (crop_x1 + crop_x2) / 2.0,
-                (crop_y1 + crop_y2) / 2.0,
-            )
+                crop_x1 = crop_center_x - effective_crop_w / 2.0
+                crop_y1 = crop_center_y - effective_crop_h / 2.0
+                crop_x2 = crop_center_x + effective_crop_w / 2.0
+                crop_y2 = crop_center_y + effective_crop_h / 2.0
 
-            crop_w = max(1, int(crop_x2 - crop_x1))
-            crop_h = max(1, int(crop_y2 - crop_y1))
+                if crop_x1 < 0.0:
+                    crop_x2 -= crop_x1
+                    crop_x1 = 0.0
+                if crop_y1 < 0.0:
+                    crop_y2 -= crop_y1
+                    crop_y1 = 0.0
+                if crop_x2 > float(source_w):
+                    shift = crop_x2 - float(source_w)
+                    crop_x1 -= shift
+                    crop_x2 = float(source_w)
+                if crop_y2 > float(source_h):
+                    shift = crop_y2 - float(source_h)
+                    crop_y1 -= shift
+                    crop_y2 = float(source_h)
 
-            cropped = src.copy(
-                int(crop_x1),
-                int(crop_y1),
-                crop_w,
-                crop_h,
-            )
+                crop_x1 = max(0.0, crop_x1)
+                crop_y1 = max(0.0, crop_y1)
+                crop_x2 = min(float(source_w), crop_x2)
+                crop_y2 = min(float(source_h), crop_y2)
 
-            scaled = cropped.scaled(
-                viewport_w,
-                viewport_h,
-                Qt.KeepAspectRatioByExpanding,
-                Qt.SmoothTransformation,
-            )
+                self.last_visible_center = (
+                    (crop_x1 + crop_x2) / 2.0,
+                    (crop_y1 + crop_y2) / 2.0,
+                )
 
-            draw_x = (viewport_w - scaled.width()) // 2
-            draw_y = (viewport_h - scaled.height()) // 2
+                crop_w = max(1, int(crop_x2 - crop_x1))
+                crop_h = max(1, int(crop_y2 - crop_y1))
 
-            painter = QPainter(canvas)
-            painter.drawPixmap(draw_x, draw_y, scaled)
-            painter.end()
+                cropped = src.copy(
+                    int(crop_x1),
+                    int(crop_y1),
+                    crop_w,
+                    crop_h,
+                )
+
+                scaled = cropped.scaled(
+                    viewport_w,
+                    viewport_h,
+                    Qt.KeepAspectRatioByExpanding,
+                    Qt.SmoothTransformation,
+                )
+
+                draw_x = (viewport_w - scaled.width()) // 2
+                draw_y = (viewport_h - scaled.height()) // 2
+
+                painter = QPainter(canvas)
+                painter.drawPixmap(draw_x, draw_y, scaled)
+                painter.end()
 
         display_long_side = self.phone_display_long_side
 
@@ -935,64 +941,154 @@ class Viewer(QMainWindow):
 
     def zoom_out(self):
         self.enter_manual_mode()
-        self.manual_zoom = max(self.minimum_manual_zoom(), self.manual_zoom / 1.15)
+        self.manual_zoom = max(1.0, self.manual_zoom / 1.15)
         self.clamp_manual_center()
         self.render_current_pixmap()
 
     def enter_manual_mode(self):
-        
-        if self.manual_crop is None:
-            if self.auto_framing:
-                face = self.auto_frame()
-                if face is not None:
-                    self.manual_crop = self.crop_for_face(face, self.viewport_aspect())
+        """
+        Enter manual framing while preserving the current visual framing.
 
-        if self.manual_crop is not None and self.manual_center is None:
-            x1, y1, x2, y2 = self.manual_crop
-            self.manual_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        Manual zoom is measured relative to Fit Video:
+
+            1.0  == Fit Video
+            >1.0 == zoomed in from Fit Video
+
+        When entering manual mode from Auto Frame, convert the current
+        auto-face crop into a source-image center and a Fit-relative zoom.
+        This allows later Zoom - operations to return all the way to Fit
+        Video instead of stopping at the original Auto Frame crop.
+        """
+        if self.manual_mode:
+            return
+
+        if self.current_pixmap is None:
+            return
+
+        if self.auto_framing:
+            face = self.auto_frame()
+            if face is not None:
+                crop = self.normalized_source_crop(
+                    self.crop_for_face(face, self.viewport_aspect())
+                )
+                self.manual_center = self.crop_center(crop)
+                self.manual_zoom = self.zoom_for_source_crop(crop)
+            else:
+                self.manual_center = self.current_source_center()
+                self.manual_zoom = 1.0
+        elif self.manual_center is None:
+            self.manual_center = self.current_source_center()
+            self.manual_zoom = 1.0
 
         self.manual_mode = True
+        self.manual_crop = None
         self.framing_button.setText("Fit Video")
 
     def minimum_manual_zoom(self) -> float:
-        if self.manual_crop is None or self.current_pixmap is None:
-            return 1.0
+        return 1.0
 
-        crop_x1, crop_y1, crop_x2, crop_y2 = self.manual_crop
-        crop_w = max(1.0, crop_x2 - crop_x1)
-        crop_h = max(1.0, crop_y2 - crop_y1)
+    def fit_source_size(self) -> tuple[float, float]:
+        """
+        Return the virtual source crop size corresponding to Fit Video.
 
-        source_w = max(1.0, float(self.current_pixmap.width()))
-        source_h = max(1.0, float(self.current_pixmap.height()))
-
+        The crop may be larger than the actual source image in one dimension.
+        That represents letterboxing/pillarboxing with black padding.
+        """
+        source_w = float(self.current_pixmap.width())
+        source_h = float(self.current_pixmap.height())
         viewport_aspect = self.viewport_aspect()
-        fit_crop_w = source_w
-        fit_crop_h = source_w / viewport_aspect
+        source_aspect = source_w / source_h
 
-        if fit_crop_h > source_h:
-            fit_crop_h = source_h
-            fit_crop_w = source_h * viewport_aspect
+        if source_aspect > viewport_aspect:
+            fit_w = source_w
+            fit_h = source_w / viewport_aspect
+        else:
+            fit_h = source_h
+            fit_w = source_h * viewport_aspect
 
-        return min(crop_w / fit_crop_w, crop_h / fit_crop_h)
+        return fit_w, fit_h
+
+    def current_source_center(self) -> tuple[float, float]:
+        if self.last_visible_center is not None:
+            return self.last_visible_center
+
+        return (
+            float(self.current_pixmap.width()) / 2.0,
+            float(self.current_pixmap.height()) / 2.0,
+        )
+
+    def crop_center(self, crop) -> tuple[float, float]:
+        x1, y1, x2, y2 = crop
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    def zoom_for_source_crop(self, crop) -> float:
+        fit_w, fit_h = self.fit_source_size()
+        crop_w = max(1.0, crop[2] - crop[0])
+        crop_h = max(1.0, crop[3] - crop[1])
+        return max(1.0, min(fit_w / crop_w, fit_h / crop_h))
+
+    def manual_source_crop(self):
+        fit_w, fit_h = self.fit_source_size()
+        visible_w = fit_w / max(1.0, self.manual_zoom)
+        visible_h = fit_h / max(1.0, self.manual_zoom)
+
+        if self.manual_center is None:
+            self.manual_center = self.current_source_center()
+
+        cx, cy = self.manual_center
+        return self.normalized_source_crop(
+            (
+                cx - visible_w / 2.0,
+                cy - visible_h / 2.0,
+                cx + visible_w / 2.0,
+                cy + visible_h / 2.0,
+            )
+        )
+
+    def normalized_source_crop(self, crop):
+        """
+        Clamp a virtual source crop center without forcing the crop itself
+        inside the image.
+
+        Crops larger than the image are valid: they render as black padding.
+        """
+        x1, y1, x2, y2 = crop
+        source_w = float(self.current_pixmap.width())
+        source_h = float(self.current_pixmap.height())
+
+        crop_w = max(1.0, x2 - x1)
+        crop_h = max(1.0, y2 - y1)
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        if crop_w >= source_w:
+            cx = source_w / 2.0
+        else:
+            cx = max(crop_w / 2.0, min(source_w - crop_w / 2.0, cx))
+
+        if crop_h >= source_h:
+            cy = source_h / 2.0
+        else:
+            cy = max(crop_h / 2.0, min(source_h - crop_h / 2.0, cy))
+
+        return (
+            cx - crop_w / 2.0,
+            cy - crop_h / 2.0,
+            cx + crop_w / 2.0,
+            cy + crop_h / 2.0,
+        )
     
     def clamp_manual_center(self):
         if self.current_pixmap is None:
             return
 
-        if self.manual_crop is None:
-            self.manual_pan_x = max(-0.5, min(0.5, self.manual_pan_x))
-            self.manual_pan_y = max(-0.5, min(0.5, self.manual_pan_y))
-            return
-
         if self.manual_center is None:
             return
 
-        x1, y1, x2, y2 = self.manual_crop
-        crop_w = max(1.0, x2 - x1)
-        crop_h = max(1.0, y2 - y1)
-
-        visible_w = crop_w / max(0.001, self.manual_zoom)
-        visible_h = crop_h / max(0.001, self.manual_zoom)
+        fit_w, fit_h = self.fit_source_size()
+        visible_w = fit_w / max(1.0, self.manual_zoom)
+        visible_h = fit_h / max(1.0, self.manual_zoom)
 
         source_w = float(self.current_pixmap.width())
         source_h = float(self.current_pixmap.height())
@@ -1014,24 +1110,19 @@ class Viewer(QMainWindow):
     def pan(self, dx: float, dy: float):
         if not self.auto_framing and not self.manual_mode:
             return
+        
         self.enter_manual_mode()
-        if self.manual_crop is None:
-            self.manual_pan_x += dx
-            self.manual_pan_y += dy
-            self.clamp_manual_center()
-            self.render_current_pixmap()
-            return
 
         if self.manual_center is None:
             return
 
-        x1, y1, x2, y2 = self.manual_crop
-        crop_w = max(1.0, x2 - x1)
-        crop_h = max(1.0, y2 - y1)
+        fit_w, fit_h = self.fit_source_size()
+        visible_w = fit_w / max(1.0, self.manual_zoom)
+        visible_h = fit_h / max(1.0, self.manual_zoom)
 
         cx, cy = self.manual_center
-        cx += dx * crop_w / max(1.0, self.manual_zoom)
-        cy += dy * crop_h / max(1.0, self.manual_zoom)
+        cx += dx * visible_w
+        cy += dy * visible_h
         self.manual_center = (cx, cy)
         self.clamp_manual_center()
 
@@ -1040,13 +1131,46 @@ class Viewer(QMainWindow):
     def select_drawer_face(self, face):
         self.auto_framing = False
         self.reset_manual_mode()
-        self.manual_crop = self.crop_for_face(face, self.viewport_aspect())
-
-        x1, y1, x2, y2 = self.manual_crop
-        self.manual_center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        crop = self.normalized_source_crop(
+            self.crop_for_face(face, self.viewport_aspect())
+        )
+        self.manual_center = self.crop_center(crop)
+        self.manual_zoom = self.zoom_for_source_crop(crop)
+        self.manual_crop = None
         self.manual_mode = True
         self.framing_button.setText("Fit Video")
         self.render_current_pixmap()
+
+    def paint_virtual_source_crop(self, src, canvas, crop):
+        crop_x1, crop_y1, crop_x2, crop_y2 = crop
+        crop_w = max(1.0, crop_x2 - crop_x1)
+        crop_h = max(1.0, crop_y2 - crop_y1)
+
+        ix1 = max(0.0, crop_x1)
+        iy1 = max(0.0, crop_y1)
+        ix2 = min(float(src.width()), crop_x2)
+        iy2 = min(float(src.height()), crop_y2)
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            return
+
+        scale = min(canvas.width() / crop_w, canvas.height() / crop_h)
+        draw_w = crop_w * scale
+        draw_h = crop_h * scale
+        ox = (canvas.width() - draw_w) / 2.0
+        oy = (canvas.height() - draw_h) / 2.0
+
+        piece = src.copy(int(ix1), int(iy1), int(ix2 - ix1), int(iy2 - iy1))
+
+        painter = QPainter(canvas)
+        painter.drawPixmap(
+            int(ox + (ix1 - crop_x1) * scale),
+            int(oy + (iy1 - crop_y1) * scale),
+            int((ix2 - ix1) * scale),
+            int((iy2 - iy1) * scale),
+            piece,
+        )
+        painter.end()
 
 def main():
     parser = argparse.ArgumentParser()
