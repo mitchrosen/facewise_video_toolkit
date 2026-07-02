@@ -231,9 +231,12 @@ class Viewer(QMainWindow):
         self.slider.sliderPressed.connect(self.begin_slider_drag)
         self.slider.sliderReleased.connect(self.end_slider_drag)
 
-        self.auto_framing = False
-        self.framing_button = QPushButton("Auto Framing")
-        self.framing_button.clicked.connect(self.toggle_framing)
+        self.auto_framing = True
+        self.auto_frame_button = QPushButton("Auto Frame")
+        self.auto_frame_button.clicked.connect(self.set_auto_frame_mode)
+
+        self.fit_video_button = QPushButton("Fit Video")
+        self.fit_video_button.clicked.connect(self.set_fit_video_mode)
 
         self.show_boxes = True
         self.boxes_button = QPushButton("Hide Boxes")
@@ -270,6 +273,7 @@ class Viewer(QMainWindow):
         self.manual_zoom = 1.0
         self.manual_crop: tuple[float, float, float, float] | None = None
         self.manual_center: tuple[float, float] | None = None
+        self.manual_base_crop_size: tuple[float, float] | None = None
         self.last_visible_center: tuple[float, float] | None = None
         self.manual_pan_x = 0.0
         self.manual_pan_y = 0.0
@@ -290,7 +294,8 @@ class Viewer(QMainWindow):
         framing_controls = QHBoxLayout()
         framing_controls.addStretch(1)
         framing_controls.addWidget(self.orientation_button)
-        framing_controls.addWidget(self.framing_button)
+        framing_controls.addWidget(self.auto_frame_button)
+        framing_controls.addWidget(self.fit_video_button)
         framing_controls.addWidget(self.boxes_button)
         framing_controls.addWidget(self.zoom_out_button)
         framing_controls.addWidget(self.zoom_in_button)
@@ -311,6 +316,7 @@ class Viewer(QMainWindow):
 
         self.setWindowTitle("Facewise Demo Viewer")
         self.set_controls_enabled(False)
+        self.update_framing_buttons()
 
         if video_path is not None:
             self.load_video(video_path)
@@ -368,6 +374,9 @@ class Viewer(QMainWindow):
         self.reader = VideoReader(path)
         self.last_open_dir = path.parent
         self.current_pixmap = None
+        self.auto_framing = True
+        self.reset_manual_mode()
+        self.update_framing_buttons()
 
         self.timer.setInterval(max(1, int(1000 / self.reader.fps)))
         self.slider.setMaximum(max(0, self.reader.frame_count - 1))
@@ -392,6 +401,9 @@ class Viewer(QMainWindow):
         self.json_path = path
         self.facewise_json = json.loads(path.read_text())
         self.face_index = FacewiseJsonIndex(self.facewise_json)
+        self.auto_framing = True
+        self.reset_manual_mode()
+        self.update_framing_buttons()
 
         title = self.windowTitle()
         self.setWindowTitle(f"{title} — JSON: {path.name}")
@@ -496,129 +508,9 @@ class Viewer(QMainWindow):
                 painter.drawText(int(x1), max(12, int(y1) - 6), label)
         painter.end()
 
-        target_face = self.auto_frame() if self.auto_framing and not self.manual_mode else None
-
-        manual_zoom = self.manual_zoom if self.manual_mode else 1.0
-
-        crop = None
-
-        if self.manual_mode:
-            crop = self.manual_source_crop()
-        elif target_face is not None:
-            crop = self.crop_for_face(target_face, self.viewport_aspect())
-
-        if crop is None:
-            scaled = src.scaled(
-                viewport_w,
-                viewport_h,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-
-            if manual_zoom != 1.0:
-                scaled = scaled.scaled(
-                    int(scaled.width() * manual_zoom),
-                    int(scaled.height() * manual_zoom),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation,
-                )
-
-            x = (viewport_w - scaled.width()) // 2
-            y = (viewport_h - scaled.height()) // 2
-
-            if self.manual_mode and manual_zoom != 1.0:
-                overflow_x = max(0, scaled.width() - viewport_w)
-                overflow_y = max(0, scaled.height() - viewport_h)
-                x -= int(self.manual_pan_x * overflow_x)
-                y -= int(self.manual_pan_y * overflow_y)
-
-            painter = QPainter(canvas)
-            painter.drawPixmap(x, y, scaled)
-            painter.end()
-        else:
-            crop_x1, crop_y1, crop_x2, crop_y2 = crop
-        
-            if self.manual_mode:
-                self.paint_virtual_source_crop(src, canvas, crop)
-                self.last_visible_center = self.crop_center(crop)
-                crop = None
-            else:
-
-                source_w = src.width()
-                source_h = src.height()
-
-                base_crop_w = max(1.0, crop_x2 - crop_x1)
-                base_crop_h = max(1.0, crop_y2 - crop_y1)
-
-                if self.manual_mode and self.manual_center is not None:
-                    crop_center_x, crop_center_y = self.manual_center
-                else:
-                    crop_center_x = (crop_x1 + crop_x2) / 2.0
-                    crop_center_y = (crop_y1 + crop_y2) / 2.0
-
-                effective_crop_w = base_crop_w / manual_zoom
-                effective_crop_h = base_crop_h / manual_zoom
-
-                effective_aspect = effective_crop_w / effective_crop_h
-                viewport_aspect = self.viewport_aspect()
-                if effective_aspect < viewport_aspect:
-                    effective_crop_w = effective_crop_h * viewport_aspect
-                else:
-                    effective_crop_h = effective_crop_w / viewport_aspect
-
-                crop_x1 = crop_center_x - effective_crop_w / 2.0
-                crop_y1 = crop_center_y - effective_crop_h / 2.0
-                crop_x2 = crop_center_x + effective_crop_w / 2.0
-                crop_y2 = crop_center_y + effective_crop_h / 2.0
-
-                if crop_x1 < 0.0:
-                    crop_x2 -= crop_x1
-                    crop_x1 = 0.0
-                if crop_y1 < 0.0:
-                    crop_y2 -= crop_y1
-                    crop_y1 = 0.0
-                if crop_x2 > float(source_w):
-                    shift = crop_x2 - float(source_w)
-                    crop_x1 -= shift
-                    crop_x2 = float(source_w)
-                if crop_y2 > float(source_h):
-                    shift = crop_y2 - float(source_h)
-                    crop_y1 -= shift
-                    crop_y2 = float(source_h)
-
-                crop_x1 = max(0.0, crop_x1)
-                crop_y1 = max(0.0, crop_y1)
-                crop_x2 = min(float(source_w), crop_x2)
-                crop_y2 = min(float(source_h), crop_y2)
-
-                self.last_visible_center = (
-                    (crop_x1 + crop_x2) / 2.0,
-                    (crop_y1 + crop_y2) / 2.0,
-                )
-
-                crop_w = max(1, int(crop_x2 - crop_x1))
-                crop_h = max(1, int(crop_y2 - crop_y1))
-
-                cropped = src.copy(
-                    int(crop_x1),
-                    int(crop_y1),
-                    crop_w,
-                    crop_h,
-                )
-
-                scaled = cropped.scaled(
-                    viewport_w,
-                    viewport_h,
-                    Qt.KeepAspectRatioByExpanding,
-                    Qt.SmoothTransformation,
-                )
-
-                draw_x = (viewport_w - scaled.width()) // 2
-                draw_y = (viewport_h - scaled.height()) // 2
-
-                painter = QPainter(canvas)
-                painter.drawPixmap(draw_x, draw_y, scaled)
-                painter.end()
+        crop = self.current_source_crop()
+        self.paint_source_crop(src, canvas, crop)
+        self.last_visible_center = self.crop_center(crop)
 
         display_long_side = self.phone_display_long_side
 
@@ -764,28 +656,40 @@ class Viewer(QMainWindow):
         self.boxes_button.setText("Hide Boxes" if self.show_boxes else "Show Boxes")
         self.render_current_pixmap()
 
-    def toggle_framing(self):
-        """
-        Toggle between Fit Video mode and Auto Frame mode.
-
-        Auto Frame follows the largest detected face when one is available.
-        If the current frame has no detected face, rendering temporarily
-        falls back to Fit Video while remaining in Auto Frame mode. When
-        faces reappear, Auto Frame resumes automatically.
-
-        Leaving Auto Frame, or leaving manual face-selection mode, returns
-        the viewer to Fit Video and clears manual crop, zoom, and pan state.
-        """
-        if self.auto_framing or self.manual_mode:
-            self.auto_framing = False
-            self.reset_manual_mode()
-            self.framing_button.setText("Auto Frame")
-        else:
-            self.auto_framing = True
-            self.reset_manual_mode()
-            self.framing_button.setText("Fit Video")
-
+    def set_auto_frame_mode(self):
+        self.auto_framing = True
+        self.reset_manual_mode()
+        self.update_framing_buttons()
         self.render_current_pixmap()
+
+    def set_fit_video_mode(self):
+        self.auto_framing = False
+        self.reset_manual_mode()
+        self.update_framing_buttons()
+        self.render_current_pixmap()
+
+    def update_framing_buttons(self):
+        """
+        Keep Auto Frame and Fit Video as independent actions.
+
+        Pure Fit Video:
+            Auto Frame enabled, Fit Video disabled.
+
+        Pure Auto Frame:
+            Auto Frame disabled, Fit Video enabled.
+
+        Manual zoom/pan/face-selection:
+            both buttons enabled.
+        """
+        if self.manual_mode:
+            self.auto_frame_button.setEnabled(True)
+            self.fit_video_button.setEnabled(True)
+        elif self.auto_framing:
+            self.auto_frame_button.setEnabled(False)
+            self.fit_video_button.setEnabled(True)
+        else:
+            self.auto_frame_button.setEnabled(True)
+            self.fit_video_button.setEnabled(False)
 
     def reset_manual_mode(self):
         self.manual_mode = False
@@ -794,6 +698,7 @@ class Viewer(QMainWindow):
         self.manual_pan_y = 0.0
         self.manual_crop = None
         self.manual_center = None
+        self.manual_base_crop_size = None
 
     def crop_for_face(
         self,
@@ -973,16 +878,19 @@ class Viewer(QMainWindow):
                 )
                 self.manual_center = self.crop_center(crop)
                 self.manual_zoom = self.zoom_for_source_crop(crop)
+                self.manual_base_crop_size = self.fit_source_size()
             else:
                 self.manual_center = self.current_source_center()
                 self.manual_zoom = 1.0
         elif self.manual_center is None:
             self.manual_center = self.current_source_center()
             self.manual_zoom = 1.0
+            fit_w, fit_h = self.fit_source_size()
+            self.manual_base_crop_size = (fit_w, fit_h)
 
         self.manual_mode = True
         self.manual_crop = None
-        self.framing_button.setText("Fit Video")
+        self.update_framing_buttons()
 
     def minimum_manual_zoom(self) -> float:
         return 1.0
@@ -1008,6 +916,38 @@ class Viewer(QMainWindow):
 
         return fit_w, fit_h
 
+    def fit_source_crop(self):
+        """
+        Return the virtual source crop corresponding to Fit Video.
+        The crop may extend beyond the image, producing black bars.
+        """
+        fit_w, fit_h = self.fit_source_size()
+        source_w = float(self.current_pixmap.width())
+        source_h = float(self.current_pixmap.height())
+
+        cx = source_w / 2.0
+        cy = source_h / 2.0
+
+        return (
+            cx - fit_w / 2.0,
+            cy - fit_h / 2.0,
+            cx + fit_w / 2.0,
+            cy + fit_h / 2.0,
+        )
+    
+    def current_source_crop(self):
+        if self.manual_mode:
+            return self.manual_source_crop()
+
+        if self.auto_framing:
+            face = self.auto_frame()
+            if face is not None:
+                return self.normalized_source_crop(
+                    self.crop_for_face(face, self.viewport_aspect())
+                )
+
+        return self.fit_source_crop()
+
     def current_source_center(self) -> tuple[float, float]:
         if self.last_visible_center is not None:
             return self.last_visible_center
@@ -1028,9 +968,12 @@ class Viewer(QMainWindow):
         return max(1.0, min(fit_w / crop_w, fit_h / crop_h))
 
     def manual_source_crop(self):
-        fit_w, fit_h = self.fit_source_size()
-        visible_w = fit_w / max(1.0, self.manual_zoom)
-        visible_h = fit_h / max(1.0, self.manual_zoom)
+        if self.manual_base_crop_size is None:
+            self.manual_base_crop_size = self.fit_source_size()
+
+        base_w, base_h = self.manual_base_crop_size
+        visible_w = base_w / max(1.0, self.manual_zoom)
+        visible_h = base_h / max(1.0, self.manual_zoom)
 
         if self.manual_center is None:
             self.manual_center = self.current_source_center()
@@ -1136,12 +1079,13 @@ class Viewer(QMainWindow):
         )
         self.manual_center = self.crop_center(crop)
         self.manual_zoom = self.zoom_for_source_crop(crop)
+        self.manual_base_crop_size = self.fit_source_size()
         self.manual_crop = None
         self.manual_mode = True
-        self.framing_button.setText("Fit Video")
+        self.update_framing_buttons()
         self.render_current_pixmap()
 
-    def paint_virtual_source_crop(self, src, canvas, crop):
+    def paint_source_crop(self, src, canvas, crop):
         crop_x1, crop_y1, crop_x2, crop_y2 = crop
         crop_w = max(1.0, crop_x2 - crop_x1)
         crop_h = max(1.0, crop_y2 - crop_y1)
