@@ -238,6 +238,17 @@ class Viewer(QMainWindow):
         self.fit_video_button = QPushButton("Fit Video")
         self.fit_video_button.clicked.connect(self.set_fit_video_mode)
 
+        framing_mode_layout = QVBoxLayout()
+        framing_mode_layout.addWidget(self.auto_frame_button)
+        framing_mode_layout.addWidget(self.fit_video_button)
+
+        framing_mode_frame = QFrame()
+        framing_mode_frame.setFrameShape(QFrame.StyledPanel)
+        framing_mode_frame.setLayout(framing_mode_layout)
+        framing_mode_frame.setStyleSheet(
+            "QFrame { border: 1px solid gray; border-radius: 4px; padding: 4px; }"
+        )
+
         self.show_boxes = True
         self.boxes_button = QPushButton("Hide Boxes")
         self.boxes_button.clicked.connect(self.toggle_boxes)
@@ -271,7 +282,6 @@ class Viewer(QMainWindow):
 
         self.manual_mode = False
         self.manual_zoom = 1.0
-        self.manual_crop: tuple[float, float, float, float] | None = None
         self.manual_center: tuple[float, float] | None = None
         self.manual_base_crop_size: tuple[float, float] | None = None
         self.last_visible_center: tuple[float, float] | None = None
@@ -294,8 +304,7 @@ class Viewer(QMainWindow):
         framing_controls = QHBoxLayout()
         framing_controls.addStretch(1)
         framing_controls.addWidget(self.orientation_button)
-        framing_controls.addWidget(self.auto_frame_button)
-        framing_controls.addWidget(self.fit_video_button)
+        framing_controls.addWidget(framing_mode_frame)
         framing_controls.addWidget(self.boxes_button)
         framing_controls.addWidget(self.zoom_out_button)
         framing_controls.addWidget(self.zoom_in_button)
@@ -696,7 +705,6 @@ class Viewer(QMainWindow):
         self.manual_zoom = 1.0
         self.manual_pan_x = 0.0
         self.manual_pan_y = 0.0
-        self.manual_crop = None
         self.manual_center = None
         self.manual_base_crop_size = None
 
@@ -876,9 +884,8 @@ class Viewer(QMainWindow):
                 crop = self.normalized_source_crop(
                     self.crop_for_face(face, self.viewport_aspect())
                 )
-                self.manual_center = self.crop_center(crop)
-                self.manual_zoom = self.zoom_for_source_crop(crop)
-                self.manual_base_crop_size = self.fit_source_size()
+                self.begin_manual_from_crop(crop)
+                return
             else:
                 self.manual_center = self.current_source_center()
                 self.manual_zoom = 1.0
@@ -889,7 +896,6 @@ class Viewer(QMainWindow):
             self.manual_base_crop_size = (fit_w, fit_h)
 
         self.manual_mode = True
-        self.manual_crop = None
         self.update_framing_buttons()
 
     def minimum_manual_zoom(self) -> float:
@@ -966,6 +972,16 @@ class Viewer(QMainWindow):
         crop_w = max(1.0, crop[2] - crop[0])
         crop_h = max(1.0, crop[3] - crop[1])
         return max(1.0, min(fit_w / crop_w, fit_h / crop_h))
+    
+    def begin_manual_from_crop(self, crop):
+        """
+        Enter manual mode preserving the supplied source crop.
+        """
+        self.manual_center = self.crop_center(crop)
+        self.manual_zoom = self.zoom_for_source_crop(crop)
+        self.manual_base_crop_size = self.fit_source_size()
+        self.manual_mode = True
+        self.update_framing_buttons()
 
     def manual_source_crop(self):
         if self.manual_base_crop_size is None:
@@ -1077,12 +1093,7 @@ class Viewer(QMainWindow):
         crop = self.normalized_source_crop(
             self.crop_for_face(face, self.viewport_aspect())
         )
-        self.manual_center = self.crop_center(crop)
-        self.manual_zoom = self.zoom_for_source_crop(crop)
-        self.manual_base_crop_size = self.fit_source_size()
-        self.manual_crop = None
-        self.manual_mode = True
-        self.update_framing_buttons()
+        self.begin_manual_from_crop(crop)
         self.render_current_pixmap()
 
     def paint_source_crop(self, src, canvas, crop):
