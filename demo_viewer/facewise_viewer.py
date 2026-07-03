@@ -16,9 +16,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QFrame,
+    QScrollArea,
     QGridLayout,
     QHBoxLayout,
     QVBoxLayout,
+    QBoxLayout,
     QWidget,
 )
 
@@ -249,17 +251,34 @@ class Viewer(QMainWindow):
         )
         self.drawer_panel.hide()
 
-        self.drawer_face_labels = [
-            QLabel("Face 1", self.drawer_panel),
-            QLabel("Face 2", self.drawer_panel),
-        ]
-        for label in self.drawer_face_labels:
-            label.setAlignment(Qt.AlignCenter)
-            label.setStyleSheet(
-                "QLabel { color: white; background: rgba(255, 255, 255, 30); }"
-            )
+        self.drawer_scroll_area = QScrollArea(self.drawer_panel)
+        self.drawer_scroll_area.setWidgetResizable(True)
+        self.drawer_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.drawer_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.drawer_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.drawer_scroll_area.setStyleSheet(
+            """
+            QScrollArea {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: transparent;
+            }
+            """
+        )
 
-        self.drawer_layout = None
+        self.drawer_contents = QWidget()
+        self.drawer_contents.setAttribute(Qt.WA_TranslucentBackground)
+        self.drawer_layout = QBoxLayout(QBoxLayout.LeftToRight)
+        self.drawer_layout.setContentsMargins(8, 8, 8, 8)
+        self.drawer_layout.setSpacing(8)
+        self.drawer_contents.setLayout(self.drawer_layout)
+        self.drawer_scroll_area.setWidget(self.drawer_contents)
+
+        self.drawer_face_labels: list[QLabel] = []
+        self.drawer_thumb_w = 1
+        self.drawer_thumb_h = 1
 
         self.open_button = QPushButton("Open…")
         self.open_button.clicked.connect(self.open_video)
@@ -360,6 +379,7 @@ class Viewer(QMainWindow):
 
         self.face_index: FacewiseJsonIndex | None = None
         self.displayed_frame_idx = 0
+        self.current_shot_number = None
 
         playback_controls = QHBoxLayout()
         playback_controls.addWidget(self.open_button)
@@ -483,6 +503,7 @@ class Viewer(QMainWindow):
         self.json_path = path
         self.facewise_json = json.loads(path.read_text())
         self.face_index = FacewiseJsonIndex(self.facewise_json)
+        self.current_shot_number = None
         self.auto_framing = True
         self.reset_manual_mode()
         self.update_framing_buttons()
@@ -552,6 +573,7 @@ class Viewer(QMainWindow):
 
     def show_frame(self, img):
         self.displayed_frame_idx = max(0, int(self.reader.current_frame_idx) - 1)
+        self.maybe_reset_manual_mode_for_scene_change()
 
         h, w, ch = img.shape
         qimg = QImage(img.data, w, h, ch * w, QImage.Format_RGB888).copy()
@@ -563,6 +585,35 @@ class Viewer(QMainWindow):
             self.slider.blockSignals(True)
             self.slider.setValue(min(self.reader.current_frame_idx - 1, self.slider.maximum()))
             self.slider.blockSignals(False)
+
+    def shot_number_for_frame(self, frame_idx: int):
+        if self.face_index is None:
+            return None
+
+        faces = self.face_index.faces_at(frame_idx)
+        if not faces:
+            return None
+
+        return faces[0].get("shot_number")
+
+    def maybe_reset_manual_mode_for_scene_change(self):
+        shot_number = self.shot_number_for_frame(self.displayed_frame_idx)
+        if shot_number is None:
+            return
+
+        if self.current_shot_number is None:
+            self.current_shot_number = shot_number
+            return
+
+        if shot_number == self.current_shot_number:
+            return
+
+        self.current_shot_number = shot_number
+
+        if self.manual_mode:
+            self.auto_framing = True
+            self.reset_manual_mode()
+            self.update_framing_buttons()
 
         self.frame_label.setText(
             f"Frame: {self.displayed_frame_idx:,} / "
@@ -677,6 +728,7 @@ class Viewer(QMainWindow):
                 display_w,
                 drawer_h,
             )
+            self.drawer_scroll_area.setGeometry(0, 0, display_w, drawer_h)
             self.drawer_button.setText("⌃" if not self.drawer_visible else "⌄")
             self.drawer_button.resize(72, 36)
             self.drawer_button.move(
@@ -684,17 +736,9 @@ class Viewer(QMainWindow):
                 phone_y + display_h - self.drawer_button.height(),
             )
 
-            margin = 8
-            spacing = 8
-            label_w = max(1, (display_w - 2 * margin - spacing) // 2)
-            label_h = max(1, drawer_h - 2 * margin)
-            for idx, label in enumerate(self.drawer_face_labels):
-                label.setGeometry(
-                    margin + idx * (label_w + spacing),
-                    margin,
-                    label_w,
-                    label_h,
-                )
+            self.drawer_layout.setDirection(QBoxLayout.LeftToRight)
+            self.drawer_thumb_w = 120
+            self.drawer_thumb_h = max(1, drawer_h - 24)
         else:
             drawer_w = 180
             self.drawer_panel.setGeometry(
@@ -703,6 +747,7 @@ class Viewer(QMainWindow):
                 drawer_w,
                 display_h,
             )
+            self.drawer_scroll_area.setGeometry(0, 0, drawer_w, display_h)
             self.drawer_button.setText("‹" if not self.drawer_visible else "›")
             self.drawer_button.resize(36, 72)
             self.drawer_button.move(
@@ -710,23 +755,12 @@ class Viewer(QMainWindow):
                 phone_y + (display_h - self.drawer_button.height()) // 2,
             )
 
-            margin = 8
-            spacing = 8
-            label_w = max(1, drawer_w - 2 * margin)
-            label_h = max(1, (display_h - 2 * margin - spacing) // 2)
-            for idx, label in enumerate(self.drawer_face_labels):
-                label.setGeometry(
-                    margin,
-                    margin + idx * (label_h + spacing),
-                    label_w,
-                    label_h,
-                )
-
-        for label in self.drawer_face_labels:
-            label.setFixedSize(label_w, label_h)
-
+            self.drawer_layout.setDirection(QBoxLayout.TopToBottom)
+            self.drawer_thumb_w = max(1, drawer_w - 24)
+            self.drawer_thumb_h = 110
         self.drawer_panel.setVisible(self.drawer_visible)
         self.drawer_panel.raise_()
+        self.drawer_scroll_area.raise_()
         self.drawer_button.raise_()
         self.drawer_button.show()
         self.update_drawer_faces()
@@ -833,13 +867,13 @@ class Viewer(QMainWindow):
             ),
         )
     
-    def largest_faces_for_current_frame(self, limit: int = 2) -> list[dict]:
+    def largest_faces_for_current_frame(self, limit: int | None = 2) -> list[dict]:
         """
-        Return up to `limit` faces for the current frame, sorted by
-        descending face area.
+        Return the faces for the current frame sorted by descending face area.
 
-        The returned list may contain fewer than `limit` faces when there are fewer
-        faces for this framethan the limit.
+        If `limit` is an integer, return at most that many faces.
+
+        If `limit` is None, return all faces. 
         """
         if self.face_index is None:
             return []
@@ -868,18 +902,29 @@ class Viewer(QMainWindow):
         if self.current_pixmap is None:
             return
 
-        faces = self.largest_faces_for_current_frame(limit=2)
+        while self.drawer_layout.count():
+            item = self.drawer_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
-        for idx, label in enumerate(self.drawer_face_labels):
-            if idx >= len(faces):
-                label.clear()
-                label.hide()
-                continue
+        self.drawer_face_labels = []
 
-            face = faces[idx]
+        faces = self.largest_faces_for_current_frame(limit=None)
+
+        for face in faces:
+            label = QLabel(self.drawer_contents)
+            label.setAlignment(Qt.AlignCenter)
+            label.setFixedSize(self.drawer_thumb_w, self.drawer_thumb_h)
+            label.setStyleSheet(
+                "QLabel { color: white; background: rgba(255, 255, 255, 30); }"
+            )
             label.mousePressEvent = (
                 lambda event, selected_face=face: self.select_drawer_face(selected_face)
             )
+            self.drawer_layout.addWidget(label)
+            self.drawer_face_labels.append(label)
+
             x1, y1, x2, y2 = face["bbox"]
 
             face_w = max(1.0, float(x2) - float(x1))
@@ -912,15 +957,14 @@ class Viewer(QMainWindow):
             label.show()
             label.setPixmap(
                 face_pix.scaled(
-                    max(1, label.width()),
-                    max(1, label.height()),
+                    self.drawer_thumb_w,
+                    self.drawer_thumb_h,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation,
                 )
             )
 
-            for label in self.drawer_face_labels:
-                label.setAlignment(Qt.AlignCenter)
+        self.drawer_layout.addStretch(1)
 
     def zoom_in(self):
         self.enter_manual_mode()
