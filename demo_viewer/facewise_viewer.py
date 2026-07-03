@@ -31,36 +31,103 @@ class VideoReader:
         self.frame_count = int(self.stream.frames or 0)
         self.current_frame_idx = 0
         self._iter = self.container.decode(video=0)
+        self._decoder_aligned = True
+        self._cache: dict[int, object] = {}
+        self._cache_order: list[int] = []
+        self._cache_limit = 12
 
     def close(self) -> None:
         self.container.close()
+
+    def _remember_frame(self, frame_idx: int, img) -> None:
+        self._cache[int(frame_idx)] = img
+        if frame_idx in self._cache_order:
+            self._cache_order.remove(frame_idx)
+        self._cache_order.append(frame_idx)
+
+        while len(self._cache_order) > self._cache_limit:
+            old = self._cache_order.pop(0)
+            self._cache.pop(old, None)
+
+    def _cached_frame(self, frame_idx: int):
+        img = self._cache.get(int(frame_idx))
+        if img is None:
+            return None
+
+        if frame_idx in self._cache_order:
+            self._cache_order.remove(frame_idx)
+        self._cache_order.append(frame_idx)
+        return img
+
+    def _frame_index_from_pts(self, frame) -> int | None:
+        if frame.pts is None:
+            return None
+
+        seconds = float(frame.pts * self.stream.time_base)
+        return int(round(seconds * self.fps))
 
     def seek(self, frame_idx: int) -> None:
         frame_idx = max(0, int(frame_idx))
         timestamp = int(frame_idx / self.fps / self.stream.time_base)
         self.container.seek(timestamp, stream=self.stream)
         self._iter = self.container.decode(video=0)
+        self._decoder_aligned = False
         self.current_frame_idx = frame_idx
 
-    def frame_at_exact(self, frame_idx: int):
-        # Reliable, not optimized: reopen and decode forward to exact frame.
-        # Good enough for demo stepping/scrubbing.
+    def frame_at_exact(self, frame_idx: int, *, use_cache: bool = True):
         frame_idx = max(0, int(frame_idx))
-        self.container.close()
-        self.container = av.open(str(self.path))
-        self.stream = self.container.streams.video[0]
+        if self.frame_count:
+            frame_idx = min(frame_idx, self.frame_count - 1)
+
+        if use_cache:
+            cached = self._cached_frame(frame_idx)
+            if cached is not None:
+                self.current_frame_idx = frame_idx + 1
+                self._decoder_aligned = False
+                return cached
+
+        # Seek to the nearest prior keyframe and decode forward.
+        timestamp = int(frame_idx / self.fps / self.stream.time_base)
+        self.container.seek(
+            timestamp,
+            stream=self.stream,
+            backward=True,
+            any_frame=False,
+        )
         self._iter = self.container.decode(video=0)
 
-        img = None
-        for i, frame in enumerate(self._iter):
-            if i == frame_idx:
-                img = frame.to_ndarray(format="rgb24")
-                self.current_frame_idx = frame_idx + 1
-                break
+        decoded_idx = None
+        fallback_idx = max(0, frame_idx - 60)
 
-        return img
+        for offset, frame in enumerate(self._iter):
+            pts_idx = self._frame_index_from_pts(frame)
+            if pts_idx is None:
+                if decoded_idx is None:
+                    decoded_idx = fallback_idx
+                else:
+                    decoded_idx += 1
+            else:
+                decoded_idx = pts_idx
+
+            if decoded_idx < frame_idx:
+                continue
+
+            img = frame.to_ndarray(format="rgb24")
+            self._remember_frame(frame_idx, img)
+            self.current_frame_idx = frame_idx + 1
+            self._decoder_aligned = True
+            return img
+
+        self._decoder_aligned = False
+        return None
 
     def next_frame(self):
+        if self.frame_count and self.current_frame_idx >= self.frame_count:
+            return None
+
+        if not self._decoder_aligned:
+            return self.frame_at_exact(self.current_frame_idx, use_cache=False)
+
         try:
             frame = next(self._iter)
         except StopIteration:
@@ -68,6 +135,7 @@ class VideoReader:
 
         img = frame.to_ndarray(format="rgb24")
         self.current_frame_idx += 1
+        self._remember_frame(self.current_frame_idx - 1, img)
         return img
 
 class FacewiseJsonIndex:
@@ -285,8 +353,6 @@ class Viewer(QMainWindow):
         self.manual_center: tuple[float, float] | None = None
         self.manual_base_crop_size: tuple[float, float] | None = None
         self.last_visible_center: tuple[float, float] | None = None
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
 
         self.face_index: FacewiseJsonIndex | None = None
         self.displayed_frame_idx = 0
@@ -703,8 +769,6 @@ class Viewer(QMainWindow):
     def reset_manual_mode(self):
         self.manual_mode = False
         self.manual_zoom = 1.0
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
         self.manual_center = None
         self.manual_base_crop_size = None
 
