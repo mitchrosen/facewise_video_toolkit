@@ -275,11 +275,11 @@ class Viewer(QMainWindow):
         self.orientation_button = QPushButton("Landscape ▭")
         self.orientation_button.clicked.connect(self.toggle_orientation)
 
-        # self.prev_button = QPushButton("<<")
-        # self.prev_button.clicked.connect(self.prev_frame)
-        # self.prev_button.setAutoRepeat(True)
-        # self.prev_button.setAutoRepeatDelay(300)
-        # self.prev_button.setAutoRepeatInterval(60)
+        self.prev_button = QPushButton("<<")
+        self.prev_button.clicked.connect(self.prev_frame)
+        self.prev_button.setAutoRepeat(True)
+        self.prev_button.setAutoRepeatDelay(300)
+        self.prev_button.setAutoRepeatInterval(60)
 
         self.play_button = QPushButton("Play")
         self.play_button.clicked.connect(self.toggle_play)
@@ -298,6 +298,10 @@ class Viewer(QMainWindow):
         self.slider.setMaximum(0)
         self.slider.sliderPressed.connect(self.begin_slider_drag)
         self.slider.sliderReleased.connect(self.end_slider_drag)
+
+        self.frame_label = QLabel("Frame: 0 / 0")
+        self.frame_label.setMinimumWidth(140)
+        self.frame_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
         self.auto_framing = True
         self.auto_frame_button = QPushButton("Auto Frame")
@@ -361,11 +365,12 @@ class Viewer(QMainWindow):
         playback_controls.addWidget(self.open_button)
         playback_controls.addWidget(self.open_json_button)
         playback_controls.addWidget(self.start_button)
-        # playback_controls.addWidget(self.prev_button)
+        playback_controls.addWidget(self.prev_button)
         playback_controls.addWidget(self.play_button)
         playback_controls.addWidget(self.next_button)
         playback_controls.addWidget(self.end_button)
         playback_controls.addWidget(self.slider, stretch=1)
+        playback_controls.addWidget(self.frame_label)
 
         framing_controls = QHBoxLayout()
         framing_controls.addStretch(1)
@@ -406,7 +411,7 @@ class Viewer(QMainWindow):
 
     def set_controls_enabled(self, enabled: bool):
         self.start_button.setEnabled(enabled)
-        # self.prev_button.setEnabled(enabled)
+        self.prev_button.setEnabled(enabled)
         self.play_button.setEnabled(enabled)
         self.next_button.setEnabled(enabled)
         self.end_button.setEnabled(enabled)
@@ -415,7 +420,7 @@ class Viewer(QMainWindow):
     def set_stopped(self):
         self.timer.stop()
         self.play_button.setText("Play")
-        # self.prev_button.setEnabled(self.reader is not None)
+        self.prev_button.setEnabled(self.reader is not None)
         self.next_button.setEnabled(self.reader is not None)
 
     def toggle_play(self):
@@ -456,6 +461,8 @@ class Viewer(QMainWindow):
         self.timer.setInterval(max(1, int(1000 / self.reader.fps)))
         self.slider.setMaximum(max(0, self.reader.frame_count - 1))
         self.slider.setValue(0)
+        self.frame_label.setText(
+            f"Frame: 0 / {max(0, self.reader.frame_count - 1)}")
 
         self.set_controls_enabled(True)
         self.setWindowTitle(f"Facewise Demo Viewer — {path.name}")
@@ -502,15 +509,15 @@ class Viewer(QMainWindow):
         if img is not None:
             self.show_frame(img)
 
-    # def prev_frame(self):
-    #     if self.reader is None:
-    #         return
-    #     self.set_stopped()
-    #     target = max(0, self.reader.current_frame_idx - 2)
-    #     self.reader.seek(target)
-    #     img = self.reader.next_frame()
-    #     if img is not None:
-    #         self.show_frame(img)
+    def prev_frame(self):
+        if self.reader is None:
+            return
+
+        self.set_stopped()
+        target = max(0, self.reader.current_frame_idx - 2)
+        img = self.reader.frame_at_exact(target)
+        if img is not None:
+            self.show_frame(img)
 
     def step_once(self):
         if self.reader is None:
@@ -556,6 +563,11 @@ class Viewer(QMainWindow):
             self.slider.blockSignals(True)
             self.slider.setValue(min(self.reader.current_frame_idx - 1, self.slider.maximum()))
             self.slider.blockSignals(False)
+
+        self.frame_label.setText(
+            f"Frame: {self.displayed_frame_idx:,} / "
+            f"{self.slider.maximum():,}"
+        )
 
     def render_current_pixmap(self):
         if self.current_pixmap is None:
