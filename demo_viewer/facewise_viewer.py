@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from dataclasses import dataclass
 
 import av
 from PySide6.QtCore import Qt, QTimer
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QLabel,
+    QComboBox,
     QMainWindow,
     QPushButton,
     QSlider,
@@ -23,6 +25,35 @@ from PySide6.QtWidgets import (
     QBoxLayout,
     QWidget,
 )
+
+REFERENCE_DIAGONAL = 6.1
+REFERENCE_LONG_SIDE = 650
+
+@dataclass(frozen=True)
+class DevicePreset:
+    name: str
+    viewport_width: int
+    viewport_height: int
+    display_inches: float
+
+IPHONE_PRESETS = [
+    DevicePreset("iPhone SE (3rd)",   750, 1334, 4.7),
+
+    DevicePreset("iPhone 15",         1179, 2556, 6.1),
+    DevicePreset("iPhone 15 Plus",    1290, 2796, 6.7),
+    DevicePreset("iPhone 15 Pro",     1179, 2556, 6.1),
+    DevicePreset("iPhone 15 Pro Max", 1290, 2796, 6.7),
+
+    DevicePreset("iPhone 16",         1179, 2556, 6.1),
+    DevicePreset("iPhone 16 Plus",    1290, 2796, 6.7),
+    DevicePreset("iPhone 16 Pro",     1206, 2622, 6.3),
+    DevicePreset("iPhone 16 Pro Max", 1320, 2868, 6.9),
+
+    DevicePreset("iPhone 17",         1206, 2622, 6.3),
+    DevicePreset("iPhone Air",        1260, 2736, 6.6),
+    DevicePreset("iPhone 17 Pro",     1206, 2622, 6.3),
+    DevicePreset("iPhone 17 Pro Max", 1320, 2868, 6.9),
+]
 
 class VideoReader:
     def __init__(self, path: Path):
@@ -227,7 +258,7 @@ class Viewer(QMainWindow):
         self.current_pixmap = None
         self.last_open_dir = Path.home()
         self._slider_dragging = False
-        self.phone_display_long_side = 650
+        self.device = IPHONE_PRESETS[0]
         self.is_portrait = True
 
         self.video_label = QLabel("Open a video to begin")
@@ -293,6 +324,30 @@ class Viewer(QMainWindow):
 
         self.orientation_button = QPushButton("Landscape ▭")
         self.orientation_button.clicked.connect(self.toggle_orientation)
+
+        self.device_combo = QComboBox()
+        self.device_combo.setMinimumContentsLength(20)
+        self.device_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+
+        self.device_combo.addItem(IPHONE_PRESETS[0].name, IPHONE_PRESETS[0])
+
+        self.device_combo.insertSeparator(self.device_combo.count())
+        for preset in IPHONE_PRESETS[1:5]:
+            self.device_combo.addItem(preset.name, preset)
+
+        self.device_combo.insertSeparator(self.device_combo.count())
+        for preset in IPHONE_PRESETS[5:9]:
+            self.device_combo.addItem(preset.name, preset)
+
+        self.device_combo.insertSeparator(self.device_combo.count())
+        for preset in IPHONE_PRESETS[9:]:
+            self.device_combo.addItem(preset.name, preset)
+
+        self.device_combo.currentIndexChanged[int].connect(
+            self.change_device_preset
+        )
 
         self.prev_button = QPushButton("<<")
         self.prev_button.clicked.connect(self.prev_frame)
@@ -375,6 +430,11 @@ class Viewer(QMainWindow):
         self.manual_zoom = 1.0
         self.manual_center: tuple[float, float] | None = None
         self.manual_base_crop_size: tuple[float, float] | None = None
+        self.manual_anchor_kind: str | None = None
+        self.manual_anchor_face: dict | None = None
+        self.manual_zoom_factor = 1.0
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
         self.last_visible_center: tuple[float, float] | None = None
 
         self.face_index: FacewiseJsonIndex | None = None
@@ -395,6 +455,7 @@ class Viewer(QMainWindow):
         framing_controls = QHBoxLayout()
         framing_controls.addStretch(1)
         framing_controls.addWidget(self.orientation_button)
+        framing_controls.addWidget(self.device_combo)
         framing_controls.addWidget(framing_mode_frame)
         framing_controls.addWidget(self.boxes_button)
         framing_controls.addWidget(self.zoom_out_button)
@@ -586,6 +647,11 @@ class Viewer(QMainWindow):
             self.slider.setValue(min(self.reader.current_frame_idx - 1, self.slider.maximum()))
             self.slider.blockSignals(False)
 
+        self.frame_label.setText(
+            f"Frame: {self.displayed_frame_idx:,} / "
+            f"{self.slider.maximum():,}"
+        )
+
     def shot_number_for_frame(self, frame_idx: int):
         if self.face_index is None:
             return None
@@ -614,11 +680,6 @@ class Viewer(QMainWindow):
             self.auto_framing = True
             self.reset_manual_mode()
             self.update_framing_buttons()
-
-        self.frame_label.setText(
-            f"Frame: {self.displayed_frame_idx:,} / "
-            f"{self.slider.maximum():,}"
-        )
 
     def render_current_pixmap(self):
         if self.current_pixmap is None:
@@ -650,7 +711,9 @@ class Viewer(QMainWindow):
         self.paint_source_crop(src, canvas, crop)
         self.last_visible_center = self.crop_center(crop)
 
-        display_long_side = self.phone_display_long_side
+        display_long_side = round(REFERENCE_LONG_SIDE * 
+                                  self.device.display_inches / 
+                                  REFERENCE_DIAGONAL)
 
         if canvas.width() >= canvas.height():
             display_w = display_long_side
@@ -684,6 +747,7 @@ class Viewer(QMainWindow):
 
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
+
         self.render_current_pixmap()
         self.update_drawer_faces()
 
@@ -704,11 +768,14 @@ class Viewer(QMainWindow):
             return
 
         viewport_w, viewport_h = self.viewport_size()
+        display_long_side = round(
+            REFERENCE_LONG_SIDE * self.device.display_inches / REFERENCE_DIAGONAL
+        )
         if viewport_w >= viewport_h:
-            display_w = self.phone_display_long_side
+            display_w = display_long_side
             display_h = round(display_w * viewport_h / viewport_w)
         else:
-            display_h = self.phone_display_long_side
+            display_h = display_long_side
             display_w = round(display_h * viewport_w / viewport_h)
 
         self.position_drawer_button(display_w, display_h)
@@ -766,7 +833,18 @@ class Viewer(QMainWindow):
         self.update_drawer_faces()
 
     def viewport_size(self) -> tuple[int, int]:
-        return (750, 1334) if self.is_portrait else (1334, 750)
+        w = self.device.viewport_width
+        h = self.device.viewport_height
+        return (w, h) if self.is_portrait else (h, w)
+
+    def change_device_preset(self, index: int):
+        preset = self.device_combo.itemData(index)
+        if preset is None:
+            return
+
+        self.device = preset
+        self.render_current_pixmap()
+        self.update_drawer_faces()
     
     def viewport_aspect(self) -> float:
         viewport_w, viewport_h = self.viewport_size()
@@ -817,6 +895,11 @@ class Viewer(QMainWindow):
         self.manual_zoom = 1.0
         self.manual_center = None
         self.manual_base_crop_size = None
+        self.manual_anchor_kind = None
+        self.manual_anchor_face = None
+        self.manual_zoom_factor = 1.0
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
 
     def crop_for_face(
         self,
@@ -968,14 +1051,12 @@ class Viewer(QMainWindow):
 
     def zoom_in(self):
         self.enter_manual_mode()
-        self.manual_zoom = min(6.0, self.manual_zoom * 1.15)
-        self.clamp_manual_center()
+        self.manual_zoom_factor = min(6.0, self.manual_zoom_factor * 1.15)
         self.render_current_pixmap()
 
     def zoom_out(self):
         self.enter_manual_mode()
-        self.manual_zoom = max(1.0, self.manual_zoom / 1.15)
-        self.clamp_manual_center()
+        self.manual_zoom_factor = max(1.0, self.manual_zoom_factor / 1.15)
         self.render_current_pixmap()
 
     def enter_manual_mode(self):
@@ -1001,19 +1082,13 @@ class Viewer(QMainWindow):
         if self.auto_framing:
             face = self.auto_frame()
             if face is not None:
-                crop = self.normalized_source_crop(
-                    self.crop_for_face(face, self.viewport_aspect())
-                )
-                self.begin_manual_from_crop(crop)
+                self.begin_manual_from_face(face)
                 return
             else:
-                self.manual_center = self.current_source_center()
-                self.manual_zoom = 1.0
+                self.begin_manual_from_fit()
+                return
         elif self.manual_center is None:
-            self.manual_center = self.current_source_center()
-            self.manual_zoom = 1.0
-            fit_w, fit_h = self.fit_source_size()
-            self.manual_base_crop_size = (fit_w, fit_h)
+            self.begin_manual_from_fit()
 
         self.manual_mode = True
         self.update_framing_buttons()
@@ -1100,21 +1175,56 @@ class Viewer(QMainWindow):
         self.manual_center = self.crop_center(crop)
         self.manual_zoom = self.zoom_for_source_crop(crop)
         self.manual_base_crop_size = self.fit_source_size()
+        self.manual_anchor_kind = "crop"
+        self.manual_anchor_face = None
+        self.manual_zoom_factor = self.zoom_for_source_crop(crop)
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
         self.manual_mode = True
         self.update_framing_buttons()
 
+    def begin_manual_from_face(self, face):
+        self.manual_anchor_kind = "face"
+        self.manual_anchor_face = face
+        crop = self.normalized_source_crop(
+            self.crop_for_face(face, self.viewport_aspect())
+        )
+        self.manual_zoom_factor = self.zoom_for_source_crop(crop)
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
+        self.manual_mode = True
+        self.update_framing_buttons()
+
+    def begin_manual_from_fit(self):
+        self.manual_anchor_kind = "fit"
+        self.manual_anchor_face = None
+        self.manual_zoom_factor = 1.0
+        self.manual_pan_x = 0.0
+        self.manual_pan_y = 0.0
+        self.manual_mode = True
+        self.update_framing_buttons()
+
+    def manual_anchor_crop(self):
+        if self.manual_anchor_kind == "face" and self.manual_anchor_face is not None:
+            return self.normalized_source_crop(
+                self.crop_for_face(self.manual_anchor_face, self.viewport_aspect())
+            )
+
+        if self.manual_anchor_kind == "fit":
+            return self.fit_source_crop()
+
+        return self.current_source_crop()
+
     def manual_source_crop(self):
-        if self.manual_base_crop_size is None:
-            self.manual_base_crop_size = self.fit_source_size()
+        anchor = self.manual_anchor_crop()
+        ax, ay = self.crop_center(anchor)
+        fit_w, fit_h = self.fit_source_size()
+        visible_w = fit_w / max(1.0, self.manual_zoom_factor)
+        visible_h = fit_h / max(1.0, self.manual_zoom_factor)
 
-        base_w, base_h = self.manual_base_crop_size
-        visible_w = base_w / max(1.0, self.manual_zoom)
-        visible_h = base_h / max(1.0, self.manual_zoom)
-
-        if self.manual_center is None:
-            self.manual_center = self.current_source_center()
-
-        cx, cy = self.manual_center
+        cx = ax + self.manual_pan_x * visible_w
+        cy = ay + self.manual_pan_y * visible_h
+        self.manual_center = (cx, cy)
         return self.normalized_source_crop(
             (
                 cx - visible_w / 2.0,
@@ -1195,25 +1305,14 @@ class Viewer(QMainWindow):
         if self.manual_center is None:
             return
 
-        fit_w, fit_h = self.fit_source_size()
-        visible_w = fit_w / max(1.0, self.manual_zoom)
-        visible_h = fit_h / max(1.0, self.manual_zoom)
-
-        cx, cy = self.manual_center
-        cx += dx * visible_w
-        cy += dy * visible_h
-        self.manual_center = (cx, cy)
-        self.clamp_manual_center()
-
+        self.manual_pan_x += dx
+        self.manual_pan_y += dy
         self.render_current_pixmap()
 
     def select_drawer_face(self, face):
         self.auto_framing = False
         self.reset_manual_mode()
-        crop = self.normalized_source_crop(
-            self.crop_for_face(face, self.viewport_aspect())
-        )
-        self.begin_manual_from_crop(crop)
+        self.begin_manual_from_face(face)
         self.render_current_pixmap()
 
     def paint_source_crop(self, src, canvas, crop):
