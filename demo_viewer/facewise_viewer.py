@@ -427,14 +427,8 @@ class Viewer(QMainWindow):
         pan_widget.setLayout(pan_layout)
 
         self.manual_mode = False
-        self.manual_zoom = 1.0
+        self.manual_crop = None
         self.manual_center: tuple[float, float] | None = None
-        self.manual_base_crop_size: tuple[float, float] | None = None
-        self.manual_anchor_kind: str | None = None
-        self.manual_anchor_face: dict | None = None
-        self.manual_zoom_factor = 1.0
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
         self.last_visible_center: tuple[float, float] | None = None
 
         self.face_index: FacewiseJsonIndex | None = None
@@ -742,11 +736,28 @@ class Viewer(QMainWindow):
 
         Boundary corrections may cause the displayed center to shift.
         """
-        if self.manual_mode and self.last_visible_center is not None:
-            self.manual_center = self.last_visible_center
+        manual_center = None
+        manual_zoom_factor = None
+        if self.manual_mode and self.manual_crop is not None:
+            manual_center = self.crop_center(self.manual_crop)
+            manual_zoom_factor = self.zoom_for_source_crop(self.manual_crop)
 
         self.is_portrait = not self.is_portrait
         self.orientation_button.setText("Landscape ▭" if self.is_portrait else "Portrait ▯")
+
+        if manual_center is not None and manual_zoom_factor is not None:
+            fit_w, fit_h = self.fit_source_size()
+            visible_w = fit_w / manual_zoom_factor
+            visible_h = fit_h / manual_zoom_factor
+            cx, cy = manual_center
+            self.set_manual_crop(
+                (
+                    cx - visible_w / 2.0,
+                    cy - visible_h / 2.0,
+                    cx + visible_w / 2.0,
+                    cy + visible_h / 2.0,
+                )
+            )
 
         self.render_current_pixmap()
         self.update_drawer_faces()
@@ -892,14 +903,8 @@ class Viewer(QMainWindow):
 
     def reset_manual_mode(self):
         self.manual_mode = False
-        self.manual_zoom = 1.0
+        self.manual_crop = None
         self.manual_center = None
-        self.manual_base_crop_size = None
-        self.manual_anchor_kind = None
-        self.manual_anchor_face = None
-        self.manual_zoom_factor = 1.0
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
 
     def crop_for_face(
         self,
@@ -1051,12 +1056,12 @@ class Viewer(QMainWindow):
 
     def zoom_in(self):
         self.enter_manual_mode()
-        self.manual_zoom_factor = min(6.0, self.manual_zoom_factor * 1.15)
+        self.zoom_manual_crop(1.15)
         self.render_current_pixmap()
 
     def zoom_out(self):
         self.enter_manual_mode()
-        self.manual_zoom_factor = max(1.0, self.manual_zoom_factor / 1.15)
+        self.zoom_manual_crop(1.0 / 1.15)
         self.render_current_pixmap()
 
     def enter_manual_mode(self):
@@ -1079,17 +1084,7 @@ class Viewer(QMainWindow):
         if self.current_pixmap is None:
             return
 
-        if self.auto_framing:
-            face = self.auto_frame()
-            if face is not None:
-                self.begin_manual_from_face(face)
-                return
-            else:
-                self.begin_manual_from_fit()
-                return
-        elif self.manual_center is None:
-            self.begin_manual_from_fit()
-
+        self.set_manual_crop(self.current_source_crop())
         self.manual_mode = True
         self.update_framing_buttons()
 
@@ -1172,60 +1167,45 @@ class Viewer(QMainWindow):
         """
         Enter manual mode preserving the supplied source crop.
         """
-        self.manual_center = self.crop_center(crop)
-        self.manual_zoom = self.zoom_for_source_crop(crop)
-        self.manual_base_crop_size = self.fit_source_size()
-        self.manual_anchor_kind = "crop"
-        self.manual_anchor_face = None
-        self.manual_zoom_factor = self.zoom_for_source_crop(crop)
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
+        self.set_manual_crop(crop)
         self.manual_mode = True
         self.update_framing_buttons()
 
     def begin_manual_from_face(self, face):
-        self.manual_anchor_kind = "face"
-        self.manual_anchor_face = face
-        crop = self.normalized_source_crop(
+        self.set_manual_crop(
             self.crop_for_face(face, self.viewport_aspect())
         )
-        self.manual_zoom_factor = self.zoom_for_source_crop(crop)
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
         self.manual_mode = True
         self.update_framing_buttons()
 
     def begin_manual_from_fit(self):
-        self.manual_anchor_kind = "fit"
-        self.manual_anchor_face = None
-        self.manual_zoom_factor = 1.0
-        self.manual_pan_x = 0.0
-        self.manual_pan_y = 0.0
+        self.set_manual_crop(self.fit_source_crop())
         self.manual_mode = True
         self.update_framing_buttons()
 
-    def manual_anchor_crop(self):
-        if self.manual_anchor_kind == "face" and self.manual_anchor_face is not None:
-            return self.normalized_source_crop(
-                self.crop_for_face(self.manual_anchor_face, self.viewport_aspect())
-            )
-
-        if self.manual_anchor_kind == "fit":
-            return self.fit_source_crop()
-
-        return self.current_source_crop()
+    def set_manual_crop(self, crop):
+        self.manual_crop = self.normalized_source_crop(crop)
+        self.manual_center = self.crop_center(self.manual_crop)
 
     def manual_source_crop(self):
-        anchor = self.manual_anchor_crop()
-        ax, ay = self.crop_center(anchor)
-        fit_w, fit_h = self.fit_source_size()
-        visible_w = fit_w / max(1.0, self.manual_zoom_factor)
-        visible_h = fit_h / max(1.0, self.manual_zoom_factor)
+        if self.manual_crop is None:
+            self.set_manual_crop(self.fit_source_crop())
+        return self.manual_crop
 
-        cx = ax + self.manual_pan_x * visible_w
-        cy = ay + self.manual_pan_y * visible_h
-        self.manual_center = (cx, cy)
-        return self.normalized_source_crop(
+    def zoom_manual_crop(self, factor: float):
+        if self.manual_crop is None:
+            self.set_manual_crop(self.current_source_crop())
+
+        cx, cy = self.crop_center(self.manual_crop)
+        current_zoom = self.zoom_for_source_crop(self.manual_crop)
+        new_zoom = max(1.0, min(6.0, current_zoom * factor))
+
+        fit_w, fit_h = self.fit_source_size()
+
+        visible_w = fit_w / new_zoom
+        visible_h = fit_h / new_zoom
+
+        self.set_manual_crop(
             (
                 cx - visible_w / 2.0,
                 cy - visible_h / 2.0,
@@ -1236,10 +1216,13 @@ class Viewer(QMainWindow):
 
     def normalized_source_crop(self, crop):
         """
-        Clamp a virtual source crop center without forcing the crop itself
-        inside the image.
+        Return a normalized virtual source crop.
 
-        Crops larger than the image are valid: they render as black padding.
+        The renderer treats the crop as a virtual viewport and paints black padding
+        where the crop falls outside the source image.
+
+        Keeps  a sliver of source image visible so manual panning cannot wander completely 
+        off-screen.
         """
         x1, y1, x2, y2 = crop
         source_w = float(self.current_pixmap.width())
@@ -1251,15 +1234,17 @@ class Viewer(QMainWindow):
         cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
 
-        if crop_w >= source_w:
-            cx = source_w / 2.0
-        else:
-            cx = max(crop_w / 2.0, min(source_w - crop_w / 2.0, cx))
+        min_visible_w = min(source_w, crop_w) * 0.10
+        min_visible_h = min(source_h, crop_h) * 0.10
 
-        if crop_h >= source_h:
-            cy = source_h / 2.0
-        else:
-            cy = max(crop_h / 2.0, min(source_h - crop_h / 2.0, cy))
+        cx = max(
+            min_visible_w - crop_w / 2.0,
+            min(source_w + crop_w / 2.0 - min_visible_w, cx),
+        )
+        cy = max(
+            min_visible_h - crop_h / 2.0,
+            min(source_h + crop_h / 2.0 - min_visible_h, cy),
+        )
 
         return (
             cx - crop_w / 2.0,
@@ -1302,11 +1287,21 @@ class Viewer(QMainWindow):
         
         self.enter_manual_mode()
 
-        if self.manual_center is None:
-            return
+        if self.manual_crop is None:
+            self.set_manual_crop(self.current_source_crop())
 
-        self.manual_pan_x += dx
-        self.manual_pan_y += dy
+        x1, y1, x2, y2 = self.manual_crop
+        crop_w = max(1.0, x2 - x1)
+        crop_h = max(1.0, y2 - y1)
+
+        self.set_manual_crop(
+            (
+                x1 + dx * crop_w,
+                y1 + dy * crop_h,
+                x2 + dx * crop_w,
+                y2 + dy * crop_h,
+            )
+        )
         self.render_current_pixmap()
 
     def select_drawer_face(self, face):
