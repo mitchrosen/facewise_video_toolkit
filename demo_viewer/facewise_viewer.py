@@ -406,16 +406,16 @@ class Viewer(QMainWindow):
         self.zoom_in_button.clicked.connect(self.zoom_in)
 
         self.pan_up_button = QPushButton("↑")
-        self.pan_up_button.clicked.connect(lambda: self.pan(0.0, -0.1))
+        self.pan_up_button.clicked.connect(lambda: self.pan_viewport_fraction(0.0, -0.1))
 
         self.pan_left_button = QPushButton("←")
-        self.pan_left_button.clicked.connect(lambda: self.pan(-0.1, 0.0))
+        self.pan_left_button.clicked.connect(lambda: self.pan_viewport_fraction(-0.1, 0.0))
 
         self.pan_right_button = QPushButton("→")
-        self.pan_right_button.clicked.connect(lambda: self.pan(0.1, 0.0))
+        self.pan_right_button.clicked.connect(lambda: self.pan_viewport_fraction(0.1, 0.0))
 
         self.pan_down_button = QPushButton("↓")
-        self.pan_down_button.clicked.connect(lambda: self.pan(0.0, 0.1))
+        self.pan_down_button.clicked.connect(lambda: self.pan_viewport_fraction(0.0, 0.1))
 
         pan_layout = QGridLayout()
         pan_layout.addWidget(self.pan_up_button, 0, 1)
@@ -1054,15 +1054,19 @@ class Viewer(QMainWindow):
 
         self.drawer_layout.addStretch(1)
 
+    def zoom_about_viewport_center(self, factor: float):
+        viewport_w, viewport_h = self.viewport_size()
+        self.zoom_about_viewport(
+            factor,
+            viewport_w / 2.0,
+            viewport_h / 2.0,
+        )
+
     def zoom_in(self):
-        self.enter_manual_mode()
-        self.zoom_manual_crop(1.15)
-        self.render_current_pixmap()
+        self.zoom_about_viewport_center(1.15)
 
     def zoom_out(self):
-        self.enter_manual_mode()
-        self.zoom_manual_crop(1.0 / 1.15)
-        self.render_current_pixmap()
+        self.zoom_about_viewport_center(1.0 / 1.15)
 
     def enter_manual_mode(self):
         """
@@ -1192,28 +1196,6 @@ class Viewer(QMainWindow):
             self.set_manual_crop(self.fit_source_crop())
         return self.manual_crop
 
-    def zoom_manual_crop(self, factor: float):
-        if self.manual_crop is None:
-            self.set_manual_crop(self.current_source_crop())
-
-        cx, cy = self.crop_center(self.manual_crop)
-        current_zoom = self.zoom_for_source_crop(self.manual_crop)
-        new_zoom = max(1.0, min(6.0, current_zoom * factor))
-
-        fit_w, fit_h = self.fit_source_size()
-
-        visible_w = fit_w / new_zoom
-        visible_h = fit_h / new_zoom
-
-        self.set_manual_crop(
-            (
-                cx - visible_w / 2.0,
-                cy - visible_h / 2.0,
-                cx + visible_w / 2.0,
-                cy + visible_h / 2.0,
-            )
-        )
-
     def normalized_source_crop(self, crop):
         """
         Return a normalized virtual source crop.
@@ -1253,53 +1235,105 @@ class Viewer(QMainWindow):
             cy + crop_h / 2.0,
         )
     
-    def clamp_manual_center(self):
-        if self.current_pixmap is None:
-            return
+    def pan_viewport_fraction(self, dx: float, dy: float):
+        """
+        Pan by a fraction of the displayed viewport.
 
-        if self.manual_center is None:
-            return
+        This preserves the existing arrow-button behavior while routing the
+        operation through the viewport-pixel pan primitive.
+        """
+        viewport_w, viewport_h = self.viewport_size()
+        self.pan_pixels(
+            dx * viewport_w,
+            dy * viewport_h,
+        )
 
-        fit_w, fit_h = self.fit_source_size()
-        visible_w = fit_w / max(1.0, self.manual_zoom)
-        visible_h = fit_h / max(1.0, self.manual_zoom)
+    def pan_pixels(self, dx_pixels: float, dy_pixels: float):
+        """
+        Pan the source crop by a displacement measured in viewport pixels.
 
-        source_w = float(self.current_pixmap.width())
-        source_h = float(self.current_pixmap.height())
-
-        cx, cy = self.manual_center
-
-        if visible_w >= source_w:
-            cx = source_w / 2.0
-        else:
-            cx = max(visible_w / 2.0, min(source_w - visible_w / 2.0, cx))
-
-        if visible_h >= source_h:
-            cy = source_h / 2.0
-        else:
-            cy = max(visible_h / 2.0, min(source_h - visible_h / 2.0, cy))
-
-        self.manual_center = (cx, cy)
-
-    def pan(self, dx: float, dy: float):
+        Positive x moves the crop toward the right side of the source image.
+        Positive y moves the crop toward the bottom of the source image.
+        """
         if not self.auto_framing and not self.manual_mode:
             return
-        
+
         self.enter_manual_mode()
 
         if self.manual_crop is None:
-            self.set_manual_crop(self.current_source_crop())
+            return
+
+        viewport_w, viewport_h = self.viewport_size()
+        if viewport_w <= 0 or viewport_h <= 0:
+            return
 
         x1, y1, x2, y2 = self.manual_crop
         crop_w = max(1.0, x2 - x1)
         crop_h = max(1.0, y2 - y1)
 
+        source_dx = float(dx_pixels) * crop_w / float(viewport_w)
+        source_dy = float(dy_pixels) * crop_h / float(viewport_h)
+
         self.set_manual_crop(
             (
-                x1 + dx * crop_w,
-                y1 + dy * crop_h,
-                x2 + dx * crop_w,
-                y2 + dy * crop_h,
+                x1 + source_dx,
+                y1 + source_dy,
+                x2 + source_dx,
+                y2 + source_dy,
+            )
+        )
+        self.render_current_pixmap()
+
+    def zoom_about_viewport(
+        self,
+        factor: float,
+        viewport_x: float,
+        viewport_y: float,
+    ):
+        """
+        Zoom while keeping the source point beneath a viewport point fixed.
+
+        Boundary clipping may move that point when the crop reaches the
+        minimum-visible-source limit.
+        """
+        self.enter_manual_mode()
+
+        if self.manual_crop is None:
+            return
+
+        viewport_w, viewport_h = self.viewport_size()
+        if viewport_w <= 0 or viewport_h <= 0:
+            return
+
+        viewport_x = max(0.0, min(float(viewport_w), float(viewport_x)))
+        viewport_y = max(0.0, min(float(viewport_h), float(viewport_y)))
+
+        x1, y1, x2, y2 = self.manual_crop
+        crop_w = max(1.0, x2 - x1)
+        crop_h = max(1.0, y2 - y1)
+
+        source_x = x1 + viewport_x / viewport_w * crop_w
+        source_y = y1 + viewport_y / viewport_h * crop_h
+
+        current_zoom = self.zoom_for_source_crop(self.manual_crop)
+        new_zoom = max(1.0, min(6.0, current_zoom * factor))
+
+        fit_w, fit_h = self.fit_source_size()
+        new_crop_w = fit_w / new_zoom
+        new_crop_h = fit_h / new_zoom
+
+        relative_x = viewport_x / viewport_w
+        relative_y = viewport_y / viewport_h
+
+        new_x1 = source_x - relative_x * new_crop_w
+        new_y1 = source_y - relative_y * new_crop_h
+
+        self.set_manual_crop(
+            (
+                new_x1,
+                new_y1,
+                new_x1 + new_crop_w,
+                new_y1 + new_crop_h,
             )
         )
         self.render_current_pixmap()
