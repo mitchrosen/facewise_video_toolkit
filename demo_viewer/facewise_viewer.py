@@ -7,7 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 import av
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -264,6 +264,7 @@ class Viewer(QMainWindow):
         self.video_label = QLabel("Open a video to begin")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setFixedSize(760, 760)
+        self.video_label.installEventFilter(self)
 
         self.drawer_visible = False
         self.drawer_button = QPushButton("⌃", self.video_label)
@@ -1248,6 +1249,32 @@ class Viewer(QMainWindow):
             dy * viewport_h,
         )
 
+    def eventFilter(self, watched, event):
+        if watched is self.video_label and event.type() == QEvent.Type.Wheel:
+            # Control-modified wheel events are reserved for pinch zoom.
+            if event.modifiers() & Qt.ControlModifier:
+                return False
+
+            delta = event.pixelDelta()
+
+            if delta.isNull():
+                angle_delta = event.angleDelta()
+                dx_pixels = angle_delta.x() / 120.0 * 40.0
+                dy_pixels = angle_delta.y() / 120.0 * 40.0
+            else:
+                dx_pixels = float(delta.x())
+                dy_pixels = float(delta.y())
+
+            if dx_pixels or dy_pixels:
+                self.pan_pixels(
+                    -dx_pixels,
+                    -dy_pixels,
+                )
+                event.accept()
+                return True
+
+        return super().eventFilter(watched, event)
+
     def pan_pixels(self, dx_pixels: float, dy_pixels: float):
         """
         Pan the source crop by a displacement measured in viewport pixels.
@@ -1255,8 +1282,6 @@ class Viewer(QMainWindow):
         Positive x moves the crop toward the right side of the source image.
         Positive y moves the crop toward the bottom of the source image.
         """
-        if not self.auto_framing and not self.manual_mode:
-            return
 
         self.enter_manual_mode()
 
